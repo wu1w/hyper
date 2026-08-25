@@ -1,0 +1,19 @@
+[package]
+name = "hyper-cli"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "hyper CLI for grok-hyper"
+
+[[bin]]
+name = "hyper"
+path = "src/main.rs"
+
+[dependencies]
+anyhow.workspace = true
+clap.workspace = true
+hyper-loop = { path = "../hyper-loop" }
+hyper-tui = { path = "../hyper-tui" }
+hyper-web = { path = "../hyper-web" }
+serde_json.workspace = true
+tokio = { workspace = true, features = ["io-std"] }

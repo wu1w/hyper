@@ -1,0 +1,119 @@
+# Copy to ~/.grok-hyper/config.toml (created by `hyper probe` / `hyper web` if missing).
+# Primary shell: `hyper web`. `--print` is oneshot; a TTY with no prompt opens the TUI.
+# Primary target: grok-4.6. Empty base_url → grok login session or XAI_API_KEY (Responses).
+# Custom base_url that is not api.x.ai / cli-chat-proxy → OpenAI Chat Completions.
+# Existing config.toml is not auto-upgraded — copy these numbers if you still have 16k/8-step defaults.
+# Env overlay (HYPER_BASE_URL / HYPER_API_KEY / HYPER_MODEL / XAI_API_KEY) applies to CLI/TUI runs only.
+# `hyper web` ignores HYPER_* on purpose — the console edits this file, and a hidden env
+# override would make the settings page lie. Configure via the console or this file.
+
+[server]
+base_url = ""                  # empty: session or api_key. custom OpenAI: http://127.0.0.1:8080/v1
+api_key = ""                   # xAI key, or "local" for llama.cpp. never paste grok login token
+model = "grok-4.6"
+# image_base_url = ""          # empty = same as base_url. Imagine REST: POST {url}/images/generations
+# image_model = ""             # empty = grok-imagine-image-2.0. Independent of chat model
+profile = "auto"               # auto | xai | llamacpp | vllm | sglang | generic
+family = "grok46"              # grok46 | auto | qwen35 | qwen36 | qwen38
+connect_timeout_s = 5
+read_timeout_s = 1800
+
+[context]
+working_window = 500000        # grok-4.6 native window; 200k is the xAI price cliff
+hard_cap = 500000
+compact_ratio = 0.80           # soft compact at prefix+reserve > window*ratio
+agents_md_max_tokens = 400     # fail-closed; --agents-md-head clips instead of omitting
+
+[prompt]
+coding = false                 # unused; builtin identity is one agent contract
+file = "AGENT.md"              # workspace first, then ~/.grok-hyper/AGENT.md
+narrate = true                 # TUI/web: one-line progress narration per stage. --print/IM never narrate.
+
+[policy]
+default_mode = "agent"
+default_effort = "auto"        # grok-4.6 → high; Qwen still medium. /think still overrides.
+max_think_tokens_low = 512
+max_think_tokens_medium = 2048
+max_think_tokens_xhigh = 4096
+max_steps = 80
+max_steps_think = 100
+max_wall_seconds = 1800
+low_precision = false        # on: tighter doom/parse/repeat guards for IQ4/Q3. Model does not see this.
+
+[features]
+code_mode = true
+tui = false
+skills_auto_catalog = false
+mcp_auto_catalog = false
+workspace_write_only = true
+# TUI: ask (prompt writes/bash) | auto (edits pass, bash prompts) | yolo
+approvals = "ask"
+
+[sidecar]
+transport = "stdio-jsonrpc"
+socket_path = ""
+
+[tools]
+read_default_lines = 600       # one page ≈ 600 lines; offset/limit pages the rest. 2000 caused 30-60k-char prefill spikes.
+result_max_chars = 10000
+result_head_chars = 8000
+result_tail_chars = 2000
+# extra_path = ["~/.cargo/bin"] # optional; bash already prepends rustup/homebrew/local bins when they exist
+
+
+[code_mode]
+timeout_s = 60
+inherit_env = true
+
+# [media]
+# enabled = true
+# max_bytes = 2097152          # inline image freeze cap (2 MB)
+# ffmpeg = ""                  # optional; else PATH / HYPER_FFMPEG (ffmpeg.exe on Windows)
+# whisper = ""                 # whisper-cli; else PATH / HYPER_WHISPER
+# whisper_model = ""           # ggml .bin; else HYPER_WHISPER_MODEL or ~/.grok-hyper/whisper/ggml-tiny.bin
+#                              # Windows: %USERPROFILE%\.grok-hyper\whisper\ggml-tiny.bin
+
+# One web(query|url) tool, appended at session start (same freeze discipline as mcp).
+# Zero-config: keyless engines (Bing HTML, DuckDuckGo lite) + readability fetch.
+# A Tavily key upgrades the backend to Tavily REST transparently, builtin as
+# fallback. Key lookup: tavily_api_key here → env TAVILY_API_KEY → any mounted
+# MCP server env with TAVILY_API_KEY (existing tavily-mcp users switch for free,
+# minus the npx cold start). Output format is identical either way.
+[web]
+enabled = true
+provider = "auto"              # auto | builtin | tavily
+tavily_api_key = ""
+engines = ["bing", "duckduckgo"]
+timeout_s = 12
+max_results = 5
+fetch_max_bytes = 2000000
+
+# Console Files page. `hyper web` (without --workspace) reopens this folder.
+# Empty / omitted = process cwd. Changing the folder in the UI writes this back.
+# [console]
+# workspace = ""
+
+# OnlyOffice Docs (community image, AGPL). `hyper web` / the Mac app start
+# onlyoffice/documentserver on 127.0.0.1:8080 when Docker is available.
+# jwt_secret is generated on first `hyper web`. `HYPER_OFFICE_AUTO=0` skips this.
+# [office]
+# docs_url = "http://127.0.0.1:8080"
+# reach_url = "http://host.docker.internal:3850"
+# jwt_secret = ""
+# bridge_bind = "0.0.0.0:3850"
+
+# One mcp() tool is appended only when servers are listed (session-start freeze).
+# Catalog stays out of system unless mcp_auto_catalog. Bodies/methods are a hidden
+# card on "mcp" / [mcp:name] / /name — same geometry as skills.
+# Overlay: config.toml [mcp], ~/.grok-hyper/mcp.toml + mcp/*.toml, then
+# workspace .grok-hyper/mcp.toml + .grok-hyper/mcp/*.toml (later wins). Never expand tools/list
+# into OpenAI tools[]. Env/command stay out of the card.
+# [mcp]
+# timeout_s = 30
+# [[mcp.servers]]
+# name = "example"
+# command = "npx"
+# args = ["-y", "@modelcontextprotocol/server-everything"]
+# description = "example server"
+# methods = ["echo"]
+# cwd = ""

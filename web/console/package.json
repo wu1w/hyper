@@ -1,0 +1,30 @@
+{
+  "name": "hyper-console",
+  "private": true,
+  "version": "0.1.0",
+  "type": "module",
+  "scripts": {
+    "dev": "vite",
+    "build": "vite build",
+    "preview": "vite preview"
+  },
+  "dependencies": {
+    "@aiden0z/pptx-renderer": "^1.2.4",
+    "docx-preview": "^0.4.0",
+    "exceljs": "^4.4.0",
+    "html-to-docx": "^1.8.0",
+    "jszip": "^3.10.1",
+    "mammoth": "^1.12.1",
+    "pdf-lib": "^1.17.1",
+    "pdfjs-dist": "^6.2.108",
+    "react": "^19.1.0",
+    "react-dom": "^19.1.0"
+  },
+  "devDependencies": {
+    "@types/react": "^19.1.0",
+    "@types/react-dom": "^19.1.0",
+    "@vitejs/plugin-react": "^4.5.0",
+    "typescript": "^5.8.0",
+    "vite": "^6.3.0"
+  }
+}

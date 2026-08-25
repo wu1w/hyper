@@ -1,0 +1,21 @@
+[package]
+name = "hyper-web"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Local Web console host for hyper (QwenPaw-shaped UI, in-process loop)"
+
+[dependencies]
+anyhow.workspace = true
+axum.workspace = true
+base64.workspace = true
+futures.workspace = true
+hmac.workspace = true
+hyper-loop = { path = "../hyper-loop" }
+reqwest.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
+tokio.workspace = true
+tower-http.workspace = true
+uuid.workspace = true

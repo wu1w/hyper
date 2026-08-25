@@ -1,0 +1,11 @@
+# hyper on dsh — disable the official agent-loop (it occupies the single
+# AgentFactory slot) and mount the sidecar driver plus the ink skin.
+
+- id: agent-loop
+  disabled: true
+
+- insert:
+    - id: hyper-loop
+      name: dsh-plugin-hyper
+      config:
+        command: hyper
