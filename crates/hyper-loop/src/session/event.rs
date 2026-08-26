@@ -314,6 +314,19 @@ pub struct CompactEvent {
     pub index: String,
 }
 
+/// Parent-stream card for a spawned Task. Child transcript lives on the child jsonl.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SubagentEvent {
+    pub id: String,
+    pub description: String,
+    pub subagent_type: String,
+    pub status: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub summary: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub parent_tool_call_id: Option<String>,
+}
+
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "type")]
 pub enum SessionEvent {
@@ -337,6 +350,8 @@ pub enum SessionEvent {
     Undo(UndoEvent),
     #[serde(rename = "delta")]
     Delta(DeltaEvent),
+    #[serde(rename = "subagent")]
+    Subagent(SubagentEvent),
 }
 
 impl SessionEvent {
@@ -391,6 +406,29 @@ impl SessionEvent {
         output: impl Into<String>,
     ) -> Self {
         Self::tool_folded(tool_call_id, name, output, None, None)
+    }
+
+    pub fn subagent(
+        id: impl Into<String>,
+        description: impl Into<String>,
+        subagent_type: impl Into<String>,
+        status: impl Into<String>,
+        summary: Option<String>,
+        parent_tool_call_id: impl Into<String>,
+    ) -> Self {
+        let parent_tool_call_id = parent_tool_call_id.into();
+        Self::Subagent(SubagentEvent {
+            id: id.into(),
+            description: description.into(),
+            subagent_type: subagent_type.into(),
+            status: status.into(),
+            summary: summary.filter(|s| !s.is_empty()),
+            parent_tool_call_id: if parent_tool_call_id.is_empty() {
+                None
+            } else {
+                Some(parent_tool_call_id)
+            },
+        })
     }
 
     pub fn tool_folded(
@@ -491,6 +529,7 @@ impl SessionEvent {
             Self::Stop(_) => "stop",
             Self::Undo(_) => "session/undo",
             Self::Delta(_) => "delta",
+            Self::Subagent(_) => "subagent",
         }
     }
 }

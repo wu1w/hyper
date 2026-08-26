@@ -385,9 +385,20 @@ impl<C: Completer> Agent<C> {
     }
 
     pub(crate) fn push_hidden_user(&mut self, text: impl AsRef<str>) {
+        self.push_hidden_user_opt(text, true);
+    }
+
+    /// Live-only note (re-injected each turn). Keep JSONL to real user/assistant/tool.
+    pub(crate) fn push_ephemeral_note(&mut self, text: impl AsRef<str>) {
+        self.push_hidden_user_opt(text, false);
+    }
+
+    fn push_hidden_user_opt(&mut self, text: impl AsRef<str>, log: bool) {
         let wrapped = wrap_tool_response(text.as_ref());
         self.messages.push(ChatMessage::user(wrapped.clone()));
-        self.log_event(SessionEvent::user(wrapped));
+        if log {
+            self.log_event(SessionEvent::user(wrapped));
+        }
     }
 
     /// Spoken answer already exists, and this hop is only dump/placeholder/cleanup.
@@ -585,11 +596,18 @@ impl<C: Completer> Agent<C> {
     }
 
     pub(crate) fn log_event(&mut self, event: SessionEvent) {
-        // Children share the parent's live sink. Forward tool cards only so the
-        // console can show nested Task progress; do not mix child tokens/text.
-        let child_live_tool = self.child.is_some() && matches!(event, SessionEvent::Tool(_));
-        let parent_forward = self.child.is_none() && !matches!(event, SessionEvent::User(_));
-        let forward = child_live_tool || parent_forward;
+        // Children keep their own jsonl. Do not mix nested tools/tokens into the
+        // parent activity stream — the console opens a Task card to view them.
+        if self.child.is_some() {
+            if event.is_ephemeral() {
+                return;
+            }
+            if let Some(log) = self.log.as_mut() {
+                let _ = log.append(event);
+            }
+            return;
+        }
+        let forward = !matches!(event, SessionEvent::User(_));
         if event.is_ephemeral() {
             if forward {
                 if let Some(sink) = &self.emit {

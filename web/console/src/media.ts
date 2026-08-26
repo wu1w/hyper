@@ -33,6 +33,18 @@ export function fileHref(path: string, download = false): string {
   return download ? `${u}&dl=1` : u;
 }
 
+/** Workspace file as a real path so HTML `./app.js` / `./styles.css` resolve. */
+export function siteHref(path: string, rev?: string | number): string {
+  const n = path.replace(/\\/g, "/").replace(/^\/+/, "").replace(/\/+/g, "/");
+  const parts = n
+    .split("/")
+    .filter((s) => s && s !== ".")
+    .map((s) => encodeURIComponent(s));
+  const u = `/api/raw/${parts.join("/")}`;
+  if (rev == null || rev === "") return u;
+  return `${u}?v=${encodeURIComponent(String(rev))}`;
+}
+
 /** Workspace-relative path from a media url, or "" if it is a data/http URL. */
 export function pathFromMediaUrl(url: string): string {
   const u = url.trim();

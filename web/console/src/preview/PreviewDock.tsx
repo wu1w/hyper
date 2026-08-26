@@ -1,6 +1,6 @@
 import { useEffect, useRef, useState, type ComponentType } from "react";
 import { api, failMsg } from "../api";
-import { fileHref, basename } from "../media";
+import { fileHref, siteHref, basename } from "../media";
 import { Icon } from "../ui";
 import { isOfficeKind, kindFor, type PreviewKind, type PreviewProps } from "./kinds";
 import { loadPreviewBytes, savePreview } from "./save";
@@ -9,12 +9,14 @@ type OfficeStatus = { ready?: boolean; starting?: boolean; docs_url?: string; hi
 
 export function PreviewDock({
   path,
+  rev = "",
   onClose,
   layout = "page",
   maximized = false,
   onMaximize,
 }: {
   path: string;
+  rev?: string;
   onClose?: () => void;
   layout?: "chat" | "page";
   maximized?: boolean;
@@ -78,7 +80,7 @@ export function PreviewDock({
     return () => {
       gone = true;
     };
-  }, [path, kind, boot]);
+  }, [path, kind, boot, rev]);
 
   useEffect(() => {
     if (office || !isOfficeKind(kind.id)) return;
@@ -150,6 +152,7 @@ export function PreviewDock({
       await savePreview(path, data, kind.id);
       setDirty(false);
       setNote("已覆盖保存，下一轮对话会按这个版本 Read。");
+      setBoot((n) => n + 1);
     } catch (e) {
       setErr(failMsg(e));
     } finally {
@@ -176,7 +179,7 @@ export function PreviewDock({
           下载
         </a>
         {kind.id === "browser" ? (
-          <a className="btn ghost small" href={fileHref(path)} target="_blank" rel="noreferrer">
+          <a className="btn ghost small" href={siteHref(path, rev)} target="_blank" rel="noreferrer">
             新窗口
           </a>
         ) : null}
@@ -206,10 +209,10 @@ export function PreviewDock({
       <div className="pv-body">
         {bytes && View ? (
           <View
-            key={path}
+            key={`${path}:${rev}:${boot}`}
             path={path}
             bytes={bytes}
-            url={fileHref(path)}
+            url={kind.id === "browser" ? siteHref(path, `${rev}:${boot}`) : fileHref(path)}
             onDirty={setDirty}
             onOfficeKey={setOfficeKey}
             registerExport={(fn) => {

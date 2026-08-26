@@ -17,6 +17,14 @@ function repoRoot() {
   return path.resolve(here, "../..");
 }
 
+function appIcon() {
+  const packaged = path.join(process.resourcesPath, "icon.png");
+  const dev = path.join(here, "build", "icon.png");
+  if (app.isPackaged && existsSync(packaged)) return packaged;
+  if (existsSync(dev)) return dev;
+  return undefined;
+}
+
 function sidecarPaths() {
   if (app.isPackaged) {
     const binName = process.platform === "win32" ? "hyper.exe" : "hyper";
@@ -251,16 +259,18 @@ async function createWindow() {
     return;
   }
 
+  const icon = appIcon();
   mainWindow = new BrowserWindow({
     width: 1280,
     height: 840,
     minWidth: 880,
     minHeight: 560,
     title: "grok-hyper",
-    backgroundColor: "#eceff4",
+    backgroundColor: "#111113",
     show: false,
     frame: false,
     autoHideMenuBar: true,
+    ...(icon ? { icon } : {}),
     webPreferences: {
       preload: path.join(here, "preload.cjs"),
       sandbox: true,

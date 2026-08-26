@@ -52,6 +52,7 @@ pub fn list(dir: impl AsRef<Path>) -> Result<Vec<SessionInfo>> {
             continue;
         };
         match inspect(dir, id, &path) {
+            Ok(info) if info.channel == "subagent" => continue,
             Ok(info) => out.push(info),
             Err(_) => continue,
         }
@@ -421,6 +422,39 @@ mod tests {
         assert_eq!(resolve(&dir, "cache").unwrap().unwrap().id, id);
         delete(&dir, &id).unwrap();
         assert!(list(&dir).unwrap().is_empty());
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn list_skips_subagent_channel() {
+        let dir = tmp();
+        let parent = new_session_id();
+        let child = format!("{parent}-abcd1234");
+        SessionLog::create_in(
+            &dir,
+            SessionStart::new(
+                &parent,
+                "/ws",
+                SessionMode::Agent,
+                "sys",
+                "h",
+                SessionMode::Agent.default_policy(),
+            ),
+        )
+        .unwrap();
+        let mut start = SessionStart::new(
+            &child,
+            "/ws",
+            SessionMode::Agent,
+            "sys",
+            "h",
+            SessionMode::Agent.default_policy(),
+        );
+        start.channel = "subagent".into();
+        SessionLog::create_in(&dir, start).unwrap();
+        let listed = list(&dir).unwrap();
+        assert_eq!(listed.len(), 1, "{listed:?}");
+        assert_eq!(listed[0].id, parent);
         let _ = fs::remove_dir_all(dir);
     }
 

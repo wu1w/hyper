@@ -4,8 +4,8 @@
 //! dumb pipe: it must not run a second tool loop, rewrite Cordis, or speak MCP.
 //!
 //! `event.append` params use the [`SessionEvent`] schema. JSONL rows are
-//! `user` / `assistant` / `tool` / `policy` / `stop` / `session/*`. Live
-//! token chunks are `type: "delta"` and are never persisted.
+//! `user` / `assistant` / `tool` / `policy` / `stop` / `session/*` / `subagent`.
+//! Live token chunks are `type: "delta"` and are never persisted.
 
 mod dispatch;
 mod helpers;
@@ -270,6 +270,7 @@ impl SidecarSession {
             "session.delete" => self.session_delete(req.params.as_ref()),
             "session.status" => self.session_status(),
             "session.history" => self.session_history(),
+            "session.subagent" => self.session_subagent(req.params.as_ref()),
             "session.context" => self.session_context(),
             "session.compress" => self.force_compact(None),
             "session.user_edit" => self.session_user_edit(req.params.as_ref()),

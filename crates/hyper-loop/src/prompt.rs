@@ -27,7 +27,8 @@ open a PR unless they ask.
 Use the tools provided. Prefer Read, Glob, and Grep over Shell cat, ls, or \
 rg. Independent read-only calls belong in one turn. Do not parallel writes \
 to the same path. Paths are workspace-relative unless absolute. Write \
-complete files; no placeholder ellipses.
+complete files; no placeholder ellipses. Independent multi-step work can go \
+to Task; do not spawn one for a single Read.
 ";
 
 /// Back-compat alias. Builtin no longer splits office vs coding.
@@ -97,11 +98,20 @@ pub fn is_stale_doc_read_builtin(text: &str) -> bool {
         && text.contains("Office files: Read with no offset returns an outline")
 }
 
+/// Previous builtin that never mentioned Task.
+pub fn is_stale_task_builtin(text: &str) -> bool {
+    text.contains("You are grok-hyper, an agent in this workspace")
+        && text.contains("Independent read-only calls belong in one turn")
+        && text.contains("no placeholder ellipses")
+        && !text.contains("Independent multi-step work can go to Task")
+}
+
 pub fn is_stale_builtin(text: &str) -> bool {
     is_stale_office_builtin(text)
         || is_stale_coding_builtin(text)
         || is_stale_roster_builtin(text)
         || is_stale_doc_read_builtin(text)
+        || is_stale_task_builtin(text)
 }
 
 /// Rewrite home AGENT.md when it is still a previous builtin snapshot.
@@ -149,7 +159,7 @@ mod tests {
     fn builtin_is_cursor_agent_contract() {
         let n = word_count(DEFAULT_AGENT_MD);
         assert!(n >= 80, "Cursor prompt too short: {n} words");
-        assert!(n <= 180, "Cursor prompt too long: {n} words");
+        assert!(n <= 210, "Cursor prompt too long: {n} words");
         assert!(DEFAULT_AGENT_MD.contains("an agent in this workspace"));
         assert!(!DEFAULT_AGENT_MD.contains("coding agent"));
         assert!(!DEFAULT_AGENT_MD.contains("office assistant"));
@@ -236,6 +246,10 @@ mod tests {
             "You are grok-hyper, an agent in this workspace.\nOffice files: Read with no offset returns an outline; then offset is a 1-based chunk.\n"
         ));
         assert!(!is_stale_doc_read_builtin(DEFAULT_AGENT_MD));
+        assert!(is_stale_task_builtin(
+            "You are grok-hyper, an agent in this workspace. Independent read-only calls belong in one turn. no placeholder ellipses"
+        ));
+        assert!(!is_stale_task_builtin(DEFAULT_AGENT_MD));
     }
 
     #[test]

@@ -87,6 +87,16 @@ export type Clarify = {
   options: Array<{ id: string; label: string }>;
 } | null;
 
+export type SubagentSnap = {
+  id: string;
+  description?: string;
+  type?: string;
+  isolation?: string;
+  status?: string;
+  summary?: string;
+  key_paths?: string[];
+};
+
 export type Snap = {
   ok?: boolean;
   session?: string;
@@ -112,6 +122,7 @@ export type Snap = {
   permit?: Permit;
   clarify?: Clarify;
   jobs?: number;
+  subagents?: SubagentSnap[];
 };
 
 export type SessionEvent = {

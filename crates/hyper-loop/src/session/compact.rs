@@ -545,7 +545,8 @@ fn groups(events: &[SessionEvent]) -> Vec<Group> {
                         | SessionEvent::Stop(_)
                         | SessionEvent::Undo(_)
                         | SessionEvent::Start(_)
-                        | SessionEvent::Delta(_) => {
+                        | SessionEvent::Delta(_)
+                        | SessionEvent::Subagent(_) => {
                             i += 1;
                         }
                         SessionEvent::User(_) | SessionEvent::Assistant(_) => break,

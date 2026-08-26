@@ -299,6 +299,53 @@ impl SidecarSession {
         self.reply_text(history_text(self.events(), 8000))
     }
 
+    pub(crate) fn session_subagent(&self, params: Option<&Value>) -> Dispatch {
+        let id = params
+            .and_then(|p| p.get("id").or_else(|| p.get("session")))
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .trim()
+            .to_string();
+        if id.is_empty() {
+            return Dispatch::Error(RpcError::invalid_params("id is required"));
+        }
+        if !crate::subagent::parent_owns_child(&self.session_id, &id) {
+            return Dispatch::Error(RpcError::invalid_params(format!(
+                "subagent `{id}` is not a child of this session"
+            )));
+        }
+        let rec = crate::subagent::get(&id);
+        let dir = match &self.store {
+            EventStore::Log(log) => Some(log.dir().to_path_buf()),
+            EventStore::Memory(_) => None,
+        };
+        let events = crate::subagent::load_transcript_in(dir.as_deref(), &id);
+        let status = rec
+            .as_ref()
+            .map(|r| r.status.as_str().to_string())
+            .or_else(|| {
+                if events.iter().any(|e| e.type_name() == "stop") {
+                    Some("done".into())
+                } else {
+                    None
+                }
+            });
+        Dispatch::Result {
+            result: json!({
+                "ok": true,
+                "id": id,
+                "description": rec.as_ref().map(|r| r.description.as_str()).unwrap_or(""),
+                "type": rec.as_ref().map(|r| r.kind.as_str()).unwrap_or(""),
+                "status": status,
+                "summary": rec.as_ref().map(|r| r.summary.as_str()).unwrap_or(""),
+                "key_paths": rec.as_ref().map(|r| r.key_paths.clone()).unwrap_or_default(),
+                "error": rec.as_ref().and_then(|r| r.error.clone()),
+                "events": events,
+            }),
+            events: Vec::new(),
+        }
+    }
+
     pub(crate) fn session_context(&self) -> Dispatch {
         let view = self.view();
         self.reply_text(context_text(&view))

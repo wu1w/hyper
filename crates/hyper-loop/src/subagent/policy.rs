@@ -14,15 +14,17 @@ pub enum SubagentType {
 }
 
 impl SubagentType {
-    pub fn parse(s: &str) -> Option<Self> {
+    /// Cursor-shaped names never fail spawn. Unknown / `inherit` → generalPurpose.
+    pub fn parse(s: &str) -> Self {
         match s.trim() {
-            "explore" => Some(Self::Explore),
-            "plan" => Some(Self::Plan),
-            "generalPurpose" | "general-purpose" | "general_purpose" | "general" => {
-                Some(Self::GeneralPurpose)
+            "explore" | "cursor-guide" | "ci-investigator" | "bugbot" | "security-review" => {
+                Self::Explore
             }
-            "office" => Some(Self::Office),
-            _ => None,
+            "plan" => Self::Plan,
+            "office" => Self::Office,
+            "generalPurpose" | "general-purpose" | "general_purpose" | "general" | "inherit"
+            | "shell" | "best-of-n-runner" | "" => Self::GeneralPurpose,
+            _ => Self::GeneralPurpose,
         }
     }
 

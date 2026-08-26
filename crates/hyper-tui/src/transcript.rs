@@ -192,6 +192,13 @@ impl Transcript {
                 self.push_system(label);
             }
             SessionEvent::Compact(_) => self.push_system("compact"),
+            SessionEvent::Subagent(s) => {
+                self.commit_live_think();
+                self.blocks.push(Block::new(
+                    Kind::Tool,
+                    format!("Task  {}  {}", s.description, s.status),
+                ));
+            }
             SessionEvent::Start(_) | SessionEvent::Fork(_) | SessionEvent::Undo(_) => {}
         }
         self.follow = true;

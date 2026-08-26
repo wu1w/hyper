@@ -18,7 +18,7 @@ pub use derive::{derive_messages, live_policy};
 pub use event::{
     policy_for_effort, AssistantEvent, CompactEvent, DeltaChannel, DeltaEvent, ForkEvent,
     OpenAiFunction, OpenAiToolCall, PolicyEvent, PolicyReason, SessionEvent, SessionMode,
-    SessionStart, StopEvent, StoredMedia, ToolEvent, UndoEvent, UserEvent,
+    SessionStart, StopEvent, StoredMedia, SubagentEvent, ToolEvent, UndoEvent, UserEvent,
 };
 pub use index::{HistoryIndex, Hit};
 pub use log::SessionLog;

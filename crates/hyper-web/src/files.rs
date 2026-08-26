@@ -4,6 +4,7 @@ use std::fs;
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::time::SystemTime;
 
 use anyhow::{bail, Result};
 use axum::http::HeaderValue;
@@ -12,6 +13,7 @@ use serde_json::{json, Value};
 
 use hyper_loop::config::user_home;
 use hyper_loop::media::{MediaKind, MediaPart, MAX_INLINE_MEDIA_BYTES};
+use hyper_loop::out_dir::OUT_DIR;
 use hyper_loop::Workspace;
 
 pub const DEFAULT_UPLOAD_CAP: u64 = 10 * 1024 * 1024;
@@ -161,6 +163,81 @@ pub fn list_tree(root: &Path, max_entries: usize) -> Result<Vec<Value>> {
     let mut out = Vec::new();
     walk(root, root, 0, max_entries, &mut out)?;
     Ok(out)
+}
+
+/// Files in workspace `out/`. Missing folder → empty list (Q&A has no deliverable).
+pub fn list_out_files(root: &Path, max_files: usize) -> Result<Vec<Value>> {
+    let dir = root.join(OUT_DIR);
+    if !dir.is_dir() {
+        return Ok(vec![]);
+    }
+    let mut files = Vec::new();
+    walk_out_files(root, &dir, 0, max_files, &mut files)?;
+    files.sort_by(|a, b| {
+        let ma = a.get("mtime").and_then(Value::as_u64).unwrap_or(0);
+        let mb = b.get("mtime").and_then(Value::as_u64).unwrap_or(0);
+        mb.cmp(&ma).then_with(|| {
+            let pa = a.get("path").and_then(Value::as_str).unwrap_or("");
+            let pb = b.get("path").and_then(Value::as_str).unwrap_or("");
+            pa.cmp(pb)
+        })
+    });
+    Ok(files)
+}
+
+fn walk_out_files(
+    root: &Path,
+    dir: &Path,
+    depth: usize,
+    max_files: usize,
+    out: &mut Vec<Value>,
+) -> Result<()> {
+    if depth > 8 || out.len() >= max_files {
+        return Ok(());
+    }
+    let mut entries: Vec<_> = match fs::read_dir(dir) {
+        Ok(rd) => rd.filter_map(|e| e.ok()).collect(),
+        Err(_) => return Ok(()),
+    };
+    entries.sort_by_key(|e| e.file_name().to_string_lossy().to_lowercase());
+    for ent in entries {
+        if out.len() >= max_files {
+            break;
+        }
+        let name = ent.file_name().to_string_lossy().to_string();
+        if skip_name(&name) {
+            continue;
+        }
+        let path = ent.path();
+        if path.is_dir() {
+            walk_out_files(root, &path, depth + 1, max_files, out)?;
+            continue;
+        }
+        let meta = match ent.metadata() {
+            Ok(m) => m,
+            Err(_) => continue,
+        };
+        let rel = path
+            .strip_prefix(root)
+            .unwrap_or(&path)
+            .to_string_lossy()
+            .replace('\\', "/");
+        out.push(json!({
+            "path": rel,
+            "name": name,
+            "bytes": meta.len(),
+            "mtime": file_mtime_ms(&meta),
+        }));
+    }
+    Ok(())
+}
+
+fn file_mtime_ms(meta: &fs::Metadata) -> u64 {
+    meta.modified()
+        .ok()
+        .and_then(|t| t.duration_since(SystemTime::UNIX_EPOCH).ok())
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
 }
 
 /// Expand `~` / `~/…`. Other paths are unchanged (relative stays relative).
@@ -464,6 +541,13 @@ fn mime_of(name: &str) -> &'static str {
         "mp3" => "audio/mpeg",
         "md" | "markdown" => "text/markdown",
         "html" | "htm" => "text/html",
+        "css" => "text/css",
+        "js" | "mjs" | "cjs" => "text/javascript",
+        "woff" => "font/woff",
+        "woff2" => "font/woff2",
+        "ttf" => "font/ttf",
+        "otf" => "font/otf",
+        "wasm" => "application/wasm",
         "json" | "jsonl" => "application/json",
         "xml" => "application/xml",
         "csv" => "text/csv",
@@ -479,9 +563,9 @@ fn mime_of(name: &str) -> &'static str {
         "pdf" => "application/pdf",
         "vsd" => "application/vnd.visio",
         "vsdx" => "application/vnd.visio",
-        "rs" | "ts" | "tsx" | "js" | "mjs" | "cjs" | "css" | "txt" | "toml" | "py" | "sh"
-        | "bash" | "zsh" | "yaml" | "yml" | "log" | "ini" | "cfg" | "sql" | "go" | "java" | "c"
-        | "h" | "hpp" | "cc" | "rb" | "env" => "text/plain",
+        "rs" | "ts" | "tsx" | "txt" | "toml" | "py" | "sh" | "bash" | "zsh" | "yaml" | "yml"
+        | "log" | "ini" | "cfg" | "sql" | "go" | "java" | "c" | "h" | "hpp" | "cc" | "rb"
+        | "env" => "text/plain",
         _ => "application/octet-stream",
     }
 }
@@ -627,6 +711,18 @@ mod tests {
     }
 
     #[test]
+    fn web_assets_use_browser_mimes() {
+        assert_eq!(mime_of("styles.css"), "text/css");
+        assert_eq!(mime_of("app.js"), "text/javascript");
+        assert_eq!(mime_of("index.html"), "text/html");
+        assert_eq!(file_content_type("text/css").to_str().unwrap(), "text/css; charset=utf-8");
+        assert_eq!(
+            file_content_type("text/javascript").to_str().unwrap(),
+            "text/javascript; charset=utf-8"
+        );
+    }
+
+    #[test]
     fn urlencode_covers_reserved_bytes() {
         assert_eq!(urlencode_rfc3986("a b"), "a%20b");
         assert_eq!(urlencode_rfc3986("a#b?c%d&e+f"), "a%23b%3Fc%25d%26e%2Bf");
@@ -694,6 +790,24 @@ mod tests {
         assert_eq!(path, fs::canonicalize(&dir).unwrap());
         assert_eq!(kids.len(), 1);
         assert_eq!(kids[0]["name"], "sub");
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn list_out_files_empty_without_folder() {
+        let dir = std::env::temp_dir().join(format!("hyper-out-{}", uuid::Uuid::new_v4()));
+        fs::create_dir_all(&dir).unwrap();
+        assert!(list_out_files(&dir, 50).unwrap().is_empty());
+        fs::create_dir_all(dir.join("out/demo")).unwrap();
+        fs::write(dir.join("out/demo/index.html"), b"<p>ok</p>").unwrap();
+        fs::write(dir.join("out/skip.py"), b"print(1)\n").unwrap();
+        let rows = list_out_files(&dir, 50).unwrap();
+        let paths: Vec<_> = rows
+            .iter()
+            .filter_map(|r| r.get("path").and_then(|v| v.as_str()))
+            .collect();
+        assert!(paths.contains(&"out/demo/index.html"), "{paths:?}");
+        assert!(paths.contains(&"out/skip.py"), "{paths:?}");
         fs::remove_dir_all(&dir).ok();
     }
 }

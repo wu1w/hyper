@@ -22,6 +22,28 @@ function isWinDesktop() {
   return window.grokHyperDesktop?.platform === "win32";
 }
 
+function WinCaptionIcon({ kind }: { kind: "min" | "max" | "close" }) {
+  if (kind === "min") {
+    return (
+      <svg viewBox="0 0 10 10" aria-hidden>
+        <rect x="1" y="4.5" width="8" height="1" rx="0.2" />
+      </svg>
+    );
+  }
+  if (kind === "max") {
+    return (
+      <svg viewBox="0 0 10 10" aria-hidden>
+        <rect x="1.5" y="1.5" width="7" height="7" fill="none" stroke="currentColor" strokeWidth="1" />
+      </svg>
+    );
+  }
+  return (
+    <svg viewBox="0 0 10 10" aria-hidden>
+      <path d="M2 2 L8 8 M8 2 L2 8" fill="none" stroke="currentColor" strokeWidth="1.15" />
+    </svg>
+  );
+}
+
 function WindowButtons() {
   const desktop = window.grokHyperDesktop;
   if (!desktop) {
@@ -38,9 +60,15 @@ function WindowButtons() {
     <div className="traffic">
       {win ? (
         <>
-          <button type="button" className="tl-y" aria-label="最小化" onClick={() => desktop.minimize()} />
-          <button type="button" className="tl-g" aria-label="最大化" onClick={() => desktop.toggleMaximize()} />
-          <button type="button" className="tl-r" aria-label="关闭" onClick={() => desktop.close()} />
+          <button type="button" className="tl-y" aria-label="最小化" onClick={() => desktop.minimize()}>
+            <WinCaptionIcon kind="min" />
+          </button>
+          <button type="button" className="tl-g" aria-label="最大化" onClick={() => desktop.toggleMaximize()}>
+            <WinCaptionIcon kind="max" />
+          </button>
+          <button type="button" className="tl-r" aria-label="关闭" onClick={() => desktop.close()}>
+            <WinCaptionIcon kind="close" />
+          </button>
         </>
       ) : (
         <>

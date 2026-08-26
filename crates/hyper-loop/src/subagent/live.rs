@@ -29,10 +29,8 @@ async fn run_inner(req: SpawnReq) -> Result<ChildOutcome, String> {
         return Err("cancelled".into());
     }
     let mut cfg = req.config.clone();
-    if let Some(model) = &req.model {
-        if !model.trim().is_empty() {
-            cfg.server.model = model.clone();
-        }
+    if let Some(model) = super::effective_model(req.model.as_deref()) {
+        cfg.server.model = model;
     }
     let budget = cfg.think_budget();
     let policy = req.kind.think_policy(&budget);
@@ -45,8 +43,14 @@ async fn run_inner(req: SpawnReq) -> Result<ChildOutcome, String> {
     let mut opts = RunOpts::from_config(&cfg, req.cwd.clone());
     opts.session_id = req.id.clone();
     opts.print = req.print;
-    opts.persist_session = req.persist;
-    opts.session_dir = req.session_dir.clone();
+    opts.persist_session = true;
+    opts.session_dir = req.session_dir.clone().or_else(|| {
+        req.home.as_ref().map(|h| h.join("sessions")).or_else(|| {
+            crate::config::Config::home_dir()
+                .ok()
+                .map(|h| h.join("sessions"))
+        })
+    });
     opts.home = req.home.clone();
     opts.child = Some(ChildCtx {
         kind: req.kind,
@@ -63,9 +67,6 @@ async fn run_inner(req: SpawnReq) -> Result<ChildOutcome, String> {
 
     let mut agent = Agent::new(completer, opts).map_err(|e| e.to_string())?;
     agent.set_cancel(req.cancel.clone());
-    if let Some(emit) = req.emit {
-        agent.set_emit(emit);
-    }
     let prompt = wrap_prompt(req.kind, &req.prompt);
     let out = tokio::select! {
         biased;

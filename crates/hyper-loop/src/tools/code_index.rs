@@ -37,6 +37,7 @@ const SKIP_DIR: &[&str] = &[
     "Local Settings",
     "Library",
     "Caches",
+    "OneDrive",
 ];
 
 pub struct CodeIndex {
@@ -56,11 +57,20 @@ impl CodeIndex {
         // Packaged Electron used to spawn with cwd=home. Indexing a Windows
         // profile (AppData / OneDrive / Downloads) blocks the first model hop
         // for minutes while the UI says "正在调用模型".
+        // A stray `~/.git` must not own the index: `git ls-files` will not
+        // enter nested repositories, so search returns nothing useful.
         if is_user_home(root) {
-            return Self::empty();
+            let idx = Self::empty();
+            idx.sync_root(root, collect_nested_git_files(root));
+            return idx;
         }
         let tracked = git_ls_files(root);
-        let files = tracked.clone().unwrap_or_else(|| walk_fallback(root));
+        let mut files = tracked.clone().unwrap_or_else(|| walk_fallback(root));
+        if tracked.is_some() {
+            files.extend(collect_nested_git_files(root));
+            files.sort();
+            files.dedup();
+        }
         // Git workspaces get a global cache. Scratch/non-repository folders
         // stay in memory, so hyper never leaves project-local index artifacts.
         let idx = if tracked.is_some() {
@@ -793,33 +803,126 @@ fn is_user_home(root: &Path) -> bool {
     let Some(home) = crate::config::user_home() else {
         return false;
     };
-    let a = std::fs::canonicalize(root).unwrap_or_else(|_| root.to_path_buf());
-    let b = std::fs::canonicalize(&home).unwrap_or(home);
+    same_dir(root, &home)
+}
+
+fn same_dir(a: &Path, b: &Path) -> bool {
+    let a = std::fs::canonicalize(a).unwrap_or_else(|_| a.to_path_buf());
+    let b = std::fs::canonicalize(b).unwrap_or_else(|_| b.to_path_buf());
     a == b
 }
 
-fn git_ls_files(root: &Path) -> Option<Vec<PathBuf>> {
+fn git_toplevel(root: &Path) -> Option<PathBuf> {
+    let out = git_at(root, &["rev-parse", "--show-toplevel"])?;
+    let s = String::from_utf8_lossy(&out).trim().to_string();
+    if s.is_empty() {
+        return None;
+    }
+    Some(PathBuf::from(s))
+}
+
+fn git_at(root: &Path, args: &[&str]) -> Option<Vec<u8>> {
     let mut cmd = Command::new("git");
     crate::proc_spawn::hide_window(&mut cmd);
     let out = cmd
         .args(["-C"])
         .arg(root)
-        .args(["ls-files", "-z", "-c", "-o", "--exclude-standard"])
+        .args(["-c", "safe.directory=*"])
+        .args(args)
         .env("GIT_TERMINAL_PROMPT", "0")
         .env("GIT_OPTIONAL_LOCKS", "0")
         .env("GIT_PAGER", "")
         .output()
         .ok()?;
-    if !out.status.success() || out.stdout.is_empty() {
+    if !out.status.success() {
+        return None;
+    }
+    Some(out.stdout)
+}
+
+/// `git ls-files` relative to `root`. None when git is missing, the repo is the
+/// user home (accidental `~/.git`), or the discovered toplevel lives outside
+/// the workspace — those cases would hide nested clones.
+fn git_ls_files(root: &Path) -> Option<Vec<PathBuf>> {
+    let top = git_toplevel(root)?;
+    if is_user_home(&top) {
+        return None;
+    }
+    let top_c = std::fs::canonicalize(&top).unwrap_or(top);
+    let root_c = std::fs::canonicalize(root).unwrap_or_else(|_| root.to_path_buf());
+    if !root_c.starts_with(&top_c) && !top_c.starts_with(&root_c) {
+        return None;
+    }
+    git_ls_files_raw(root)
+}
+
+fn git_ls_files_raw(root: &Path) -> Option<Vec<PathBuf>> {
+    let stdout = git_at(root, &["ls-files", "-z", "-c", "-o", "--exclude-standard"])?;
+    if stdout.is_empty() {
         return None;
     }
     Some(
-        out.stdout
+        stdout
             .split(|b| *b == 0)
             .filter(|s| !s.is_empty())
             .map(|s| PathBuf::from(String::from_utf8_lossy(s).as_ref()))
             .collect(),
     )
+}
+
+/// Directories with their own `.git` that `git ls-files` on the parent skips.
+fn collect_nested_git_files(root: &Path) -> Vec<PathBuf> {
+    let mut out = Vec::new();
+    walk_nested_git(root, root, 0, &mut out);
+    out
+}
+
+const NESTED_GIT_DEPTH: usize = 8;
+
+fn walk_nested_git(root: &Path, dir: &Path, depth: usize, out: &mut Vec<PathBuf>) {
+    if out.len() >= MAX_FILES || depth > NESTED_GIT_DEPTH {
+        return;
+    }
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        if out.len() >= MAX_FILES {
+            return;
+        }
+        let name = entry.file_name();
+        let name_s = name.to_string_lossy();
+        let Ok(ft) = entry.file_type() else {
+            continue;
+        };
+        if !ft.is_dir() {
+            continue;
+        }
+        if SKIP_DIR.contains(&name_s.as_ref()) {
+            continue;
+        }
+        let path = entry.path();
+        if path.join(".git").exists() {
+            if let Some(files) = git_ls_files_raw(&path) {
+                for f in files {
+                    let abs = path.join(&f);
+                    if let Ok(rel) = abs.strip_prefix(root) {
+                        out.push(rel.to_path_buf());
+                    }
+                }
+            } else {
+                let mut nested = Vec::new();
+                walk_dir(&path, &path, &mut nested);
+                for f in nested {
+                    if let Ok(rel) = path.join(f).strip_prefix(root) {
+                        out.push(rel.to_path_buf());
+                    }
+                }
+            }
+            continue;
+        }
+        walk_nested_git(root, &path, depth + 1, out);
+    }
 }
 
 fn walk_fallback(root: &Path) -> Vec<PathBuf> {
@@ -1092,6 +1195,8 @@ fn like_escape(s: &str) -> String {
 mod tests {
     use super::*;
     use serde_json::json;
+    use std::path::Path;
+    use std::process::Command;
 
     fn scratch() -> (std::path::PathBuf, Workspace) {
         let dir = std::env::temp_dir().join(format!("hyper-idx-{}", uuid::Uuid::new_v4().simple()));
@@ -1321,6 +1426,57 @@ mod tests {
     fn skip_rel_drops_windows_profile_junk() {
         assert!(skip_rel(Path::new("AppData/Local/foo.rs")));
         assert!(skip_rel(Path::new("Library/Caches/bar.py")));
+        assert!(skip_rel(Path::new("OneDrive/docs.rs")));
         assert!(!skip_rel(Path::new("src/foo.rs")));
+    }
+
+    fn git_init(dir: &Path) {
+        let st = Command::new("git")
+            .args(["init"])
+            .current_dir(dir)
+            .env("GIT_TERMINAL_PROMPT", "0")
+            .output()
+            .expect("git init");
+        assert!(
+            st.status.success(),
+            "{}",
+            String::from_utf8_lossy(&st.stderr)
+        );
+    }
+
+    #[test]
+    fn search_indexes_nested_git_repos() {
+        let dir =
+            std::env::temp_dir().join(format!("hyper-nest-{}", uuid::Uuid::new_v4().simple()));
+        std::fs::create_dir_all(dir.join("nested/src")).unwrap();
+        git_init(&dir);
+        std::fs::write(dir.join("README.md"), "outer workspace\n").unwrap();
+        git_init(&dir.join("nested"));
+        std::fs::write(
+            dir.join("nested/src/hit.rs"),
+            "fn nested_search_needle() {}\n",
+        )
+        .unwrap();
+        let idx = CodeIndex::build(&dir);
+        let hits = idx.search("nested_search_needle", None, 8);
+        assert!(
+            hits.iter()
+                .any(|h| h.path.contains("hit.rs") && h.body.contains("nested_search_needle")),
+            "nested repo was invisible to search: {hits:?}"
+        );
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn git_ls_files_ignores_home_repo() {
+        let Some(home) = crate::config::user_home() else {
+            return;
+        };
+        assert!(is_user_home(&home));
+        // Even if HOME is a git repo, list_index must not treat it as the project.
+        // git_ls_files returns None so the caller walks / finds nested clones.
+        if git_toplevel(&home).is_some_and(|top| same_dir(&top, &home)) {
+            assert!(git_ls_files(&home).is_none());
+        }
     }
 }

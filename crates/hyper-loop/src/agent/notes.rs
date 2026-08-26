@@ -65,7 +65,19 @@ impl<C: Completer> Agent<C> {
         if crate::cron::wants_cron_card(user) && !sticky::live_has_cron_note(&self.messages) {
             self.push_hidden_user(crate::cron::CRON_CARD);
         }
+        self.inject_out_dir(user);
         self.inject_doc_read(user);
+    }
+
+    pub(crate) fn inject_out_dir(&mut self, user: &str) {
+        if forbids_tools(user) {
+            return;
+        }
+        if sticky::live_has_out_note(&self.messages) {
+            let n = sticky::stub_live_out_notes(&mut self.messages);
+            self.note_stubbed(n);
+        }
+        self.push_ephemeral_note(crate::out_dir::OUT_CARD);
     }
 
     pub(crate) fn inject_doc_read(&mut self, text: &str) {

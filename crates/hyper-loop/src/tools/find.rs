@@ -25,6 +25,7 @@ pub(crate) const SKIP_DIR: &[&str] = &[
     "Local Settings",
     "Library",
     "Caches",
+    "OneDrive",
 ];
 
 const GLOB_CAP: usize = 200;

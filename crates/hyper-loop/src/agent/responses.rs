@@ -1044,10 +1044,21 @@ fn auth_or_status(status: reqwest::StatusCode, body: &str) -> Error {
 }
 
 fn format_api_error(err: &Value) -> String {
-    err.get("message")
+    if let Some(m) = err
+        .get("message")
         .and_then(|m| m.as_str())
-        .map(|s| s.to_string())
-        .unwrap_or_else(|| "responses error".into())
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+    {
+        return m.to_string();
+    }
+    if let Some(s) = err.as_str().map(str::trim).filter(|s| !s.is_empty()) {
+        return s.to_string();
+    }
+    if let Some(code) = err.get("code").and_then(|c| c.as_str()) {
+        return code.to_string();
+    }
+    serde_json::to_string(err).unwrap_or_else(|_| "responses error".into())
 }
 
 fn lock_policy(m: &Mutex<ThinkPolicy>) -> std::sync::MutexGuard<'_, ThinkPolicy> {

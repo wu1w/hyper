@@ -9,7 +9,7 @@ export function BrowserPreview({ path, bytes, url, onDirty, registerExport }: Pr
   }, [registerExport, initial]);
   return (
     <div className="pv-split">
-      <iframe className="pv-frame" title={path} src={url} sandbox="allow-scripts allow-same-origin" />
+      <iframe className="pv-frame" title={path} src={url} sandbox="allow-scripts" />
       <textarea
         className="pv-html-src"
         defaultValue={initial}

@@ -151,7 +151,7 @@ export function InboxPage({
             ) : (
               <Empty
                 title="没有待审批项"
-                body="ask 模式下 Write / StrReplace / Shell / Task / mcp 会排到这里。AskQuestion 澄清题在聊天弹窗。"
+                body="ask 模式下 Write / StrReplace / Shell / mcp 会排到这里。Task 启动不需要批准；子代理里的写入仍走这扇门。AskQuestion 澄清题在聊天弹窗。"
               />
             )}
           </div>
@@ -1331,7 +1331,7 @@ export function ToolsPage({ active = true }: { active?: boolean }) {
           <ul className="sub" style={{ margin: "6px 0 0", paddingLeft: 18, lineHeight: 1.9 }}>
             <li>盲覆写保护：Write 一个本会话没读过的已有文件会被拒绝，先 Read 再写。</li>
             <li>复读围栏：同一工具同参数连打先提醒、再停机，防死循环烧 token。</li>
-            <li>审批门控：ask 模式下 Write / StrReplace / Shell / Task / mcp 逐一批准。</li>
+            <li>审批门控：ask 模式下 Write / StrReplace / Shell / mcp 逐一批准。Task 本身不弹窗，子代理里的写入仍会。</li>
             <li>工作区边界：文件工具只能操作当前文件夹内路径。</li>
           </ul>
         </div>

@@ -44,6 +44,7 @@ const PATHS: Record<string, string> = {
   download: "M12 3v12M7 10l5 5 5-5M5 21h14",
   maximize: "M4 9V4h5M20 9V4h-5M4 15v5h5M20 15v5h-5",
   restore: "M9 4H4v5M15 4h5v5M9 20H4v-5M15 20h5v-5",
+  fork: "M6 3v12M18 9v12M6 15a3 3 0 100-6 3 3 0 000 6zM18 21a3 3 0 100-6 3 3 0 000 6zM8.7 9H12a6 6 0 016 6",
 };
 
 export function Icon({ name, className = "ico" }: { name: string; className?: string }) {

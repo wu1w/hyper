@@ -22,6 +22,7 @@ pub mod media;
 pub mod memory;
 pub mod oauth;
 pub mod office_edit;
+pub mod out_dir;
 pub mod paw_loop;
 pub mod permit;
 pub mod platform_prefix;

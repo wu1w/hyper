@@ -90,6 +90,7 @@ pub fn is_sticky_note(text: &str) -> bool {
         || inner.starts_with("[mcp:")
         || inner.starts_with("[mcp]")
         || inner.starts_with("[style]")
+        || inner.starts_with("[out]")
         || inner.starts_with("MEMORY hot")
         || inner.starts_with("MEMORY hosts")
         || inner.starts_with("MEMORY.md")
@@ -129,6 +130,9 @@ fn stub_body(inner: &str) -> String {
     if inner.starts_with("[style]") {
         return "[style] applied".into();
     }
+    if inner.starts_with("[out]") {
+        return "[out] applied".into();
+    }
     "applied".into()
 }
 
@@ -143,6 +147,11 @@ pub fn stub_live_skill_notes(messages: &mut [ChatMessage]) -> usize {
     stub_notes(messages, StubWhen::Now, |inner| {
         inner.starts_with("[skill:")
     })
+}
+
+/// Fresh `[out]` card each user turn.
+pub fn stub_live_out_notes(messages: &mut [ChatMessage]) -> usize {
+    stub_notes(messages, StubWhen::Now, |inner| inner.starts_with("[out]"))
 }
 
 /// User explicitly named an MCP server. Don't wait two turns.
@@ -240,6 +249,16 @@ pub fn live_has_doc_read_note(messages: &[ChatMessage]) -> bool {
             && m.content
                 .as_deref()
                 .is_some_and(|c| unwrap_hidden(c).starts_with("[doc-read]"))
+    })
+}
+
+pub fn live_has_out_note(messages: &[ChatMessage]) -> bool {
+    messages.iter().any(|m| {
+        m.role == "user"
+            && m.content.as_deref().is_some_and(|c| {
+                let inner = unwrap_hidden(c);
+                inner.starts_with("[out]") && !inner.contains(" applied")
+            })
     })
 }
 
@@ -351,6 +370,24 @@ mod tests {
         let hidden = msgs[2].content.as_deref().unwrap();
         assert!(hidden.contains("[style] applied"), "{hidden}");
         assert!(!live_has_style_note(&msgs), "stub must allow re-inject");
+    }
+
+    #[test]
+    fn out_card_stubs_immediately() {
+        let mut msgs = vec![
+            ChatMessage::system("sys"),
+            ChatMessage::user("u1"),
+            ChatMessage::hidden_user(crate::out_dir::OUT_CARD),
+            ChatMessage::assistant("ok"),
+        ];
+        assert!(live_has_out_note(&msgs));
+        stub_live_out_notes(&mut msgs);
+        assert!(!live_has_out_note(&msgs));
+        assert!(msgs[2]
+            .content
+            .as_deref()
+            .unwrap()
+            .contains("[out] applied"));
     }
 
     #[test]

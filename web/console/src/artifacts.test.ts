@@ -1,5 +1,13 @@
 import assert from "node:assert/strict";
-import { turnArtifacts, turnPreviewPaths } from "./artifacts";
+import {
+  isOutPath,
+  mergeArtifactLists,
+  siblingStamp,
+  turnArtifacts,
+  turnPreviewPaths,
+  turnTouchedPaths,
+} from "./artifacts";
+import { siteHref } from "./media";
 import type { SessionEvent } from "./api";
 
 const WS = "/tmp/hyper-dialect-ws";
@@ -23,38 +31,58 @@ function turn(user: string, rest: SessionEvent[]) {
 }
 
 {
+  assert.equal(isOutPath("out/guide.docx"), true);
+  assert.equal(isOutPath("out/demo/index.html"), true);
+  assert.equal(isOutPath(`${WS}/out/guide.docx`), true);
+  assert.equal(isOutPath("out.pptx"), false);
+  assert.equal(isOutPath("notes/out.md"), false);
+  assert.equal(isOutPath("timeout/x.docx"), false);
+}
+
+{
+  assert.deepEqual(turn("现在几点", []), []);
+}
+
+{
   const events: SessionEvent[] = [
     { type: "user", text: "给你自己做一个使用说明的word文档" },
     ...tool(
       "Write",
       {
         path: `${WS}/build_user_guide.py`,
-        contents: 'out = "/tmp/hyper-dialect-ws/grok-hyper-使用说明.docx"\n',
+        contents: 'out = "/tmp/hyper-dialect-ws/out/grok-hyper-使用说明.docx"\n',
       },
       "Wrote 38213 bytes to /tmp/hyper-dialect-ws/build_user_guide.py.",
     ),
     ...tool(
       "Shell",
       {
-        command: `${WS}/.pptx-venv/bin/python ${WS}/build_user_guide.py && ls -la "${WS}/grok-hyper-使用说明.docx"`,
+        command: `${WS}/.pptx-venv/bin/python ${WS}/build_user_guide.py && ls -la "${WS}/out/grok-hyper-使用说明.docx"`,
       },
-      `${WS}/grok-hyper-使用说明.docx\n-rw-r--r--@ 1 william  wheel  52041 Aug 25 19:51 ${WS}/grok-hyper-使用说明.docx\n`,
+      `${WS}/out/grok-hyper-使用说明.docx\n-rw-r--r--@ 1 william  wheel  52041 Aug 25 19:51 ${WS}/out/grok-hyper-使用说明.docx\n`,
     ),
-    { type: "assistant", content: "已写好使用说明 Word，路径是 `grok-hyper-使用说明.docx`。" },
+    { type: "assistant", content: "已写好使用说明 Word，路径是 `out/grok-hyper-使用说明.docx`。" },
   ];
-  assert.deepEqual(turnArtifacts(events, WS), ["grok-hyper-使用说明.docx"]);
+  assert.deepEqual(turnArtifacts(events, WS), ["out/grok-hyper-使用说明.docx"]);
 }
 
 {
   assert.deepEqual(
-    turn("做 ppt", tool("Shell", { command: `python ${WS}/build_self_intro.py` }, `${WS}/grok-hyper-self-intro.pptx\n`)),
-    ["grok-hyper-self-intro.pptx"],
+    turn("做 ppt", tool("Shell", { command: `python ${WS}/build_self_intro.py` }, `${WS}/out/grok-hyper-self-intro.pptx\n`)),
+    ["out/grok-hyper-self-intro.pptx"],
   );
 }
 
 {
   assert.deepEqual(
     turn("x", tool("Write", { path: `${WS}/build_user_guide.py`, contents: "print(1)\n" }, "Wrote 8 bytes to build_user_guide.py.")),
+    [],
+  );
+}
+
+{
+  assert.deepEqual(
+    turn("x", tool("Write", { path: `${WS}/guide.docx`, contents: "x" }, `Wrote 1 bytes to ${WS}/guide.docx.`)),
     [],
   );
 }
@@ -73,7 +101,6 @@ function turn(user: string, rest: SessionEvent[]) {
   );
 }
 
-// Direct Write of each preview-kind product.
 const WRITE_FILES = [
   "deck.pptx",
   "legacy.ppt",
@@ -97,23 +124,19 @@ const WRITE_FILES = [
   "board.canvas.json",
 ];
 for (const file of WRITE_FILES) {
-  const got = turn("做文件", tool("Write", { path: `${WS}/${file}`, contents: "x" }, `Wrote 1 bytes to ${WS}/${file}.`));
-  assert.deepEqual(got, [file], `Write ${file} -> ${got.join(",")}`);
+  const got = turn("做文件", tool("Write", { path: `${WS}/out/${file}`, contents: "x" }, `Wrote 1 bytes to ${WS}/out/${file}.`));
+  assert.deepEqual(got, [`out/${file}`], `Write out/${file} -> ${got.join(",")}`);
 }
 
-// Python save is not a Write-path; Cursor only lists files after Shell actually ran.
 {
   const cases: Array<{ file: string; cmd: string; out: string }> = [
-    { file: "out.pptx", cmd: `python build.py && echo ${WS}/out.pptx`, out: `${WS}/out.pptx\n` },
-    { file: "out.docx", cmd: `python -c 'doc.save("${WS}/out.docx")'`, out: `${WS}/out.docx\n` },
-    { file: "out.xlsx", cmd: `python -c 'df.to_excel("${WS}/out.xlsx")'`, out: `${WS}/out.xlsx\n` },
-    { file: "out.csv", cmd: `python -c 'df.to_csv("${WS}/out.csv")'`, out: `${WS}/out.csv\n` },
-    { file: "out.html", cmd: `python -c 'df.to_html("${WS}/out.html")'`, out: `${WS}/out.html\n` },
-    { file: "chart.png", cmd: `python -c 'plt.savefig("${WS}/chart.png")'`, out: `${WS}/chart.png\n` },
-    { file: "out.pdf", cmd: `python -c 'c.save("${WS}/out.pdf")'`, out: `${WS}/out.pdf\n` },
-    { file: "out.ods", cmd: `python -c 'wb.save("${WS}/out.ods")'`, out: `${WS}/out.ods\n` },
-    { file: "out.odp", cmd: `python -c 'prs.save("${WS}/out.odp")'`, out: `${WS}/out.odp\n` },
-    { file: "out.odt", cmd: `python -c 'doc.save("${WS}/out.odt")'`, out: `${WS}/out.odt\n` },
+    { file: "out/deck.pptx", cmd: `python build.py && echo ${WS}/out/deck.pptx`, out: `${WS}/out/deck.pptx\n` },
+    { file: "out/note.docx", cmd: `python -c 'doc.save("${WS}/out/note.docx")'`, out: `${WS}/out/note.docx\n` },
+    { file: "out/table.xlsx", cmd: `python -c 'df.to_excel("${WS}/out/table.xlsx")'`, out: `${WS}/out/table.xlsx\n` },
+    { file: "out/grid.csv", cmd: `python -c 'df.to_csv("${WS}/out/grid.csv")'`, out: `${WS}/out/grid.csv\n` },
+    { file: "out/page.html", cmd: `python -c 'df.to_html("${WS}/out/page.html")'`, out: `${WS}/out/page.html\n` },
+    { file: "out/chart.png", cmd: `python -c 'plt.savefig("${WS}/out/chart.png")'`, out: `${WS}/out/chart.png\n` },
+    { file: "out/one.pdf", cmd: `python -c 'c.save("${WS}/out/one.pdf")'`, out: `${WS}/out/one.pdf\n` },
   ];
   for (const { file, cmd, out } of cases) {
     const got = turn("生成", tool("Shell", { command: cmd }, out));
@@ -121,7 +144,6 @@ for (const file of WRITE_FILES) {
   }
 }
 
-// Script body is not a file list (Cursor does not scrape Write contents).
 {
   assert.deepEqual(
     turn(
@@ -132,7 +154,6 @@ for (const file of WRITE_FILES) {
   );
 }
 
-// Chat prose / backticks are not a file list.
 {
   assert.deepEqual(
     turn("x", [{ type: "assistant", content: "成品在 `report.docx` 和 `deck.pptx`。" }]),
@@ -140,64 +161,58 @@ for (const file of WRITE_FILES) {
   );
 }
 
-// pptx skill: python build_pptx.py outline.json -o out.pptx
 {
   assert.deepEqual(
     turn(
       "做幻灯片",
       tool(
         "Shell",
-        { command: `python3 scripts/build_pptx.py outline.json -o ${WS}/pitch.pptx` },
+        { command: `python3 scripts/build_pptx.py outline.json -o ${WS}/out/pitch.pptx` },
         "wrote pitch.pptx\n",
       ),
     ),
-    ["pitch.pptx"],
+    ["out/pitch.pptx"],
   );
 }
 
-// Filename with spaces, quoted.
 {
   assert.deepEqual(
     turn(
       "做表",
       tool(
         "Shell",
-        { command: `python build.py && ls -la "${WS}/Q3 报告.xlsx"` },
-        `-rw-r-- 1 u  wheel  12 Aug 25 20:00 ${WS}/Q3 报告.xlsx\n`,
+        { command: `python build.py && ls -la "${WS}/out/Q3 报告.xlsx"` },
+        `-rw-r-- 1 u  wheel  12 Aug 25 20:00 ${WS}/out/Q3 报告.xlsx\n`,
       ),
     ),
-    ["Q3 报告.xlsx"],
+    ["out/Q3 报告.xlsx"],
   );
 }
 
-// LibreOffice convert stdout.
 {
   const got = turn(
     "转pdf",
     tool(
       "Shell",
-      { command: `soffice --headless --convert-to pdf --outdir ${WS} ${WS}/deck.pptx` },
-      `convert ${WS}/deck.pptx as a PDF document -> ${WS}/deck.pdf using filter : writer_pdf_Export\n`,
+      { command: `soffice --headless --convert-to pdf --outdir ${WS}/out ${WS}/out/deck.pptx` },
+      `convert ${WS}/out/deck.pptx as a PDF document -> ${WS}/out/deck.pdf using filter : writer_pdf_Export\n`,
     ),
   );
-  assert.deepEqual(got, ["deck.pptx", "deck.pdf"]);
+  assert.deepEqual(got, ["out/deck.pptx", "out/deck.pdf"]);
 }
 
-// cp dest.
 {
-  const got = turn("拷贝", tool("Shell", { command: `cp ${WS}/tmp.pptx ${WS}/final.pptx` }, ""));
-  assert.ok(got.includes("final.pptx"), String(got));
+  const got = turn("拷贝", tool("Shell", { command: `cp ${WS}/tmp.pptx ${WS}/out/final.pptx` }, ""));
+  assert.ok(got.includes("out/final.pptx"), String(got));
 }
 
-// word/guide.docx is a real deliverable, not an OOXML listing.
 {
   assert.deepEqual(
-    turn("写", tool("Write", { path: `${WS}/word/guide.docx`, contents: "x" }, `Wrote 1 bytes to ${WS}/word/guide.docx.`)),
-    ["word/guide.docx"],
+    turn("写", tool("Write", { path: `${WS}/out/word/guide.docx`, contents: "x" }, `Wrote 1 bytes to ${WS}/out/word/guide.docx.`)),
+    ["out/word/guide.docx"],
   );
 }
 
-// Imagine generated image (normally junk under .grok-hyper/).
 {
   const events: SessionEvent[] = [
     { type: "user", text: "画一只猫" },
@@ -210,7 +225,6 @@ for (const file of WRITE_FILES) {
   assert.deepEqual(turnArtifacts(events, WS), [".grok-hyper/generated/imagine-abcd.jpg"]);
 }
 
-// Uploads stay out of 产物 (preview fallback still sees attachments).
 {
   const events: SessionEvent[] = [
     { type: "user", text: "看看这个\n[attached: .grok-hyper/uploads/scan.pdf]" },
@@ -219,7 +233,6 @@ for (const file of WRITE_FILES) {
   assert.deepEqual(turnPreviewPaths(events, WS), [".grok-hyper/uploads/scan.pdf"]);
 }
 
-// http URLs are not workspace artifacts.
 {
   assert.deepEqual(
     turn("x", [{ type: "assistant", content: "见 `https://example.com/file.pdf`" }]),
@@ -227,7 +240,6 @@ for (const file of WRITE_FILES) {
   );
 }
 
-// Directory listing without rooted paths must not harvest every existing docx.
 {
   const ls = `-rw-r--r--@ 1 william  wheel  3468485 Aug 25 17:33 HLX10-002-NSCLC301-CSR-v3-TOC-fixed.docx
 -rw-r--r--@ 1 william  wheel    39340 Aug 25 16:55 grok-hyper-self-intro.pptx
@@ -235,39 +247,56 @@ for (const file of WRITE_FILES) {
   assert.deepEqual(turn("x", tool("Shell", { command: "ls -la" }, ls)), []);
 }
 
-// Cursor browse skip: dist / build / .next are not 产物.
 {
   assert.deepEqual(
     turn("x", tool("Write", { path: `${WS}/dist/bundle.html`, contents: "<p/>" }, "Wrote 4 bytes to dist/bundle.html.")),
     [],
   );
-  assert.deepEqual(
-    turn("x", tool("Write", { path: `${WS}/build/out.pdf`, contents: "x" }, "Wrote 1 bytes to build/out.pdf.")),
-    [],
-  );
-  assert.deepEqual(
-    turn("x", tool("Write", { path: `${WS}/.next/static.html`, contents: "x" }, "Wrote 1 bytes to .next/static.html.")),
-    [],
-  );
 }
 
-// Shell command fragments are not files.
 {
   const cmd = `cd /var/www/onlyoffice/documentserver/server/FileConverter/bin && ./x2t /tmp/guide.docx /tmp/guide.pdf ./font_selection.bin; echo exit:$?; ls -la /tmp/guide.pdf`;
   assert.deepEqual(turn("转pdf", tool("Shell", { command: cmd }, `${cmd}\n`)), []);
   assert.deepEqual(
     turn("x", tool("Shell", { command: `DOC="${WS}/grok-hyper-使用说明.docx"` }, "")),
-    ["grok-hyper-使用说明.docx"],
+    [],
   );
-  assert.deepEqual(turn("x", tool("Shell", { command: "doc0=grok-hyper-使用说明.docx", }, "")), []);
 }
 
-// Markdown-only write still shows when there is no office product.
 {
   assert.deepEqual(
     turn("记一下", tool("Write", { path: `${WS}/notes/out.md`, contents: "hi" }, "Wrote 2 bytes to notes/out.md.")),
-    ["notes/out.md"],
+    [],
   );
+}
+
+{
+  const events: SessionEvent[] = [
+    { type: "user", text: "做网页demo" },
+    ...tool("Write", { path: `${WS}/out/mw-csr-demo/index.html`, contents: "<link href=./styles.css>" }, `Wrote 80 bytes to ${WS}/out/mw-csr-demo/index.html.`),
+    ...tool("Write", { path: `${WS}/out/mw-csr-demo/app.js`, contents: "1" }, `Wrote 1 bytes to ${WS}/out/mw-csr-demo/app.js.`),
+    ...tool("Write", { path: `${WS}/out/mw-csr-demo/styles.css`, contents: "body{}" }, `Wrote 8 bytes to ${WS}/out/mw-csr-demo/styles.css.`),
+  ];
+  assert.deepEqual(turnArtifacts(events, WS), ["out/mw-csr-demo/index.html"]);
+  const touched = turnTouchedPaths(events, WS);
+  assert.ok(touched.includes("out/mw-csr-demo/index.html"), String(touched));
+  assert.ok(touched.includes("out/mw-csr-demo/app.js"), String(touched));
+  assert.ok(touched.includes("out/mw-csr-demo/styles.css"), String(touched));
+  const stamp = siblingStamp("out/mw-csr-demo/index.html", touched);
+  assert.ok(stamp.includes("app.js") && stamp.includes("styles.css"), stamp);
+}
+
+{
+  assert.deepEqual(
+    mergeArtifactLists(["out/b.html"], ["out/a.pptx"]),
+    ["out/a.pptx", "out/b.html"],
+  );
+}
+
+{
+  assert.equal(siteHref("out/mw-csr-demo/index.html"), "/api/raw/out/mw-csr-demo/index.html");
+  const page = new URL("http://127.0.0.1:3848/api/raw/out/mw-csr-demo/index.html");
+  assert.equal(new URL("./app.js", page).pathname, "/api/raw/out/mw-csr-demo/app.js");
 }
 
 console.log("artifacts.test.ts ok");

@@ -58,7 +58,8 @@ pub fn derive_messages(events: &[SessionEvent]) -> Vec<ChatMessage> {
             | SessionEvent::Compact(_)
             | SessionEvent::Stop(_)
             | SessionEvent::Undo(_)
-            | SessionEvent::Delta(_) => {}
+            | SessionEvent::Delta(_)
+            | SessionEvent::Subagent(_) => {}
         }
     }
     crate::sticky::stub_expired_notes(&mut out);

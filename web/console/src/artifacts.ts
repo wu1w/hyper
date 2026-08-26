@@ -2,15 +2,8 @@ import type { SessionEvent } from "./api";
 import { pathFromMediaUrl } from "./media";
 
 /**
- * Artifact list follows Cursor's file-review source, then office display rank.
- *
- * Cursor (`fileStatesV2` / `onDidAiEditFile`): only files the agent actually
- * mutated — Write / StrReplace / Delete, plus Shell I/O (redirects, -o, stdout
- * paths). Read / Grep / Glob / chat prose are not a file list. Ignored dirs
- * match Cursor's browse skip set (`.git`, `node_modules`, `dist`, `build`, …).
- *
- * Hyper is not an IDE: when those writes include an office/preview file, the
- * 产物 rail shows that file and hides process scripts (`.py`, unpack listings).
+ * 产物 rail is workspace `out/` (and Imagine media under `.grok-hyper/generated/`).
+ * Event harvest only keeps paths in that folder so Q&A turns stay empty.
  */
 
 const WRITE_TOOLS = new Set(["write", "edit", "strreplace", "delete"]);
@@ -159,12 +152,42 @@ function inWorkspace(p: string, workspace?: string) {
 export function isDeliverablePath(p: string, workspace?: string) {
   const n = foldPath(p).replace(/^['"`]|['"`]$/g, "");
   if (!n || n.length > 512) return false;
-  // Shell fragments: DOC="a.docx", `cd /x && ./x2t a.docx`.
   if (/[=;&|<>"]/.test(n)) return false;
   if (isRemoteUrl(n)) return false;
   if (isGeneratedPath(n)) return inWorkspace(n, workspace);
+  if (!isOutPath(n)) return false;
   if (isJunkPath(n) || isScratchName(n)) return false;
   return inWorkspace(n, workspace);
+}
+
+export const OUT_DIR = "out";
+
+/** Workspace `out/…` only — not a file named `out.pptx`. */
+export function isOutPath(p: string): boolean {
+  const parts = foldPath(p).split("/").filter(Boolean);
+  const i = parts.findIndex((s) => s === OUT_DIR);
+  return i >= 0 && i < parts.length - 1;
+}
+
+export function mergeArtifactLists(...lists: string[][]): string[] {
+  const out = new Map<string, string>();
+  for (const list of lists) {
+    for (const p of list) {
+      const n = foldPath(p);
+      if (!n) continue;
+      const key = n.toLowerCase();
+      if (!out.has(key)) out.set(key, p);
+    }
+  }
+  return rankArtifacts([...out.values()]);
+}
+
+function rankArtifacts(raw: string[]): string[] {
+  const products = raw
+    .filter(isProductPath)
+    .sort((a, b) => productRank(b) - productRank(a) || a.localeCompare(b));
+  if (products.length) return products;
+  return raw.filter((p) => !isProcessPath(p));
 }
 
 function isProcessPath(p: string): boolean {
@@ -192,6 +215,7 @@ function productRank(p: string): number {
   if (/\.(docx|docm|doc|odt|rtf)$/.test(n)) return 90;
   if (/\.(xlsx|xlsm|xls|ods)$/.test(n)) return 90;
   if (/\.pdf$/.test(n)) return 80;
+  if (/(^|\/)index\.html?$/.test(n)) return 78;
   if (/\.html?$/.test(n)) return 70;
   if (/\.canvas\.json$/.test(n) || /\.vsdx$|\.vsd$/.test(n)) return 60;
   if (/\.(png|jpe?g|gif|webp|svg|bmp)$/.test(n)) return 50;
@@ -346,6 +370,28 @@ function addEventMedia(out: Map<string, string>, e: SessionEvent, workspace?: st
   }
 }
 
+/** Workspace writes this turn, including process files next to an HTML demo (`app.js`, `styles.css`). */
+export function turnTouchedPaths(events: SessionEvent[], workspace?: string): string[] {
+  return collectRaw(events, workspace);
+}
+
+export function dirOf(p: string): string {
+  const n = foldPath(p).replace(/\/+$/, "");
+  const i = n.lastIndexOf("/");
+  return i >= 0 ? n.slice(0, i) : "";
+}
+
+/** Files written beside `path` — used to remount HTML preview after CSS/JS land. */
+export function siblingStamp(path: string, touched: string[]): string {
+  if (!path) return "";
+  const dir = dirOf(path);
+  return touched
+    .filter((p) => foldPath(p) === foldPath(path) || dirOf(p) === dir)
+    .map(foldPath)
+    .sort()
+    .join("|");
+}
+
 function collectRaw(events: SessionEvent[], workspace?: string): string[] {
   const out = new Map<string, string>();
   const slice = events.slice(lastLiveUserIndex(events));
@@ -375,14 +421,9 @@ function collectRaw(events: SessionEvent[], workspace?: string): string[] {
   return [...out.values()];
 }
 
-/** Write/save paths for the current user turn. Process scripts and unpack listings stay out. */
+/** Write/save paths for the current user turn that landed in `out/` (or generated media). */
 export function turnArtifacts(events: SessionEvent[], workspace?: string): string[] {
-  const raw = collectRaw(events, workspace);
-  const products = raw
-    .filter(isProductPath)
-    .sort((a, b) => productRank(b) - productRank(a) || a.localeCompare(b));
-  if (products.length) return products;
-  return raw.filter((p) => !isProcessPath(p));
+  return rankArtifacts(collectRaw(events, workspace));
 }
 
 export function isUploadPath(p: string): boolean {

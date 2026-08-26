@@ -86,6 +86,10 @@ impl SessionLog {
         &self.path
     }
 
+    pub fn dir(&self) -> &Path {
+        &self.dir
+    }
+
     pub fn events(&self) -> &[SessionEvent] {
         &self.events
     }

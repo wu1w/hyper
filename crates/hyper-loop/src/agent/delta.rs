@@ -49,6 +49,8 @@ pub struct TokenSink {
 enum TokenSinkKind {
     Events(EventSink),
     Stdio(Arc<StdioState>),
+    /// Keep Responses `stream: true` without painting tokens (child Task).
+    Discard,
 }
 
 impl TokenSink {
@@ -64,6 +66,12 @@ impl TokenSink {
         }
     }
 
+    pub(super) fn discard() -> Self {
+        Self {
+            kind: TokenSinkKind::Discard,
+        }
+    }
+
     pub fn reset(&self) {
         match &self.kind {
             TokenSinkKind::Events(emit) => emit.append(SessionEvent::delta_reset()),
@@ -72,6 +80,7 @@ impl TokenSink {
                     eprintln!();
                 }
             }
+            TokenSinkKind::Discard => {}
         }
     }
 
@@ -91,6 +100,7 @@ impl TokenSink {
                 let _ = std::io::stderr().flush();
                 state.think_streamed.store(true, Ordering::Relaxed);
             }
+            TokenSinkKind::Discard => {}
         }
     }
 
@@ -110,6 +120,7 @@ impl TokenSink {
                 let _ = std::io::stdout().flush();
                 state.text_streamed.store(true, Ordering::Relaxed);
             }
+            TokenSinkKind::Discard => {}
         }
     }
 
@@ -134,6 +145,7 @@ impl TokenSink {
                     eprintln!("[{name}] {preview}");
                 }
             }
+            TokenSinkKind::Discard => {}
         }
     }
 

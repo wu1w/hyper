@@ -25,7 +25,7 @@ use crate::template::ChatMessage;
 use crate::tool_calls::{CancelFlag, ToolCoordinator, COORDINATOR_OWNED_EXEC_TIMEOUT_SECS};
 use crate::tools::{BlobStore, CodeIndex, Workspace};
 use crate::tools_schema::{
-    agent_tools, code_tools, has_tool, mcp_tool, memory_search_tool, view_tool,
+    agent_tools, code_tools, dispatch_name, has_tool, mcp_tool, memory_search_tool, view_tool,
 };
 
 impl<C: Completer> Agent<C> {
@@ -134,7 +134,9 @@ impl<C: Completer> Agent<C> {
                 .or_else(|| Config::home_dir().ok().map(|h| h.join("blobs")))
                 .unwrap_or_else(|| std::env::temp_dir().join("hyper-blobs"))
         }));
-        completer.pin_session(&opts.session_id);
+        if opts.child.is_none() {
+            completer.pin_session(&opts.session_id);
+        }
         if opts.print {
             if let Some(o) = &opts.working_window_overlay {
                 eprintln!(
@@ -351,6 +353,14 @@ pub(crate) fn bind_periphery(
     }
     if opts.media && matches!(tool_set, ToolSet::Agent) {
         tools.push(view_tool());
+    }
+    if opts.child.is_some() {
+        tools.retain(|t| {
+            t["function"]["name"]
+                .as_str()
+                .map(|n| dispatch_name(n) != "task")
+                .unwrap_or(true)
+        });
     }
     (system, tools, memory, skills, mcp)
 }

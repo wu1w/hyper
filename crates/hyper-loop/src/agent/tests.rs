@@ -1077,6 +1077,11 @@ fn parallel_safe_batch_only_read_and_view() {
     assert!(parallel_safe_batch(&[read.clone(), call("g", "Grep")]));
     assert!(parallel_safe_batch(&[read.clone(), call("w", "WebSearch")]));
     assert!(parallel_safe_batch(&[call("r", "Read"), call("g", "Glob")]));
+    assert!(parallel_safe_batch(&[
+        call("t1", "Task"),
+        call("t2", "Task")
+    ]));
+    assert!(parallel_safe_batch(&[read.clone(), call("t", "Task")]));
     assert!(!parallel_safe_batch(&[read.clone(), call("q", "ask")]));
     assert!(!parallel_safe_batch(&[
         read.clone(),
@@ -1890,6 +1895,50 @@ async fn doc_read_card_lands_on_office_files_not_on_code() {
         .filter(|c| c.contains("[doc-read]"))
         .count();
     assert_eq!(hints, 1, "code task must not re-fire the card");
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+#[tokio::test]
+async fn out_card_lands_each_user_turn() {
+    let dir = std::env::temp_dir().join(format!("grok-hyper-{}", uuid::Uuid::new_v4().simple()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let mut o = opts(&dir);
+    o.peripheral = false;
+    let scripted = Scripted {
+        turns: Mutex::new(VecDeque::from([turn_text("3pm"), turn_text("ok")])),
+        meter: false,
+    };
+    let mut agent = Agent::new(scripted, o).unwrap();
+    let _ = agent.run("现在几点").await.unwrap();
+    let live = agent
+        .messages
+        .iter()
+        .filter(|m| m.role == "user")
+        .filter_map(|m| m.content.as_deref())
+        .filter(|c| c.contains("[out]") && !c.contains("[out] applied"))
+        .count();
+    assert_eq!(live, 1, "first turn has one live out card");
+
+    let _ = agent.run("谢谢").await.unwrap();
+    let texts: Vec<_> = agent
+        .messages
+        .iter()
+        .filter(|m| m.role == "user")
+        .filter_map(|m| m.content.as_deref())
+        .filter(|c| c.contains("[out]"))
+        .collect();
+    assert!(
+        texts.iter().any(|c| c.contains("[out] applied")),
+        "previous out card stubs: {texts:?}"
+    );
+    assert_eq!(
+        texts
+            .iter()
+            .filter(|c| c.contains("[out]") && !c.contains("[out] applied"))
+            .count(),
+        1,
+        "second turn has a fresh out card: {texts:?}"
+    );
     let _ = std::fs::remove_dir_all(dir);
 }
 
@@ -2908,7 +2957,7 @@ async fn emit_sink_streams_tool_then_assistant_not_user() {
 }
 
 #[tokio::test]
-async fn child_emit_forwards_tools_not_assistant() {
+async fn child_emit_stays_off_parent_stream() {
     let dir = std::env::temp_dir().join(format!("grok-hyper-{}", uuid::Uuid::new_v4().simple()));
     std::fs::create_dir_all(&dir).unwrap();
     std::fs::write(dir.join("note.txt"), "abc\n").unwrap();
@@ -2933,12 +2982,38 @@ async fn child_emit_forwards_tools_not_assistant() {
     while let Ok(e) = rx.try_recv() {
         kinds.push(e.type_name().to_string());
     }
-    assert!(kinds.iter().any(|k| k == "tool"), "{kinds:?}");
     assert!(
-        !kinds
-            .iter()
-            .any(|k| k == "assistant" || k == "user" || k == "stop"),
-        "child live sink is tools-only: {kinds:?}"
+        kinds.is_empty(),
+        "child live sink must not pollute the parent stream: {kinds:?}"
+    );
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+#[test]
+fn child_tools_omit_task() {
+    let dir = std::env::temp_dir().join(format!("grok-hyper-{}", uuid::Uuid::new_v4().simple()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let scripted = Scripted {
+        turns: Mutex::new(VecDeque::new()),
+        meter: false,
+    };
+    let mut o = opts(&dir);
+    o.child = Some(crate::subagent::ChildCtx {
+        kind: crate::subagent::SubagentType::GeneralPurpose,
+        capability: crate::subagent::CapabilityMode::All,
+    });
+    let agent = Agent::new(scripted, o).unwrap();
+    assert!(
+        crate::tools_schema::has_tool(agent.tools(), "Read"),
+        "children keep Read"
+    );
+    assert!(
+        crate::tools_schema::has_tool(agent.tools(), "AwaitShell"),
+        "children keep AwaitShell"
+    );
+    assert!(
+        !crate::tools_schema::has_tool(agent.tools(), "Task"),
+        "children must not see Task"
     );
     let _ = std::fs::remove_dir_all(dir);
 }

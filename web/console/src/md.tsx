@@ -41,9 +41,10 @@ export function mdInline(escaped: string): string {
     if (!safe) return _m;
     return `<img class="md-img" alt="${alt}" src="${esc(safe)}" loading="lazy" />`;
   });
+  s = s.replace(/\[([^\]]+)\]\((https?:\/\/[^\s)]+)\)/g, '<a href="$2" target="_blank" rel="noreferrer">$1</a>');
   s = s.replace(
-    /\[([^\]]+)\]\((https?:\/\/[^\s)]+)\)/g,
-    '<a href="$2" target="_blank" rel="noreferrer">$1</a>',
+    /\[([^\]]+)\]\(([0-9a-f]{8,32}-[0-9a-f]{8})\)/gi,
+    '<button type="button" class="md-agent" data-agent-id="$2">$1</button>',
   );
   s = s.replace(/\*\*([^*]+)\*\*/g, "<strong>$1</strong>");
   s = s.replace(/~~([^~]+)~~/g, "<del>$1</del>");
@@ -459,10 +460,28 @@ function BlockView({ b, live }: { b: Block; live?: boolean }) {
 }
 
 /** 正文块：parse 只在文本变化时重算。流式未闭合的围栏当代码块，图等收束后再画。 */
-export const MdText = memo(function MdText({ text, live }: { text: string; live?: boolean }) {
+export const MdText = memo(function MdText({
+  text,
+  live,
+  onOpenAgent,
+}: {
+  text: string;
+  live?: boolean;
+  onOpenAgent?: (id: string, label: string, status?: string, type?: string, detail?: string) => void;
+}) {
   const blocks = useMemo(() => parseMd(text), [text]);
   return (
-    <div className={`msg-a${live ? " caret" : ""}`}>
+    <div
+      className={`msg-a${live ? " caret" : ""}`}
+      onClick={(e) => {
+        if (!onOpenAgent) return;
+        const el = (e.target as HTMLElement | null)?.closest?.("[data-agent-id]");
+        if (!el) return;
+        e.preventDefault();
+        const id = el.getAttribute("data-agent-id") || "";
+        if (id) onOpenAgent(id, (el.textContent || "").trim() || id);
+      }}
+    >
       {blocks.map((b, i) => (
         <BlockView key={i} b={b} live={live && i === blocks.length - 1} />
       ))}

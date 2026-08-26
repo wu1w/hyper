@@ -187,7 +187,6 @@ pub fn is_mutating(tool: &str) -> bool {
             | "mcp"
             | "strreplace"
             | "todowrite"
-            | "task"
     )
 }
 
@@ -473,10 +472,10 @@ mod tests {
         assert!(PermitHub::needs_prompt(ApprovalMode::Ask, "write"));
         assert!(PermitHub::needs_prompt(ApprovalMode::Ask, "Write"));
         assert!(!PermitHub::needs_prompt(ApprovalMode::Yolo, "bash"));
-        assert!(PermitHub::needs_prompt(ApprovalMode::Ask, "Task"));
-        assert!(PermitHub::needs_prompt(ApprovalMode::Auto, "Task"));
-        assert!(is_mutating("task"));
-        assert!(is_mutating("Task"));
+        assert!(!PermitHub::needs_prompt(ApprovalMode::Ask, "Task"));
+        assert!(!PermitHub::needs_prompt(ApprovalMode::Auto, "Task"));
+        assert!(!is_mutating("task"));
+        assert!(!is_mutating("Task"));
     }
 
     #[test]

@@ -689,7 +689,11 @@ fn draw(
     }
     let start = *scroll as usize;
     let slice: Vec<Line> = lines.iter().skip(start).take(view_h).cloned().collect();
-    let title = if running { " hyper · running " } else { " hyper " };
+    let title = if running {
+        " hyper · running "
+    } else {
+        " hyper "
+    };
     f.render_widget(
         Paragraph::new(slice).block(Block::default().borders(Borders::TOP).title(title)),
         chunks[0],

@@ -24,7 +24,9 @@ mod spawn;
 mod worktree;
 
 pub use policy::{deny_child_tool, CapabilityMode, SubagentType};
-pub use registry::{list_for_parent, running_count, snapshot_json, ChildRecord, MAX_CONCURRENT};
+pub use registry::{
+    get, list_for_parent, running_count, snapshot_json, ChildRecord, MAX_CONCURRENT,
+};
 pub use spawn::{register_live_runner, ChildOutcome, SpawnReq};
 pub use worktree::Isolation;
 
@@ -51,7 +53,7 @@ pub struct DispatchCtx {
     pub persist: bool,
     pub session_dir: Option<PathBuf>,
     pub home: Option<PathBuf>,
-    /// Parent live sink so the console can show child tool cards while Task runs.
+    /// Parent live sink for Task cards (`subagent` events). Child tools stay off this stream.
     pub emit: Option<crate::sidecar::EventSink>,
     pub permit: Option<crate::permit::PermitHub>,
     pub clarify: Option<crate::clarify::ClarifyHub>,
@@ -133,24 +135,20 @@ async fn dispatch_task(call: &ToolCall, ctx: &DispatchCtx) -> ToolResponse {
     if prompt.trim().is_empty() {
         return ToolResponse::text(&call.id, "Error: Task requires `prompt`.", ToolState::Error);
     }
-    let description = arg_str(&call.arguments, "description").unwrap_or_else(|| "subagent".into());
+    let description = arg_str(&call.arguments, "description")
+        .filter(|s| !s.trim().is_empty())
+        .unwrap_or_else(|| default_description(&prompt));
     let kind_raw = arg_str(&call.arguments, "subagent_type")
         .or_else(|| arg_str(&call.arguments, "type"))
         .unwrap_or_else(|| "generalPurpose".into());
-    let Some(mut kind) = SubagentType::parse(&kind_raw) else {
-        return ToolResponse::text(
-            &call.id,
-            format!(
-                "Error: unknown subagent_type `{kind_raw}` (explore|plan|generalPurpose|office)."
-            ),
-            ToolState::Error,
-        );
-    };
+    let mut kind = SubagentType::parse(&kind_raw);
     let cap = arg_str(&call.arguments, "capability_mode")
         .and_then(|s| CapabilityMode::parse(&s))
         .unwrap_or_else(|| CapabilityMode::from_kind(kind));
-    let background = arg_bool(&call.arguments, "background").unwrap_or(false);
-    let model = arg_str(&call.arguments, "model");
+    let background = arg_bool(&call.arguments, "run_in_background")
+        .or_else(|| arg_bool(&call.arguments, "background"))
+        .unwrap_or(false);
+    let model = effective_model(arg_str(&call.arguments, "model").as_deref());
     let cwd = arg_str(&call.arguments, "cwd")
         .map(PathBuf::from)
         .filter(|p| !p.as_os_str().is_empty())
@@ -164,7 +162,7 @@ async fn dispatch_task(call: &ToolCall, ctx: &DispatchCtx) -> ToolResponse {
 
     if let Some(resume) = arg_str(&call.arguments, "resume")
         .or_else(|| arg_str(&call.arguments, "resume_from"))
-        .filter(|s| !s.is_empty())
+        .filter(|s| !s.is_empty() && s != "self")
     {
         return resume_child(call, &resume, &prompt, background, ctx, model, cwd).await;
     }
@@ -319,12 +317,35 @@ async fn launch(
     description: &str,
     kind: SubagentType,
 ) -> ToolResponse {
+    emit_child(
+        req.emit.as_ref(),
+        &handle.id,
+        description,
+        kind,
+        "running",
+        None,
+        call_id,
+    );
     let notify = handle.notify.clone();
     let wait_id = handle.id.clone();
     let spawn_id = handle.id.clone();
+    let emit = req.emit.clone();
+    let desc = description.to_string();
+    let tool_call_id = call_id.to_string();
     tokio::spawn(async move {
         let out = spawn::run_child(req).await;
+        let status = out.status.as_str().to_string();
+        let summary = out.summary.clone();
         registry::finish(&spawn_id, out.status, out.summary, out.key_paths, out.error);
+        emit_child(
+            emit.as_ref(),
+            &spawn_id,
+            &desc,
+            kind,
+            &status,
+            Some(summary.as_str()),
+            &tool_call_id,
+        );
         notify.notify_waiters();
     });
 
@@ -434,6 +455,81 @@ fn dispatch_kill(call: &ToolCall) -> ToolResponse {
             ToolState::Error,
         ),
     }
+}
+
+fn emit_child(
+    emit: Option<&crate::sidecar::EventSink>,
+    id: &str,
+    description: &str,
+    kind: SubagentType,
+    status: &str,
+    summary: Option<&str>,
+    parent_tool_call_id: &str,
+) {
+    let Some(sink) = emit else {
+        return;
+    };
+    sink.append(crate::session::SessionEvent::subagent(
+        id,
+        description,
+        kind.as_str(),
+        status,
+        summary.map(str::to_string),
+        parent_tool_call_id,
+    ));
+}
+
+fn default_description(prompt: &str) -> String {
+    let words: Vec<&str> = prompt.split_whitespace().take(5).collect();
+    let s = words.join(" ");
+    if s.is_empty() {
+        "subagent".into()
+    } else if s.chars().count() > 48 {
+        let head: String = s.chars().take(47).collect();
+        format!("{head}…")
+    } else {
+        s
+    }
+}
+
+/// Parent may open a child transcript only when the id is `{parent}-{short}`
+/// or the in-process registry lists this session as parent.
+pub fn parent_owns_child(parent: &str, id: &str) -> bool {
+    if parent.is_empty() || id.is_empty() || id == parent {
+        return false;
+    }
+    if id.starts_with(&format!("{parent}-")) {
+        return true;
+    }
+    registry::get(id).is_some_and(|r| r.parent_session == parent)
+}
+
+pub fn load_transcript(id: &str) -> Vec<crate::session::SessionEvent> {
+    load_transcript_in(None, id)
+}
+
+pub fn load_transcript_in(dir: Option<&Path>, id: &str) -> Vec<crate::session::SessionEvent> {
+    let open = if let Some(dir) = dir {
+        crate::session::SessionLog::open_in(dir, id)
+    } else {
+        crate::session::SessionLog::open(id)
+    };
+    open.map(|log| log.events().to_vec()).unwrap_or_default()
+}
+
+/// Cursor `model` on Task. `inherit` / `fast` / `composer-*` keep the parent model.
+pub(crate) fn effective_model(raw: Option<&str>) -> Option<String> {
+    let s = raw.map(str::trim).filter(|s| !s.is_empty())?;
+    let lower = s.to_ascii_lowercase();
+    if matches!(
+        lower.as_str(),
+        "inherit" | "default" | "parent" | "auto" | "fast"
+    ) || lower.starts_with("composer")
+        || lower.starts_with("cursor-")
+    {
+        return None;
+    }
+    Some(s.to_string())
 }
 
 fn format_record(call_id: &str, rec: Option<registry::ChildRecord>) -> ToolResponse {
@@ -898,5 +994,119 @@ mod tests {
         assert!(p.contains("This Task is explore"));
         assert!(!p.contains("You are an explore"));
         assert!(p.contains("look around"));
+    }
+
+    #[test]
+    fn parse_accepts_cursor_aliases() {
+        assert_eq!(SubagentType::parse("inherit"), SubagentType::GeneralPurpose);
+        assert_eq!(SubagentType::parse("shell"), SubagentType::GeneralPurpose);
+        assert_eq!(SubagentType::parse(""), SubagentType::GeneralPurpose);
+        assert_eq!(SubagentType::parse("nope"), SubagentType::GeneralPurpose);
+        assert_eq!(SubagentType::parse("explore"), SubagentType::Explore);
+        assert_eq!(SubagentType::parse("cursor-guide"), SubagentType::Explore);
+        assert_eq!(SubagentType::parse("plan"), SubagentType::Plan);
+        assert_eq!(SubagentType::parse("office"), SubagentType::Office);
+    }
+
+    #[tokio::test]
+    async fn inherit_and_run_in_background_do_not_error() {
+        let _g = lock_registry_for_test().await;
+        registry::clear();
+        let resp = dispatch(
+            &call(
+                "Task",
+                json!({
+                    "prompt": "look around the tree",
+                    "description": "scan tree",
+                    "subagent_type": "inherit",
+                    "run_in_background": true
+                }),
+            ),
+            &parent_ctx(PathBuf::from("/tmp")),
+        )
+        .await;
+        let text = resp.joined_text();
+        assert_eq!(resp.state, ToolState::Success, "{text}");
+        assert!(text.starts_with("BACKGROUND "), "{text}");
+        assert!(text.contains("generalPurpose"), "{text}");
+    }
+
+    #[tokio::test]
+    async fn launch_emits_subagent_card() {
+        let _g = lock_registry_for_test().await;
+        registry::clear();
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut ctx = parent_ctx(PathBuf::from("/tmp"));
+        ctx.emit = Some(crate::sidecar::EventSink::new(tx));
+        let resp = dispatch(
+            &call(
+                "Task",
+                json!({
+                    "prompt": "look around",
+                    "description": "scan lib",
+                    "subagent_type": "explore",
+                    "run_in_background": true
+                }),
+            ),
+            &ctx,
+        )
+        .await;
+        assert_eq!(resp.state, ToolState::Success, "{}", resp.joined_text());
+        let mut kinds = Vec::new();
+        while let Ok(e) = rx.try_recv() {
+            kinds.push(e.type_name().to_string());
+        }
+        assert!(
+            kinds.iter().any(|k| k == "subagent"),
+            "expected a Task card event, got {kinds:?}"
+        );
+    }
+
+    #[test]
+    fn parent_owns_hyphenated_child_id() {
+        assert!(parent_owns_child("sess", "sess-abcd1234"));
+        assert!(!parent_owns_child("sess", "sess"));
+        assert!(!parent_owns_child("sess", "other-abcd1234"));
+    }
+
+    #[test]
+    fn cursor_model_aliases_inherit_parent() {
+        assert_eq!(effective_model(None), None);
+        assert_eq!(effective_model(Some("")), None);
+        assert_eq!(effective_model(Some("inherit")), None);
+        assert_eq!(effective_model(Some("fast")), None);
+        assert_eq!(effective_model(Some("composer-2")), None);
+        assert_eq!(effective_model(Some("cursor-small")), None);
+        assert_eq!(
+            effective_model(Some("grok-4.6")).as_deref(),
+            Some("grok-4.6")
+        );
+    }
+
+    #[tokio::test]
+    async fn model_fast_does_not_error_on_spawn() {
+        let _g = lock_registry_for_test().await;
+        registry::clear();
+        let resp = dispatch(
+            &call(
+                "Task",
+                json!({
+                    "prompt": "ping",
+                    "description": "probe connectivity",
+                    "subagent_type": "explore",
+                    "model": "fast",
+                    "run_in_background": true
+                }),
+            ),
+            &parent_ctx(PathBuf::from("/tmp")),
+        )
+        .await;
+        let text = resp.joined_text();
+        assert_eq!(resp.state, ToolState::Success, "{text}");
+        assert!(text.starts_with("BACKGROUND "), "{text}");
+        assert!(
+            !text.to_ascii_lowercase().contains("model not found"),
+            "{text}"
+        );
     }
 }

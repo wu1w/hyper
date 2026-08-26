@@ -16,9 +16,10 @@ import {
   type SessionEvent,
   type SessionInfo,
   type Snap,
+  type SubagentSnap,
   type Uploaded,
 } from "./api";
-import { isJunkPath, lastLiveUserIndex, turnArtifacts, turnPreviewPaths } from "./artifacts";
+import { isJunkPath, lastLiveUserIndex, mergeArtifactLists, siblingStamp, turnArtifacts, turnPreviewPaths, turnTouchedPaths } from "./artifacts";
 import { isOfficeKind, kindFor } from "./preview/kinds";
 import { PreviewDock } from "./preview/PreviewDock";
 import { MdText } from "./md";
@@ -220,6 +221,23 @@ function isTaskTool(name: string): boolean {
   return n === "task" || n === "spawnsubagent";
 }
 
+function parseTaskOutput(out: string): { id?: string; status?: string } {
+  const bg = out.match(/^BACKGROUND\s+(\S+)/m);
+  if (bg) return { id: bg[1], status: "running" };
+  const st = out.match(/^STATUS\s+(\S+)\s+id=(\S+)/m);
+  if (st) return { status: st[1], id: st[2] };
+  return {};
+}
+
+function agentStatusLabel(status?: string): string {
+  const s = (status || "").toLowerCase();
+  if (s === "running") return "运行中";
+  if (s === "done" || s === "completed") return "已完成";
+  if (s === "failed") return "失败";
+  if (s === "cancelled" || s === "canceled") return "已取消";
+  return status || "";
+}
+
 function isAskTool(name: string): boolean {
   const n = toolKey(name);
   return n === "askquestion" || n === "ask";
@@ -294,44 +312,23 @@ function latestTodos(events: SessionEvent[]): TodoItem[] {
   return items;
 }
 
-function subagentRows(events: SessionEvent[]): Array<{ id: string; label: string; status: string }> {
-  const rows: Array<{ id: string; label: string; status: string }> = [];
-  const seen = new Set<string>();
-  const push = (id: string, label: string, status: string) => {
-    if (seen.has(id)) {
-      const i = rows.findIndex((r) => r.id === id);
-      if (i >= 0) rows[i] = { id, label: label || rows[i].label, status };
-      return;
-    }
-    seen.add(id);
-    rows.push({ id, label, status });
-  };
-  for (const e of events) {
-    const t = (e.type || "").toLowerCase();
-    if (t === "subagent" || t === "task" || t === "agent") {
-      const id = strField(e, "subagent_id", "agent_id", "task_id", "id") || `sub-${rows.length}`;
-      push(id, strField(e, "name", "label", "description") || "子代理", strField(e, "status") || "running");
-    }
-    for (const c of e.tool_calls || []) {
-      if (!isTaskTool(c.function?.name || "")) continue;
-      const a = parseJsonObj(c.function?.arguments || "") || {};
-      const id =
-        (typeof a.id === "string" && a.id) ||
-        (typeof a.subagent_id === "string" && a.subagent_id) ||
-        c.id ||
-        `task-${rows.length}`;
-      const label =
-        (typeof a.description === "string" && a.description) ||
-        (typeof a.subagent_type === "string" && a.subagent_type) ||
-        "Task";
-      push(id, label, "running");
-    }
-    if (e.type === "tool" && isTaskTool(e.name || "")) {
-      const id = e.tool_call_id || strField(e, "subagent_id") || `task-${rows.length}`;
-      push(id, e.name || "Task", "done");
-    }
+function applyTaskMeta(step: ToolStep, patch: { id?: string; status?: string; type?: string; label?: string }) {
+  if (patch.id) step.agentId = patch.id;
+  if (patch.status) step.agentStatus = patch.status;
+  if (patch.type) step.agentType = patch.type;
+  if (patch.label) step.agentLabel = patch.label;
+}
+
+function findTaskStep(steps: Step[], toolCallId?: string, agentId?: string): ToolStep | undefined {
+  if (toolCallId) {
+    const hit = steps.find((s): s is ToolStep => s.kind === "tool" && isTaskTool(s.name) && s.id === toolCallId);
+    if (hit) return hit;
   }
-  return rows;
+  if (agentId) {
+    const hit = steps.find((s): s is ToolStep => s.kind === "tool" && isTaskTool(s.name) && s.agentId === agentId);
+    if (hit) return hit;
+  }
+  return [...steps].reverse().find((s): s is ToolStep => s.kind === "tool" && isTaskTool(s.name) && !s.agentId);
 }
 
 function todoClass(status?: string): string {
@@ -780,16 +777,24 @@ export function ChatPage({
   const [openSteps, setOpenSteps] = useState<Set<string>>(() => new Set());
   const [previewPath, setPreviewPath] = useState("");
   const [previewMax, setPreviewMax] = useState(false);
-  const [detailsTab, setDetailsTab] = useState<"preview" | "arts" | "session">("session");
+  const [detailsTab, setDetailsTab] = useState<"preview" | "arts" | "session" | "agent">("session");
+  const [openAgent, setOpenAgent] = useState<{
+    id: string;
+    label: string;
+    status?: string;
+    type?: string;
+    detail?: string;
+  } | null>(null);
   const [railWidth, setRailWidth] = useState(520);
   const lastArtRef = useRef("");
+  const outBaseRef = useRef<Map<string, string>>(new Map());
+  const [diskOut, setDiskOut] = useState<string[]>([]);
   const lastUpload = useRef({ sig: "", t: 0 });
   const dragRail = useRef<{ x: number; w: number } | null>(null);
   const anchorRef = useRef<{ count: number; sess?: string }>({ count: 0, sess: undefined });
 
-  const turns = useMemo(() => buildTurns(events), [events]);
+  const turns = useMemo(() => buildTurns(events, snap.subagents), [events, snap.subagents]);
   const todos = useMemo(() => latestTodos(events), [events]);
-  const agents = useMemo(() => subagentRows(events), [events]);
   const lastUserKey = useMemo(() => {
     for (let i = turns.length - 1; i >= 0; i--) {
       if (turns[i].user !== undefined) return turns[i].key;
@@ -1243,25 +1248,75 @@ export function ChatPage({
     }
   };
 
-  const arts = useMemo(() => turnArtifacts(events, snap.workspace), [events, snap.workspace]);
-  const previewList = useMemo(() => turnPreviewPaths(events, snap.workspace), [events, snap.workspace]);
+  const eventArts = useMemo(() => turnArtifacts(events, snap.workspace), [events, snap.workspace]);
+  const arts = useMemo(() => mergeArtifactLists(diskOut, eventArts), [diskOut, eventArts]);
+  const previewList = useMemo(() => {
+    const products = arts;
+    if (products.length) return products;
+    return turnPreviewPaths(events, snap.workspace);
+  }, [arts, events, snap.workspace]);
+  const touched = useMemo(() => turnTouchedPaths(events, snap.workspace), [events, snap.workspace]);
   const liveUser = useMemo(() => lastLiveUserIndex(events), [events]);
+  const dockRev = useMemo(() => siblingStamp(previewPath, touched), [previewPath, touched]);
   const openPreview = useCallback((p: string) => {
     if (!p) return;
     setPreviewPath(p);
     setDetailsTab("preview");
     if (!detailsOpen) onToggleDetails();
   }, [detailsOpen, onToggleDetails]);
+  const openAgentView = useCallback((id: string, label: string, status?: string, type?: string, detail?: string) => {
+    if (!id) return;
+    setOpenAgent({ id, label, status, type, detail });
+    setDetailsTab("agent");
+    if (!detailsOpen) onToggleDetails();
+  }, [detailsOpen, onToggleDetails]);
+  useEffect(() => {
+    if (!openAgent || detailsTab !== "agent") return;
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key !== "Escape") return;
+      e.preventDefault();
+      setOpenAgent(null);
+      setDetailsTab("session");
+    };
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+  }, [openAgent, detailsTab]);
   useEffect(() => {
     lastArtRef.current = "";
     setPreviewPath("");
     setPreviewMax(false);
+    setDiskOut([]);
+    setOpenAgent(null);
+    setDetailsTab((t) => (t === "agent" ? "session" : t));
   }, [liveUser, snap.session]);
+  useEffect(() => {
+    let gone = false;
+    (async () => {
+      const j = await api<{ files?: { path: string; bytes?: number; mtime?: number }[] }>("/out").catch(
+        () => ({ files: [] as { path: string; bytes?: number; mtime?: number }[] }),
+      );
+      if (gone) return;
+      const files = j.files || [];
+      const sig = (f: { path: string; bytes?: number; mtime?: number }) => `${f.mtime ?? 0}:${f.bytes ?? 0}`;
+      if (!busy) {
+        outBaseRef.current = new Map(files.map((f) => [f.path, sig(f)]));
+        return;
+      }
+      const base = outBaseRef.current;
+      setDiskOut(files.filter((f) => base.get(f.path) !== sig(f)).map((f) => f.path));
+    })();
+    return () => {
+      gone = true;
+    };
+  }, [busy, events.length, snap.session, snap.workspace]);
   useEffect(() => {
     let gone = false;
     (async () => {
       for (const p of previewList) {
         if (gone) return;
+        // HTML demos usually write CSS/JS after index.html. Opening mid-turn
+        // shows a bare shell; wait until the round finishes.
+        if (kindFor(p).id === "browser" && busy) continue;
         if (isOfficeKind(kindFor(p).id)) {
           try {
             const r = await fetch(`/api/office/config?path=${encodeURIComponent(p)}`);
@@ -1279,7 +1334,7 @@ export function ChatPage({
     return () => {
       gone = true;
     };
-  }, [previewList]);
+  }, [previewList, busy, openPreview]);
   useEffect(() => {
     const onMove = (e: MouseEvent) => {
       const drag = dragRail.current;
@@ -1549,15 +1604,6 @@ export function ChatPage({
               <Empty title="开始对话" body="在下方输入。Enter 发送。需要选择题时打开 AskQuestion。文稿和下载在「文件」页。" />
             ) : null}
             {todos.length ? <TodoBoard items={todos} /> : null}
-            {agents.map((a) => (
-              <div className="subagent-row" key={a.id}>
-                <span className={`st-dot ${a.status === "done" || a.status === "completed" ? "ok" : "run"}`} />
-                <b>Task</b>
-                <span className="grow ellipsis">{a.label}</span>
-                <span className="mono">{a.id}</span>
-                <span className="pill idle">{a.status}</span>
-              </div>
-            ))}
             {turns.map((t, ti) => {
               const isLast = ti === turns.length - 1;
               return (
@@ -1576,6 +1622,8 @@ export function ChatPage({
                   onToggleBlock={toggleBlock}
                   onToggleStep={toggleStep}
                   onOpenPreview={openPreview}
+                  onOpenAgent={openAgentView}
+                  openAgentId={openAgent?.id}
                 />
               );
             })}
@@ -1983,8 +2031,8 @@ export function ChatPage({
         ) : null}
       </div>
       <aside
-        className={`details${detailsOpen ? "" : " closed"}${previewPath && detailsTab === "preview" ? " wide" : ""}${previewMax ? " pv-fill" : ""}`}
-        style={detailsOpen && previewPath && detailsTab === "preview" && !previewMax ? { width: railWidth, flex: "0 0 auto" } : undefined}
+        className={`details${detailsOpen ? "" : " closed"}${detailsTab === "agent" || (previewPath && detailsTab === "preview") ? " wide" : ""}${previewMax ? " pv-fill" : ""}${detailsTab === "agent" ? " agent-open" : ""}`}
+        style={detailsOpen && (detailsTab === "agent" || (previewPath && detailsTab === "preview")) && !previewMax ? { width: railWidth, flex: "0 0 auto" } : undefined}
       >
         <div
           className="dt-split"
@@ -2006,16 +2054,36 @@ export function ChatPage({
             <button type="button" className={`dt-tab${detailsTab === "session" ? " on" : ""}`} onClick={() => setDetailsTab("session")}>
               会话
             </button>
+            {openAgent ? (
+              <button type="button" className={`dt-tab${detailsTab === "agent" ? " on" : ""}`} onClick={() => setDetailsTab("agent")}>
+                子代理
+              </button>
+            ) : null}
           </div>
           <button type="button" className="icon-btn dt-close" title="收起面板" aria-label="收起面板" onClick={onToggleDetails}>
             <Icon name="x" />
           </button>
         </div>
-        <div className="dt-scroll">
+        <div className={`dt-scroll${detailsTab === "agent" ? " agent-fill" : ""}`}>
+          {detailsTab === "agent" && openAgent ? (
+            <AgentDock
+              id={openAgent.id}
+              label={openAgent.label}
+              status={openAgent.status || snap.subagents?.find((r) => r.id === openAgent.id)?.status}
+              kind={openAgent.type || snap.subagents?.find((r) => r.id === openAgent.id)?.type}
+              detail={openAgent.detail}
+              onClose={() => {
+                setOpenAgent(null);
+                setDetailsTab("session");
+              }}
+              onOpenPreview={openPreview}
+            />
+          ) : null}
           {detailsTab === "preview" ? (
             previewPath ? (
               <PreviewDock
                 path={previewPath}
+                rev={dockRev}
                 layout="chat"
                 maximized={previewMax}
                 onMaximize={setPreviewMax}
@@ -2030,8 +2098,10 @@ export function ChatPage({
           ) : null}
           {detailsTab === "arts" || detailsTab === "preview" ? (
           <div className="dt-block">
-            <div className="cap">{arts.length ? "本轮产物" : "本轮文件"}</div>
-            {arts.length === 0 && previewList.length === 0 ? <div className="sub">本轮还没有写入的交付文件，也没有可预览的附件。</div> : null}
+            <div className="cap">{arts.length ? "out/" : "产物"}</div>
+            {arts.length === 0 && previewList.length === 0 ? (
+              <div className="sub">本轮没有产物。问答不必写文件；成品会放在 out/。</div>
+            ) : null}
             {(arts.length ? arts : previewList).map((p) => (
               <div key={p} className={`artifact${isImagePath(p) ? " img" : ""}`}>
                 {isImagePath(p) ? (
@@ -2174,6 +2244,10 @@ type ToolStep = {
   output?: string;
   done: boolean;
   media?: StoredMedia[];
+  agentId?: string;
+  agentStatus?: string;
+  agentType?: string;
+  agentLabel?: string;
 };
 type Step = ToolStep | { kind: "think"; text: string; live?: boolean } | { kind: "note"; text: string };
 type ActivityBlockData = { kind: "activity"; steps: Step[] };
@@ -2236,7 +2310,7 @@ function pushThink(steps: Step[], text: string, live?: boolean): Step[] {
   return out;
 }
 
-function buildTurns(events: SessionEvent[]): TurnGroup[] {
+function buildTurns(events: SessionEvent[], rows?: SubagentSnap[]): TurnGroup[] {
   const turns: TurnGroup[] = [];
   const seen = new Map<string, number>();
   let cur: TurnGroup | undefined;
@@ -2309,13 +2383,24 @@ function buildTurns(events: SessionEvent[]): TurnGroup[] {
           turn().blocks.push({ kind: "text", text: e.content || "", media });
         }
         (e.tool_calls || []).forEach((c, j) => {
-          activity().steps.push({
+          const name = c.function?.name || "tool";
+          const args = c.function?.arguments || "";
+          const step: ToolStep = {
             kind: "tool",
             id: c.id || `${i}.${j}`,
-            name: c.function?.name || "tool",
-            args: c.function?.arguments || "",
+            name,
+            args,
             done: false,
-          });
+          };
+          if (isTaskTool(name)) {
+            const a = parseJsonObj(args) || {};
+            applyTaskMeta(step, {
+              status: "running",
+              type: typeof a.subagent_type === "string" ? a.subagent_type : undefined,
+              label: typeof a.description === "string" ? a.description : undefined,
+            });
+          }
+          activity().steps.push(step);
         });
         return;
       }
@@ -2340,6 +2425,14 @@ function buildTurns(events: SessionEvent[]): TurnGroup[] {
         }
         hit.done = true;
         hit.output = e.output || "";
+        if (isTaskTool(hit.name)) {
+          const parsed = parseTaskOutput(hit.output);
+          applyTaskMeta(hit, parsed);
+          const out = hit.output.trimStart();
+          if (!parsed.status && /^(error|错误)/i.test(out)) {
+            applyTaskMeta(hit, { status: "failed" });
+          }
+        }
         const media = parseStoredMedia(e.media);
         if (media.length) hit.media = media;
         return;
@@ -2369,13 +2462,30 @@ function buildTurns(events: SessionEvent[]): TurnGroup[] {
           return;
         }
         if (t === "subagent" || t === "task" || t === "agent") {
-          const id = strField(e, "subagent_id", "agent_id", "task_id", "id") || "subagent";
-          const label = strField(e, "name", "label", "description") || "子代理";
+          const id = strField(e, "id", "subagent_id", "agent_id", "task_id") || "";
+          const label = strField(e, "description", "name", "label") || "子代理";
           const status = strField(e, "status") || "running";
-          activity().steps.push({
-            kind: "note",
-            text: `子代理 ${label} · ${id} · ${status}`,
-          });
+          const kind = strField(e, "subagent_type", "type");
+          const toolCallId = strField(e, "parent_tool_call_id");
+          const blocks = turn().blocks;
+          let hit = findTaskStep(
+            blocks.flatMap((b) => (b.kind === "activity" ? b.steps : [])),
+            toolCallId,
+            id || undefined,
+          );
+          if (!hit) {
+            const act = activity();
+            hit = {
+              kind: "tool",
+              id: toolCallId || id || `task-${i}`,
+              name: "Task",
+              args: JSON.stringify({ description: label, subagent_type: kind || "" }),
+              done: status !== "running",
+            };
+            act.steps.push(hit);
+          }
+          applyTaskMeta(hit, { id: id || undefined, status, type: kind, label });
+          if (status !== "running") hit.done = true;
         }
         return;
       }
@@ -2383,6 +2493,24 @@ function buildTurns(events: SessionEvent[]): TurnGroup[] {
   });
   finishRates();
   for (const t of turns) dropHostImageToolIfShot(t);
+  if (rows?.length) {
+    const byId = new Map(rows.map((r) => [r.id, r]));
+    for (const t of turns) {
+      for (const b of t.blocks) {
+        if (b.kind !== "activity") continue;
+        for (const s of b.steps) {
+          if (s.kind !== "tool" || !isTaskTool(s.name) || !s.agentId) continue;
+          const rec = byId.get(s.agentId);
+          if (!rec) continue;
+          applyTaskMeta(s, {
+            status: rec.status,
+            type: rec.type,
+            label: rec.description,
+          });
+        }
+      }
+    }
+  }
   return turns;
 }
 
@@ -2404,6 +2532,186 @@ function dropHostImageToolIfShot(turn: TurnGroup) {
     .filter((b) => b.kind !== "activity" || b.steps.length > 0);
 }
 
+function pickAgentStatus(rpc?: string | null, card?: string, eventCount = 0): string {
+  if (rpc === "running") return "running";
+  if (card === "failed" || card === "cancelled") return card;
+  if (rpc) return rpc;
+  if (card) return card;
+  return eventCount > 0 ? "done" : "done";
+}
+
+function AgentDock({
+  id,
+  label,
+  status,
+  kind,
+  detail,
+  onClose,
+  onOpenPreview,
+}: {
+  id: string;
+  label: string;
+  status?: string;
+  kind?: string;
+  detail?: string;
+  onClose: () => void;
+  onOpenPreview?: (path: string) => void;
+}) {
+  const [events, setEvents] = useState<SessionEvent[]>([]);
+  const [meta, setMeta] = useState<{
+    description?: string;
+    type?: string;
+    status?: string;
+    summary?: string;
+    error?: string;
+  }>({
+    status,
+    type: kind,
+    description: label,
+  });
+  const [err, setErr] = useState("");
+  const [openBlocks, setOpenBlocks] = useState<Set<string>>(() => new Set());
+  const [openSteps, setOpenSteps] = useState<Set<string>>(() => new Set());
+  const liveStatus = pickAgentStatus(meta.status, status, events.length);
+  const running = liveStatus === "running";
+
+  useEffect(() => {
+    setEvents([]);
+    setMeta({ status, type: kind, description: label });
+    setErr("");
+    setOpenBlocks(new Set());
+    setOpenSteps(new Set());
+  }, [id]);
+
+  useEffect(() => {
+    let gone = false;
+    const load = async () => {
+      try {
+        const j = await rpc<{
+          description?: string;
+          type?: string;
+          status?: string | null;
+          summary?: string;
+          error?: string;
+          events?: SessionEvent[];
+        }>("session.subagent", { id });
+        if (gone) return;
+        const ev = j.events || [];
+        setMeta({
+          description: j.description || label,
+          type: j.type || kind,
+          status: pickAgentStatus(j.status, status, ev.length),
+          summary: j.summary,
+          error: j.error,
+        });
+        setEvents(ev);
+        setErr("");
+      } catch (e) {
+        if (!gone) setErr(failMsg(e));
+      }
+    };
+    void load();
+    const t = window.setInterval(load, running ? 700 : 8000);
+    return () => {
+      gone = true;
+      window.clearInterval(t);
+    };
+  }, [id, running, label, kind, status]);
+
+  const turns = useMemo(() => buildTurns(events), [events]);
+  useEffect(() => {
+    setOpenBlocks((prev) => {
+      const next = new Set(prev);
+      let changed = false;
+      for (const t of turns) {
+        t.blocks.forEach((b, i) => {
+          if (b.kind !== "activity") return;
+          const k = `${t.key}:${i}`;
+          if (!next.has(k)) {
+            next.add(k);
+            changed = true;
+          }
+        });
+      }
+      return changed ? next : prev;
+    });
+  }, [turns]);
+
+  const title = meta.description || label || "Task";
+  return (
+    <div className="agent-dock">
+      <div className="agent-bar">
+        <Icon name="fork" />
+        <div className="grow min0">
+          <div className="agent-title">{title}</div>
+          <div className="sub">
+            {meta.type || kind || "generalPurpose"} · {id}
+          </div>
+        </div>
+        <span className={`pill ${running ? "run" : liveStatus === "failed" ? "err" : "ok"}`}>
+          {agentStatusLabel(liveStatus)}
+        </span>
+        <button type="button" className="icon-btn" title="关闭子代理" aria-label="关闭子代理" onClick={onClose}>
+          <Icon name="x" />
+        </button>
+      </div>
+      <div className="agent-thread">
+        {err ? <div className="sub">{err}</div> : null}
+        {!err && turns.length === 0 ? (
+          <div className="sub">
+            {running
+              ? "子代理启动中…"
+              : liveStatus === "failed"
+                ? "子代理没有留下轨迹（启动失败）。"
+                : "还没有轨迹。"}
+          </div>
+        ) : null}
+        {!turns.length && (meta.error || detail) ? (
+          <pre className="pre step-pre agent-fail">{meta.error || detail}</pre>
+        ) : null}
+        {turns.map((t) => (
+          <TurnView
+            key={t.key}
+            turnKey={t.key}
+            user={t.user}
+            userMedia={t.userMedia}
+            blocks={t.blocks}
+            active={running}
+            decodeTokS={t.decodeTokS}
+            callLabel={running ? "子代理运行中" : ""}
+            elapsed={0}
+            openBlocks={openBlocks}
+            openSteps={openSteps}
+            onToggleBlock={(k) =>
+              setOpenBlocks((s) => {
+                const n = new Set(s);
+                if (n.has(k)) n.delete(k);
+                else n.add(k);
+                return n;
+              })
+            }
+            onToggleStep={(k) =>
+              setOpenSteps((s) => {
+                const n = new Set(s);
+                if (n.has(k)) n.delete(k);
+                else n.add(k);
+                return n;
+              })
+            }
+            onOpenPreview={onOpenPreview}
+          />
+        ))}
+        {meta.summary && !running ? (
+          <div className="agent-summary">
+            <div className="cap">摘要</div>
+            <pre className="pre step-pre">{meta.summary}</pre>
+          </div>
+        ) : null}
+      </div>
+    </div>
+  );
+}
+
 /** 单个轮次。memo 后流式增量只触发最后一轮重渲，长会话打字不再整屏刷新。 */
 const TurnView = memo(function TurnView({
   turnKey,
@@ -2419,6 +2727,8 @@ const TurnView = memo(function TurnView({
   onToggleBlock,
   onToggleStep,
   onOpenPreview,
+  onOpenAgent,
+  openAgentId,
 }: {
   turnKey: string;
   user?: string;
@@ -2433,6 +2743,8 @@ const TurnView = memo(function TurnView({
   onToggleBlock: (k: string) => void;
   onToggleStep: (k: string) => void;
   onOpenPreview?: (path: string) => void;
+  onOpenAgent?: (id: string, label: string, status?: string, type?: string, detail?: string) => void;
+  openAgentId?: string;
 }) {
   const answer = blocks
     .filter((b): b is { kind: "text"; text: string; live?: boolean; media?: StoredMedia[] } => b.kind === "text")
@@ -2466,7 +2778,7 @@ const TurnView = memo(function TurnView({
           }
           return (
             <div key={bk}>
-              <MdText text={b.text} live={b.live} />
+              <MdText text={b.text} live={b.live} onOpenAgent={onOpenAgent} />
               {shots}
             </div>
           );
@@ -2491,6 +2803,9 @@ const TurnView = memo(function TurnView({
             openSteps={openSteps}
             onToggle={onToggleBlock}
             onToggleStep={onToggleStep}
+            onOpenPreview={onOpenPreview}
+            onOpenAgent={onOpenAgent}
+            openAgentId={openAgentId}
           />
         );
       })}
@@ -2536,6 +2851,7 @@ function actSummary(steps: Step[]): string {
   let note = 0;
   for (const s of steps) {
     if (s.kind === "think") think++;
+    else if (s.kind === "tool" && isTaskTool(s.name)) continue;
     else if (s.kind === "tool") tool++;
     else note++;
   }
@@ -2622,7 +2938,8 @@ function toolIcon(name: string): string {
   if (n === "web" || n === "websearch" || n === "webfetch") return "globe";
   if (n === "mcp") return "plug";
   if (n === "search" || n === "memorysearch" || n === "recall" || n === "grep" || n === "glob") return "search";
-  if (n === "skill" || n === "task") return "spark";
+  if (n === "skill") return "spark";
+  if (n === "task") return "fork";
   if (n === "imagegeneration") return "image";
   if (n === "todowrite" || n === "todo" || n === "askquestion" || n === "ask") return "list";
   return "wrench";
@@ -2649,11 +2966,17 @@ function StepRow({
   sk,
   open,
   onToggle,
+  onOpenPreview,
+  onOpenAgent,
+  openAgentId,
 }: {
   step: Step;
   sk: string;
   open: boolean;
   onToggle: (k: string) => void;
+  onOpenPreview?: (path: string) => void;
+  onOpenAgent?: (id: string, label: string, status?: string, type?: string, detail?: string) => void;
+  openAgentId?: string;
 }) {
   if (step.kind === "think") {
     return (
@@ -2679,6 +3002,39 @@ function StepRow({
           <span className="step-prev">{clipEnd(firstLine(step.text), 80)}</span>
         </button>
         {open ? <div className="step-full think-full">{step.text}</div> : null}
+      </div>
+    );
+  }
+  if (isTaskTool(step.name)) {
+    const st = step.agentStatus === "failed" ? "err" : step.agentStatus === "running" || !step.done ? "run" : "ok";
+    const title = step.agentLabel || argPreview(step.name, step.args) || "Task";
+    const type = step.agentType || "";
+    const pill = agentStatusLabel(step.agentStatus || (step.done ? "done" : "running"));
+    const canOpen = Boolean(step.agentId && onOpenAgent);
+    const showOut = open && !canOpen && Boolean(step.output);
+    return (
+      <div className={`step agent${openAgentId && step.agentId === openAgentId ? " on" : ""}`}>
+        <button
+          type="button"
+          className="step-head agent-head"
+          onClick={() => {
+            if (step.agentId && onOpenAgent) {
+              onOpenAgent(step.agentId, title, step.agentStatus, type || undefined, step.output);
+              return;
+            }
+            if (step.output) onToggle(sk);
+          }}
+          disabled={!canOpen && !step.output}
+          aria-label={`Task ${title}${type ? ` ${type}` : ""} ${pill}`}
+          aria-pressed={openAgentId === step.agentId}
+        >
+          <Icon name="fork" />
+          <span className="step-prev agent-name">{title}</span>
+          {type ? <span className="agent-type">{type}</span> : null}
+          <span className={`pill ${st === "run" ? "run" : st === "err" ? "err" : "idle"}`}>{pill}</span>
+          <span className={`st-dot ${st}`} />
+        </button>
+        {showOut ? <pre className="pre step-pre">{step.output}</pre> : null}
       </div>
     );
   }
@@ -2732,6 +3088,9 @@ function ActivityBlock({
   openSteps,
   onToggle,
   onToggleStep,
+  onOpenPreview,
+  onOpenAgent,
+  openAgentId,
 }: {
   bk: string;
   steps: Step[];
@@ -2742,20 +3101,25 @@ function ActivityBlock({
   openSteps: Set<string>;
   onToggle: (k: string) => void;
   onToggleStep: (k: string) => void;
+  onOpenPreview?: (path: string) => void;
+  onOpenAgent?: (id: string, label: string, status?: string, type?: string, detail?: string) => void;
+  openAgentId?: string;
 }) {
-  const last = steps[steps.length - 1];
+  const taskSteps = steps.filter((s): s is ToolStep => s.kind === "tool" && isTaskTool(s.name));
+  const rest = steps.filter((s) => !(s.kind === "tool" && isTaskTool(s.name)));
+  const last = rest[rest.length - 1];
   let label: string;
   let preview = "";
-  const liveThink = [...steps]
+  const liveThink = [...rest]
     .reverse()
     .find((s): s is Extract<Step, { kind: "think" }> => s.kind === "think" && !!s.live);
-  if (running) {
+  const restRunning = running && rest.length > 0;
+  if (restRunning) {
     if (liveThink) {
       label = "思考中";
       preview = thinkTail(liveThink.text);
     } else if (last?.kind === "tool" && !last.done) {
-      if (isTaskTool(last.name)) label = "子代理运行中";
-      else if (isTodoTool(last.name)) label = "TodoWrite";
+      if (isTodoTool(last.name)) label = "TodoWrite";
       else if (isAskTool(last.name)) label = "AskQuestion";
       else label = `运行 ${last.name}`;
       preview = argPreview(last.name, last.args);
@@ -2763,30 +3127,61 @@ function ActivityBlock({
       label = callLabel;
     }
   } else {
-    label = actSummary(steps);
+    label = actSummary(rest);
   }
-  const canOpen = steps.length > 0;
+  const canOpen = rest.length > 0;
   const expanded = open && canOpen;
   return (
-    <div className={`activity${expanded ? " open" : ""}${running ? " running" : ""}`}>
-      <button
-        type="button"
-        className="act-head"
-        onClick={() => canOpen && onToggle(bk)}
-        aria-expanded={expanded}
-        disabled={!canOpen}
-      >
-        {canOpen ? <Icon name="chev-r" className="ico act-chev" /> : null}
-        {running ? <span className="act-spin" aria-hidden /> : null}
-        <span className={`act-label${running ? " shimmer" : ""}`}>{label}</span>
-        {preview && !expanded ? <span className="act-prev">{preview}</span> : null}
-        {running && elapsed > 0 ? <span className="act-time">{fmtElapsed(elapsed)}</span> : null}
-      </button>
+    <div className={`activity${expanded ? " open" : ""}${restRunning ? " running" : ""}`}>
+      {canOpen ? (
+        <button
+          type="button"
+          className="act-head"
+          onClick={() => onToggle(bk)}
+          aria-expanded={expanded}
+        >
+          <Icon name="chev-r" className="ico act-chev" />
+          {restRunning ? <span className="act-spin" aria-hidden /> : null}
+          <span className={`act-label${restRunning ? " shimmer" : ""}`}>{label}</span>
+          {preview && !expanded ? <span className="act-prev">{preview}</span> : null}
+          {restRunning && elapsed > 0 ? <span className="act-time">{fmtElapsed(elapsed)}</span> : null}
+        </button>
+      ) : null}
+      {taskSteps.length ? (
+        <div className="act-agents">
+          {taskSteps.map((s, si) => {
+            const sk = `${bk}:task:${s.agentId || s.id || si}`;
+            return (
+              <StepRow
+                key={sk}
+                step={s}
+                sk={sk}
+                open={openSteps.has(sk)}
+                onToggle={onToggleStep}
+                onOpenPreview={onOpenPreview}
+                onOpenAgent={onOpenAgent}
+                openAgentId={openAgentId}
+              />
+            );
+          })}
+        </div>
+      ) : null}
       {expanded ? (
         <div className="act-trace">
-          {steps.map((s, si) => {
+          {rest.map((s, si) => {
             const sk = `${bk}:${si}`;
-            return <StepRow key={sk} step={s} sk={sk} open={openSteps.has(sk)} onToggle={onToggleStep} />;
+            return (
+              <StepRow
+                key={sk}
+                step={s}
+                sk={sk}
+                open={openSteps.has(sk)}
+                onToggle={onToggleStep}
+                onOpenPreview={onOpenPreview}
+                onOpenAgent={onOpenAgent}
+                openAgentId={openAgentId}
+              />
+            );
           })}
         </div>
       ) : null}

@@ -30,9 +30,9 @@ use crate::cron::{
     upsert_cron_job, CronJob, CronStore, Heartbeat,
 };
 use crate::files::{
-    file_content_type, file_disposition_kind, list_child_dirs, list_tree, max_upload, parent_dir,
-    pick_folder_native, read_preview, resolve_workspace_dir, workspace_shortcuts, write_upload,
-    write_workspace_file, FILE_PUT_CAP,
+    file_content_type, file_disposition_kind, list_child_dirs, list_out_files, list_tree,
+    max_upload, parent_dir, pick_folder_native, read_preview, resolve_workspace_dir,
+    workspace_shortcuts, write_upload, write_workspace_file, FILE_PUT_CAP,
 };
 use crate::hub::{push_state, redact_key, AppState, Inner};
 
@@ -48,6 +48,8 @@ pub fn router(state: AppState, dist: PathBuf) -> Router {
         .route("/upload", post(upload))
         .route("/ingest", post(ingest))
         .route("/files", get(files_get).put(files_put))
+        .route("/raw/{*path}", get(files_raw_get))
+        .route("/out", get(out_list))
         .route("/tree", get(tree_get))
         .route("/workspace", get(workspace_get).post(workspace_post))
         .route("/workspace/pick", post(workspace_pick))
@@ -506,13 +508,37 @@ async fn files_get(
     State(st): State<AppState>,
     Query(q): Query<FileQuery>,
 ) -> Result<Response, (StatusCode, String)> {
+    let download = matches!(
+        q.dl.as_deref().map(str::trim),
+        Some("1") | Some("true") | Some("yes")
+    );
+    files_body(st, &q.path, download).await
+}
+
+/// Path-style file URLs so HTML previews can resolve `./app.js` / `./styles.css`.
+async fn files_raw_get(
+    State(st): State<AppState>,
+    Path(rel): Path<String>,
+) -> Result<Response, (StatusCode, String)> {
+    files_body(st, rel.trim_start_matches('/'), false).await
+}
+
+async fn files_body(
+    st: AppState,
+    rel: &str,
+    download: bool,
+) -> Result<Response, (StatusCode, String)> {
     // 只在锁内拷 workspace 路径,文件 IO 放到锁外的阻塞线程,
     // 大文件预览不再卡住整个控制台
+    if rel.trim().is_empty() {
+        return Err((StatusCode::NOT_FOUND, "not found".into()));
+    }
     let workspace = {
         let g = st.inner.lock().await;
         g.session.workspace().to_path_buf()
     };
-    let rel = q.path.clone();
+    let rel = rel.to_string();
+    let shown = rel.clone();
     let (mime, body, trunc) =
         tokio::task::spawn_blocking(move || read_preview(&workspace, &rel, FILE_PUT_CAP))
             .await
@@ -520,16 +546,16 @@ async fn files_get(
             .map_err(|e| (StatusCode::NOT_FOUND, e.to_string()))?;
     let mut headers = HeaderMap::new();
     headers.insert(header::CONTENT_TYPE, file_content_type(&mime));
+    headers.insert(
+        header::CACHE_CONTROL,
+        HeaderValue::from_static("no-store, must-revalidate"),
+    );
     if trunc {
         headers.insert("x-hyper-truncated", HeaderValue::from_static("1"));
     }
-    let download = matches!(
-        q.dl.as_deref().map(str::trim),
-        Some("1") | Some("true") | Some("yes")
-    );
     headers.insert(
         header::CONTENT_DISPOSITION,
-        file_disposition_kind(&q.path, download),
+        file_disposition_kind(&shown, download),
     );
     Ok((headers, body).into_response())
 }
@@ -574,6 +600,21 @@ async fn tree_get(State(st): State<AppState>) -> Result<Json<Value>, (StatusCode
         "root": root.display().to_string(),
         "parent": parent_dir(root),
         "entries": rows,
+    })))
+}
+
+async fn out_list(State(st): State<AppState>) -> Result<Json<Value>, (StatusCode, String)> {
+    let g = st.inner.lock().await;
+    let root = g.session.workspace().to_path_buf();
+    drop(g);
+    let files = tokio::task::spawn_blocking(move || list_out_files(&root, 200))
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    Ok(Json(json!({
+        "ok": true,
+        "dir": hyper_loop::out_dir::OUT_DIR,
+        "files": files,
     })))
 }
 

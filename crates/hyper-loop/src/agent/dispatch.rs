@@ -444,7 +444,9 @@ impl<C: Completer> Agent<C> {
 
     pub(crate) fn live_sink(&self) -> Option<TokenSink> {
         if self.child.is_some() {
-            return None;
+            // Children must stream (cli-chat-proxy rejects non-SSE POSTs) but
+            // tokens stay off the parent activity stream.
+            return Some(TokenSink::discard());
         }
         if let Some(emit) = &self.emit {
             Some(TokenSink::events(emit.clone()))
