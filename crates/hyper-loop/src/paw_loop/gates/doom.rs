@@ -8,8 +8,7 @@ use crate::paw_loop::{GateCtx, GateDecision, ToolFingerprint};
 /// A low-information trajectory observation, not an order. It is intentionally
 /// delayed: polling, flaky processes and changing files can make identical
 /// calls useful for a few rounds.
-pub const REPEAT_NOTE: &str =
-    "[trajectory] The same tool and arguments appeared three times in a row; new information may be low. Check the last result; change the target or arguments if you need new evidence, else continue or finish from what you have.";
+pub const REPEAT_NOTE: &str = "[trajectory] The same tool and arguments appeared three times in a row; new information may be low. Check the last result; change the target or arguments if you need new evidence, else continue or finish from what you have.";
 
 #[derive(Clone, Debug)]
 pub struct DoomStage {
@@ -63,9 +62,16 @@ impl DoomLoopGate {
 
     /// Let the model lead. A sixth identical call gets one factual nudge.
     /// Further repeats stay silent: step/time budgets are the hard edge, not
-    /// this detector.
+    /// this detector. Used for local Qwen weights.
     pub fn qwen_default() -> Self {
         Self::new(2, 1.0, vec![DoomStage::warn(6, REPEAT_NOTE)])
+    }
+
+    /// grok-4.6 already knows not to spin. No trajectory lecture — that is a
+    /// new user turn on Responses and makes it restate. Quiet halt at the
+    /// sixth identical call so the 80-step budget cannot burn on one Read.
+    pub fn grok_default() -> Self {
+        Self::new(2, 1.0, vec![DoomStage::halt(6, "budget:repeat")])
     }
 
     /// Low-precision overlay: one nudge at the second identical call.
@@ -256,6 +262,23 @@ mod tests {
                 "no repeated note at hits={iter}"
             );
         }
+    }
+
+    #[test]
+    fn grok_sixth_repeat_halts_without_lecture() {
+        let gate = DoomLoopGate::grok_default();
+        let a = ToolFingerprint::new("read", r#"{"path":"a.rs"}"#);
+        for iter in 1..=5 {
+            assert!(
+                matches!(hop(&gate, iter, &[a.clone()]), GateDecision::Bypass),
+                "iter={iter}"
+            );
+        }
+        match hop(&gate, 6, &[a]) {
+            GateDecision::Stop { reason } => assert_eq!(reason, "budget:repeat"),
+            other => panic!("expected quiet halt at 6th repeat: {other:?}"),
+        }
+        assert_eq!(gate.continuation("s"), "");
     }
 
     #[test]

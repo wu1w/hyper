@@ -163,8 +163,16 @@ impl Transcript {
                 } else {
                     a.content.clone()
                 };
+                let has_tools = a.tool_calls.as_ref().is_some_and(|c| !c.is_empty());
                 if !content.is_empty() {
-                    self.blocks.push(Block::new(Kind::Assistant, content));
+                    if has_tools {
+                        let line = clip_one_line(&content, 120);
+                        if !line.is_empty() {
+                            self.blocks.push(Block::new(Kind::Tool, line));
+                        }
+                    } else {
+                        self.blocks.push(Block::new(Kind::Assistant, content));
+                    }
                 }
             }
             SessionEvent::Tool(t) => {
@@ -434,11 +442,36 @@ mod tests {
             )]),
         ));
         t.apply(&SessionEvent::tool("c1", "read", "fn main"));
-        assert!(!t
-            .blocks()
-            .iter()
-            .any(|b| b.kind == Kind::Assistant && b.text.contains("path")));
+        assert!(!t.blocks().iter().any(|b| b.kind == Kind::Assistant));
         assert!(t.blocks().iter().any(|b| b.kind == Kind::Tool));
+    }
+
+    #[test]
+    fn tool_hop_essay_is_not_an_answer_bubble() {
+        let mut t = Transcript::default();
+        t.apply(&SessionEvent::assistant(
+            "I'll read a.rs next and then summarize the loop in detail.",
+            String::new(),
+            Some(vec![hyper_loop::OpenAiToolCall::function(
+                "c1",
+                "Read",
+                "{\"path\":\"a.rs\"}",
+            )]),
+        ));
+        t.apply(&SessionEvent::tool("c1", "Read", "fn main"));
+        assert!(
+            !t.blocks().iter().any(|b| b.kind == Kind::Assistant),
+            "tool-hop narration must not land as the answer: {:?}",
+            t.blocks()
+                .iter()
+                .map(|b| (&b.kind, b.text.as_str()))
+                .collect::<Vec<_>>()
+        );
+        assert!(
+            t.blocks()
+                .iter()
+                .any(|b| b.kind == Kind::Tool && b.text.contains("I'll read"))
+        );
     }
 
     #[test]

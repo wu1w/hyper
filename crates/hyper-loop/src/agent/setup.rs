@@ -68,6 +68,8 @@ impl<C: Completer> Agent<C> {
         let mut gates = vec![
             Gate::from(if lossy {
                 DoomLoopGate::lossy()
+            } else if completer.recasts_xai_product() {
+                DoomLoopGate::grok_default()
             } else {
                 DoomLoopGate::qwen_default()
             }),
@@ -203,6 +205,7 @@ impl<C: Completer> Agent<C> {
             narrate: opts.narrate && !opts.print && interactive_channel(&opts.channel),
             code_index,
             stutter_nudged: false,
+            dump_nudged: false,
             physics_nudged: false,
             parse_nudged: false,
             official_compaction: None,

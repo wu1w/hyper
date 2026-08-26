@@ -14,6 +14,10 @@ impl<C: Completer> Agent<C> {
         forced_skill: Option<&str>,
         forced_mcp: Option<&str>,
     ) {
+        if self.cursor_wire() {
+            self.inject_cursor_mode_notes(user, forced_skill, forced_mcp);
+            return;
+        }
         if !sticky::live_has_memory_note(&self.messages) {
             if let Some(store) = &self.memory {
                 if let Some(md) = store.read_memory_md() {
@@ -69,7 +73,54 @@ impl<C: Completer> Agent<C> {
         self.inject_doc_read(user);
     }
 
+    /// Cursor/Responses: only plan/clarify mode cards and an explicit
+    /// `[skill:]` / `[mcp:]` prefix. No 27B locate/out/style/memory lectures.
+    fn inject_cursor_mode_notes(
+        &mut self,
+        _user: &str,
+        forced_skill: Option<&str>,
+        forced_mcp: Option<&str>,
+    ) {
+        if forced_skill.is_some() {
+            let stubbed = sticky::stub_live_skill_notes(&mut self.messages);
+            self.note_stubbed(stubbed);
+        }
+        if !sticky::live_has_skill_note(&self.messages) {
+            if let Some(sk) = forced_skill.and_then(|n| self.skills.get(n)) {
+                match hidden_card(sk) {
+                    Some(card) => self.push_hidden_user(card),
+                    None => self.note(&format!(
+                        "hyper: skill {} over {} tok; not injected",
+                        sk.name,
+                        sticky::SKILL_BODY_MAX_TOKENS
+                    )),
+                }
+            }
+        }
+        if forced_mcp.is_some() {
+            let stubbed = sticky::stub_live_mcp_notes(&mut self.messages);
+            self.note_stubbed(stubbed);
+        }
+        if crate::tools_schema::has_tool(&self.tools, "mcp")
+            && forced_mcp.is_some()
+            && !sticky::live_has_mcp_note(&self.messages)
+        {
+            if let Some(card) = mcp_card(&self.mcp, _user, forced_mcp) {
+                self.push_hidden_user(card);
+            }
+        }
+        if self.plan_mode && !sticky::live_has_plan_note(&self.messages) {
+            self.push_hidden_user(PLAN_CARD);
+        }
+        if (self.plan_mode || self.clarify_mode) && !sticky::live_has_clarify_note(&self.messages) {
+            self.push_hidden_user(crate::clarify::CLARIFY_CARD);
+        }
+    }
+
     pub(crate) fn inject_out_dir(&mut self, user: &str) {
+        if self.cursor_wire() {
+            return;
+        }
         if forbids_tools(user) {
             return;
         }
@@ -81,6 +132,9 @@ impl<C: Completer> Agent<C> {
     }
 
     pub(crate) fn inject_doc_read(&mut self, text: &str) {
+        if self.cursor_wire() {
+            return;
+        }
         if forbids_tools(text) || sticky::live_has_doc_read_note(&self.messages) {
             return;
         }
@@ -90,6 +144,10 @@ impl<C: Completer> Agent<C> {
     }
 
     pub(crate) fn inject_window_overlay_note(&mut self) {
+        if self.cursor_wire() {
+            self.window_overlay.take();
+            return;
+        }
         let Some(o) = self.window_overlay.take() else {
             return;
         };
@@ -103,7 +161,7 @@ impl<C: Completer> Agent<C> {
     /// smells like fresh-world knowledge and `web` is armed, one short hidden
     /// fact names the tool — instead of a standing lecture in every prompt.
     pub(crate) fn inject_web_hint(&mut self, user: &str) {
-        if self.completer.recasts_xai_product() {
+        if self.cursor_wire() {
             return;
         }
         if !crate::tools_schema::has_tool(&self.tools, "web") {
@@ -119,7 +177,7 @@ impl<C: Completer> Agent<C> {
     /// absent from ordinary chat and coding turns, and does not force another
     /// model hop: the model keeps control over when its answer is ready.
     pub(crate) fn inject_numeric_check_hint(&mut self, user: &str) {
-        if self.completer.recasts_xai_product() {
+        if self.cursor_wire() {
             return;
         }
         if wants_numeric_check(user) {
@@ -128,7 +186,7 @@ impl<C: Completer> Agent<C> {
     }
 
     pub(crate) fn inject_locate(&mut self, user: &str) {
-        if self.completer.recasts_xai_product() {
+        if self.cursor_wire() {
             return;
         }
         if forbids_tools(user) || !wants_auto_locate(user) {
@@ -144,6 +202,9 @@ impl<C: Completer> Agent<C> {
     }
 
     pub(crate) fn inject_skill_from_tools(&mut self, output: &str) {
+        if self.cursor_wire() {
+            return;
+        }
         let Some(sk) = match_tool_output(&self.skills, output) else {
             return;
         };

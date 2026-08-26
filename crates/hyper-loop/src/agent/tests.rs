@@ -845,6 +845,159 @@ async fn grok_responses_path_skips_locate_card() {
 }
 
 #[tokio::test]
+async fn grok_skips_style_and_out_cards() {
+    let dir = std::env::temp_dir().join(format!(
+        "hyper-grok-cards-{}",
+        uuid::Uuid::new_v4().simple()
+    ));
+    std::fs::create_dir_all(&dir).unwrap();
+    let scripted = Recasting(Scripted {
+        turns: Mutex::new(VecDeque::from([turn_text("ok")])),
+        meter: false,
+    });
+    let mut o = opts(&dir);
+    o.narrate = true;
+    o.peripheral = false;
+    let mut agent = Agent::new(scripted, o).unwrap();
+    let out = agent.run("现在几点").await.unwrap();
+    assert_eq!(out.text, "ok");
+    let hidden: Vec<_> = agent
+        .messages
+        .iter()
+        .filter(|m| m.role == "user")
+        .filter_map(|m| m.content.as_deref())
+        .filter(|c| crate::template::is_hidden_user_text(c))
+        .collect();
+    assert!(
+        hidden
+            .iter()
+            .all(|c| !c.contains("[style]") && !c.contains("[out]")),
+        "Cursor path must not inject style/out cards: {hidden:?}"
+    );
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+#[tokio::test]
+async fn grok_dump_hop_finishes_without_lecture() {
+    let dir =
+        std::env::temp_dir().join(format!("hyper-grok-dump-{}", uuid::Uuid::new_v4().simple()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let essay = "I studied the grok-hyper agent loop in detail. The core crate is hyper-loop. \
+It runs a ReAct cycle with frozen tools read write edit bash. Template rendering uses the \
+official Qwen3.8 Jinja chat template. Adapter builds OpenAI-compat requests. Sticky notes \
+hold skill and MCP cards. This is a strong fit for the 27B local model because the prefix \
+is byte-stable and tools stay frozen.";
+    let again = essay.replace("in detail", "carefully");
+    let mut o = opts(&dir);
+    o.max_steps = 8;
+    o.peripheral = false;
+    let scripted = Recasting(Scripted {
+        turns: Mutex::new(VecDeque::from([
+            turn_said(essay, "write", json!({"path": "a.md", "content": essay})),
+            turn_said(&again, "write", json!({"path": "b.md", "content": again})),
+            turn_text("should-not-run"),
+        ])),
+        meter: false,
+    });
+    let mut agent = Agent::new(scripted, o).unwrap();
+    let out = agent.run("how well does this fit the model").await.unwrap();
+    assert_eq!(out.stop_reason, None);
+    assert_eq!(out.text, essay);
+    assert!(dir.join("a.md").is_file(), "first write should run");
+    assert!(!dir.join("b.md").is_file(), "restated dump must not land");
+    let hidden: Vec<_> = agent
+        .messages
+        .iter()
+        .filter(|m| m.role == "user")
+        .filter_map(|m| m.content.as_deref())
+        .filter(|c| crate::template::is_hidden_user_text(c))
+        .collect();
+    assert!(
+        hidden
+            .iter()
+            .all(|c| !c.contains(crate::stutter::DUMP_NOTE)),
+        "no dump lecture on Cursor path: {hidden:?}"
+    );
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+#[tokio::test]
+async fn grok_identical_reads_halt_quietly() {
+    let dir =
+        std::env::temp_dir().join(format!("hyper-grok-doom-{}", uuid::Uuid::new_v4().simple()));
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(dir.join("ping.txt"), "pong\n").unwrap();
+    let mut o = opts(&dir);
+    o.max_steps = 12;
+    o.peripheral = false;
+    let ping = json!({"path": "ping.txt"});
+    let scripted = Recasting(Scripted {
+        turns: Mutex::new(VecDeque::from([
+            turn_tool("read", ping.clone()),
+            turn_tool("read", ping.clone()),
+            turn_tool("read", ping.clone()),
+            turn_tool("read", ping.clone()),
+            turn_tool("read", ping.clone()),
+            turn_tool("read", ping.clone()),
+            turn_text("should-not-run"),
+        ])),
+        meter: false,
+    });
+    let mut agent = Agent::new(scripted, o).unwrap();
+    let out = agent.run("read ping.txt").await.unwrap();
+    assert_eq!(out.stop_reason.as_deref(), Some("budget:repeat"));
+    assert_ne!(out.text, "should-not-run");
+    let hidden: Vec<_> = agent
+        .messages
+        .iter()
+        .filter(|m| m.role == "user")
+        .filter_map(|m| m.content.as_deref())
+        .filter(|c| crate::template::is_hidden_user_text(c))
+        .collect();
+    assert!(
+        hidden
+            .iter()
+            .all(|c| !c.contains(crate::paw_loop::REPEAT_NOTE)),
+        "no repeat lecture on Cursor path: {hidden:?}"
+    );
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+#[tokio::test]
+async fn grok_lossy_stutter_finishes_without_lecture() {
+    let dir = std::env::temp_dir().join(format!(
+        "hyper-grok-stutter-{}",
+        uuid::Uuid::new_v4().simple()
+    ));
+    std::fs::create_dir_all(&dir).unwrap();
+    let mut o = opts(&dir);
+    o.peripheral = false;
+    o.low_precision = true;
+    let scripted = Recasting(Scripted {
+        turns: Mutex::new(VecDeque::from([turn_text("x\nx\nx\nx\n")])),
+        meter: false,
+    });
+    let mut agent = Agent::new(scripted, o).unwrap();
+    let out = agent.run("hi").await.unwrap();
+    assert_eq!(out.text, "x\nx\nx\nx\n");
+    assert_eq!(out.stop_reason, None);
+    let hidden: Vec<_> = agent
+        .messages
+        .iter()
+        .filter(|m| m.role == "user")
+        .filter_map(|m| m.content.as_deref())
+        .filter(|c| crate::template::is_hidden_user_text(c))
+        .collect();
+    assert!(
+        hidden
+            .iter()
+            .all(|c| !c.contains(crate::stutter::STUTTER_NOTE)),
+        "Cursor path must not inject stutter lectures: {hidden:?}"
+    );
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+#[tokio::test]
 async fn bash_rg_dump_is_folded_to_spans() {
     let dir = std::env::temp_dir().join(format!("hyper-rg-{}", uuid::Uuid::new_v4().simple()));
     std::fs::create_dir_all(dir.join("src")).unwrap();
@@ -1012,10 +1165,12 @@ async fn print_mode_never_narrates() {
     o.print = true;
     let mut agent = Agent::new(scripted, o).unwrap();
     agent.run("hi").await.unwrap();
-    assert!(agent
-        .messages
-        .iter()
-        .all(|m| !m.content.as_deref().unwrap_or("").contains("[style]")));
+    assert!(
+        agent
+            .messages
+            .iter()
+            .all(|m| !m.content.as_deref().unwrap_or("").contains("[style]"))
+    );
     let _ = std::fs::remove_dir_all(dir);
 }
 
@@ -2094,6 +2249,46 @@ is byte-stable and tools stay frozen.";
 }
 
 #[tokio::test]
+async fn restated_dump_notes_once_then_defers_again() {
+    let dir =
+        std::env::temp_dir().join(format!("hyper-restate2-{}", uuid::Uuid::new_v4().simple()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let essay = "I studied the grok-hyper agent loop in detail. The core crate is hyper-loop. \
+It runs a ReAct cycle with frozen tools read write edit bash. Template rendering uses the \
+official Qwen3.8 Jinja chat template. Adapter builds OpenAI-compat requests. Sticky notes \
+hold skill and MCP cards. This is a strong fit for the 27B local model because the prefix \
+is byte-stable and tools stay frozen.";
+    let again = essay.replace("in detail", "carefully");
+    let mut o = opts(&dir);
+    o.max_steps = 8;
+    o.peripheral = false;
+    let scripted = Scripted {
+        turns: Mutex::new(VecDeque::from([
+            turn_said(essay, "write", json!({"path": "a.md", "content": essay})),
+            turn_said(&again, "write", json!({"path": "b.md", "content": again})),
+            turn_said(&again, "write", json!({"path": "c.md", "content": again})),
+            turn_text("done"),
+        ])),
+        meter: false,
+    };
+    let mut agent = Agent::new(scripted, o).unwrap();
+    let out = agent.run("how well does this fit the model").await.unwrap();
+    assert_eq!(out.text, "done");
+    assert!(dir.join("a.md").is_file());
+    assert!(!dir.join("b.md").is_file());
+    assert!(!dir.join("c.md").is_file());
+    let notes = agent
+        .messages
+        .iter()
+        .filter(|m| m.role == "user")
+        .filter_map(|m| m.content.as_deref())
+        .filter(|c| c.contains(crate::stutter::DUMP_NOTE))
+        .count();
+    assert_eq!(notes, 1, "dump lecture once");
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+#[tokio::test]
 async fn spoken_then_cleanup_is_deferred_not_hard_stopped() {
     let dir = std::env::temp_dir().join(format!("hyper-keeprm-{}", uuid::Uuid::new_v4().simple()));
     std::fs::create_dir_all(&dir).unwrap();
@@ -2144,8 +2339,7 @@ official Qwen3.8 Jinja chat template. Adapter builds OpenAI-compat requests. Sti
 hold skill and MCP cards. This is a strong fit for the 27B local model because the prefix \
 is byte-stable and tools stay frozen.";
     let again = essay.replace("in detail", "carefully");
-    let doc =
-        "CONTRIBUTING\n\nFork the repo, open a PR against main, run cargo test -p hyper-loop \
+    let doc = "CONTRIBUTING\n\nFork the repo, open a PR against main, run cargo test -p hyper-loop \
 --lib before you push. Do not bump the frozen tools array. Add a live scene only when the \
 public llama.cpp endpoint is up. Name the branch after the ticket. Ask for review from William.";
     let mut o = opts(&dir);

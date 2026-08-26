@@ -95,9 +95,9 @@ Cron / 心跳 / 频道入站也是 **主机定时器或适配器** 去调 `turn.
 4. 工具调用按审批模式停或放行；结果写回 messages，直到模型停或打到 `max_steps`。
 5. 事件追加到会话 JSONL；`stop` 结束本轮。控制台会重放本轮前半段，避免 WS 丢包后画面残缺。
 
-q35 架构模型，尤其是 Qwen3.8，偶尔会出现“雷霆大思考”甚至把思考预算耗尽。默认 `auto` 映射到官方中性的 `medium`，模板不注入深浅指令，由模型按任务自行分配思考强度；最大思考 token 只作失控上限。历史思考默认保留。`/think`、`--think`、`/fast` 仍可人工覆盖。thinking 采样固定对齐官方 `temperature=1.0, top_p=0.95, top_k=20`；`low_precision` 只收紧本机围栏，模型看不见。
+默认 `auto` 对 grok-4.6 映射为 **high**（思考关不掉）；Qwen 仍是官方中性 `medium`。`/think`、`--think`、`/fast` 仍可人工覆盖。grok 走 Responses：不回放思考、不回放 tool-hop 助手正文、不把 QwenPaw 的 `[trajectory]` / `[style]` / `[out]` / `[locate]` / `[oracle]` / `[guard]` 注记当用户消息。同参工具第 6 次安静停止（`budget:repeat`）。控制台和 TUI 不把 tool-hop 旁白画成答案气泡。Qwen 本地权重仍走软干预：同参 6 次提醒一次，dump 延后工具并观察一次。
 
-轨迹控制遵循“模型主导、harness 软干预”：测试转红、修改测试期望和编辑摇摆只作为隐藏事实反馈，不替模型决定停止或回退；同参工具连续 3 次才提醒，连续 6 次完全不换路才停止（有状态 shell 为 7 次）。思考触及上限时保留模型选择的思考模式，追加一次简短收敛提示并给更宽的一次重试；只有再次触顶、时间、步数或上下文硬上限才终止。重复答案伴随暂存/清理动作时先延后该批工具，把选择权交还模型，避免在提醒送达前执行低信息量写入或删除。
+轨迹控制：测试转红、修改测试期望和编辑摇摆只作为隐藏事实反馈，不替模型决定停止或回退。思考触及上限时保留模型选择的思考模式；grok 不再追加“collapse to one conclusion”讲义。只有再次触顶、时间、步数或上下文硬上限才终止。
 
 上下文窗口默认 **500000**。超过 `working_window * 0.80` 或 200k 价格悬崖时，session/api_key 走官方 `POST /v1/responses/compact`；openai_compat 仍用本地 archive compact。
 
