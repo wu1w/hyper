@@ -4,7 +4,7 @@
 //! gets `chat_template_kwargs`, `enable_thinking`, or llama.cpp `id_slot`.
 
 use reqwest::Client;
-use serde_json::{json, Map, Value};
+use serde_json::{Map, Value, json};
 use std::collections::HashSet;
 use std::sync::Mutex;
 
@@ -14,7 +14,7 @@ use crate::config::Config;
 use crate::error::{Error, Result};
 use crate::family::{EndpointCaps, EngineProfile, Family};
 use crate::policy::{Effort, ThinkPolicy};
-use crate::session::{chat_to_input_items, OfficialCompaction};
+use crate::session::{OfficialCompaction, chat_to_input_items};
 use crate::template::ChatMessage;
 use crate::tool_calls::ToolCall;
 use crate::transport::{GrokTransport, ResolvedTransport, WireFormat};
@@ -1408,7 +1408,7 @@ mod tests {
     }
 
     #[test]
-    fn trajectory_hidden_user_is_unwrapped_on_responses() {
+    fn trajectory_hidden_user_is_dropped_on_responses() {
         let msgs = vec![
             ChatMessage::user("go"),
             ChatMessage::hidden_user("[trajectory] Visible output is repeating in place."),
@@ -1425,10 +1425,7 @@ mod tests {
         });
         let dumped = serde_json::to_string(&body["input"]).unwrap();
         assert!(!dumped.contains("<tool_response>"), "{dumped}");
-        assert!(
-            dumped.contains("[trajectory] Visible output is repeating in place."),
-            "{dumped}"
-        );
+        assert!(!dumped.contains("[trajectory]"), "{dumped}");
     }
 
     #[test]

@@ -1,10 +1,10 @@
 //! Working-window compact: soft/hard thresholds, local archive, official xAI compact.
 
 use super::{
-    over_hard_threshold, over_soft_threshold, should_compact_at_user_turn, Agent, Completer,
+    Agent, Completer, over_hard_threshold, over_soft_threshold, should_compact_at_user_turn,
 };
-use crate::session::{compact_messages, derive_messages, plan_compact, SessionEvent};
-use crate::template::{render, RenderOpts};
+use crate::session::{SessionEvent, compact_messages, derive_messages, plan_compact};
+use crate::template::{RenderOpts, render};
 use crate::tokenize::count_tokens;
 use crate::tools_schema::{has_recall, recall_tool};
 
@@ -187,9 +187,11 @@ impl<C: Completer> Agent<C> {
         paths.sort();
         paths.truncate(16);
         let body = paths.join("\n");
-        self.push_hidden_user(format!(
-            "[compact] prior reads left the live window. Files still on disk — page with read(path, offset, limit); do not repeat the same unpaged read:\n{body}"
-        ));
+        if !self.cursor_wire() {
+            self.push_hidden_user(format!(
+                "[compact] prior reads left the live window. Files still on disk — page with read(path, offset, limit); do not repeat the same unpaged read:\n{body}"
+            ));
+        }
         self.read_paths.clear();
     }
 

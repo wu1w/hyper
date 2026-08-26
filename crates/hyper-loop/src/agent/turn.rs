@@ -10,10 +10,10 @@ use super::{Agent, AgentOutcome, Completer, ModelTurn};
 use crate::channel::take_steer;
 use crate::echo::strip_greeting_echo;
 use crate::error::Result;
-use crate::paw_loop::{fs_tool_path, GateCtx, GateDecision, ToolFingerprint};
+use crate::paw_loop::{GateCtx, GateDecision, ToolFingerprint, fs_tool_path};
 use crate::session::{PolicyReason, SessionEvent};
 use crate::sticky;
-use crate::template::{is_hidden_user_text, wrap_tool_response, ChatMessage};
+use crate::template::{ChatMessage, is_hidden_user_text, wrap_tool_response};
 use crate::tool_calls::{ToolCall, ToolState};
 use crate::tools_schema::dispatch_name;
 
@@ -59,6 +59,7 @@ impl<C: Completer> Agent<C> {
         // inherit iteration/timeout/doom from the previous prompt.
         self.handler.reset_turn(&self.session_id);
         self.stutter_nudged = false;
+        self.dump_nudged = false;
         self.physics_nudged = false;
         self.parse_nudged = false;
         self.last_spoken = None;
@@ -93,7 +94,7 @@ impl<C: Completer> Agent<C> {
 
             if let Some(reason) = self.compact_if_needed().await {
                 self.note(&reason);
-                if self.physics_nudged {
+                if self.physics_nudged || self.cursor_wire() {
                     return self.finish(self.last_spoken.clone().unwrap_or_default(), None, steps);
                 }
                 self.physics_nudged = true;
@@ -119,7 +120,9 @@ impl<C: Completer> Agent<C> {
                 // that thinking itself should be disabled. Give the model one
                 // concise side observation and more room to choose a course.
                 self.note("[watchdog] think cap; soft nudge and one roomy retry");
-                self.push_hidden_user(THINK_DIVERGENCE_NOTE);
+                if !self.cursor_wire() {
+                    self.push_hidden_user(THINK_DIVERGENCE_NOTE);
+                }
                 let widened = self.retry_with_runaway_room(tools).await;
                 if self.cancel.is_cancelled() {
                     return self.finish(String::new(), Some("aborted".into()), steps);
@@ -151,7 +154,7 @@ impl<C: Completer> Agent<C> {
                 parse_retries += 1;
                 self.note("[parse] retry");
                 if parse_retries >= self.parse_stop_after {
-                    if !self.parse_nudged {
+                    if !self.parse_nudged && !self.cursor_wire() {
                         self.parse_nudged = true;
                         self.push_hidden_user(PARSE_REPAIR_NOTE);
                         continue;
@@ -164,7 +167,10 @@ impl<C: Completer> Agent<C> {
             if turn.tool_calls.is_empty() {
                 turn.content = strip_greeting_echo(self.last_real_user(), &turn.content);
             }
-            if self.low_precision && crate::stutter::is_stutter(&turn.content, &turn.reasoning) {
+            if self.low_precision
+                && !self.cursor_wire()
+                && crate::stutter::is_stutter(&turn.content, &turn.reasoning)
+            {
                 if !self.stutter_nudged {
                     self.stutter_nudged = true;
                     self.push_hidden_user(crate::stutter::STUTTER_NOTE);
@@ -175,6 +181,7 @@ impl<C: Completer> Agent<C> {
                 turn.content = body;
             }
             let mut trajectory_note = None;
+            let mut dump_hop = false;
             if let Some(prev) = self.last_spoken.clone() {
                 if self.is_answer_dump_hop(&prev, &turn) {
                     if turn.tool_calls.is_empty() {
@@ -184,7 +191,20 @@ impl<C: Completer> Agent<C> {
                         self.mark_clean();
                         return self.finish(prev, None, steps);
                     }
-                    trajectory_note = Some(crate::stutter::DUMP_NOTE);
+                    dump_hop = true;
+                    // grok-4.6 is trained to stop after a delivered answer.
+                    // A Qwen-style dump lecture ("collapse to one conclusion")
+                    // is itself a new user turn and makes it restate.
+                    if self.cursor_wire() {
+                        self.push_assistant(&turn);
+                        self.defer_divergent_tools(std::mem::take(&mut turn.tool_calls));
+                        self.mark_clean();
+                        return self.finish(prev, None, steps);
+                    }
+                    if !self.dump_nudged {
+                        self.dump_nudged = true;
+                        trajectory_note = Some(crate::stutter::DUMP_NOTE);
+                    }
                 }
             }
             self.push_assistant(&turn);
@@ -200,25 +220,27 @@ impl<C: Completer> Agent<C> {
                 let mut gate_note = None;
                 match &decision {
                     GateDecision::Stop { reason } if is_physics_stop(reason) => {
-                        if !self.physics_nudged {
+                        if self.cursor_wire() || self.physics_nudged {
+                            self.note(reason);
+                            self.pending_stop = Some(String::new());
+                        } else {
                             self.physics_nudged = true;
                             self.note(reason);
                             gate_note = Some(PHYSICS_WRAP_NOTE.to_string());
-                        } else {
-                            self.note(reason);
-                            self.pending_stop = Some(String::new());
                         }
                     }
                     GateDecision::Stop { reason } if !reason.is_empty() => {
                         self.pending_stop = Some(reason.clone());
                     }
-                    GateDecision::Continue { continuation, .. } if !continuation.is_empty() => {
+                    GateDecision::Continue { continuation, .. }
+                        if !continuation.is_empty() && !self.cursor_wire() =>
+                    {
                         gate_note = Some(continuation.clone());
                     }
                     _ => {}
                 }
                 let calls = std::mem::take(&mut turn.tool_calls);
-                if trajectory_note.is_some() {
+                if trajectory_note.is_some() || dump_hop {
                     // Do not execute a cleanup/write batch before the model has
                     // seen the divergence observation. Record well-formed tool
                     // results, then give control straight back to the model.
@@ -557,6 +579,14 @@ impl<C: Completer> Agent<C> {
         retry.filter(|t| !t.watchdog_hit && !t.parse_fail)
     }
 
+    /// Cursor / grok-4.6 Responses path. Tool names match Cursor; the loop
+    /// must not inject QwenPaw 27B babysitting (style cards, trajectory
+    /// lectures, auto-oracle, dump notes) — those are off-distribution and
+    /// make grok restate.
+    pub(crate) fn cursor_wire(&self) -> bool {
+        self.completer.recasts_xai_product()
+    }
+
     pub(crate) fn last_real_user(&self) -> &str {
         self.messages
             .iter()
@@ -681,8 +711,7 @@ pub(crate) const THINK_DIVERGENCE_NOTE: &str = "[trajectory] This turn's thinkin
 Compress known facts and open questions first; answer or act if the evidence is enough, else take only the smallest missing step.";
 
 /// One wrap-up hop when a physics cap would otherwise tombstone the turn.
-pub(crate) const PHYSICS_WRAP_NOTE: &str =
-    "[trajectory] This turn is near the step, time, or context cap. \
+pub(crate) const PHYSICS_WRAP_NOTE: &str = "[trajectory] This turn is near the step, time, or context cap. \
 Close with a user-visible conclusion from the evidence you have; do not start a new tool loop.";
 
 /// One repair hop after the parse-fail retry budget is spent.

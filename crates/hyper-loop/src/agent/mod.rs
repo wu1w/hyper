@@ -1,21 +1,11 @@
 //! ReAct agent. Loop shape from QwenPaw `react_agent._reasoning`.
 //!
-//! Per user turn (`run`):
-//! 1. apply deferred TERMINATE from a previous tool iter (before the model)
-//! 2. model — thought lives in `reasoning_content`; if native `tool_calls` are
-//!    empty, recover complete `<tool_call>` XML from that thought (QwenPaw)
-//! 3. if tools: gates — TERMINATE with reason is deferred; execute via ToolCoordinator
-//! 4. if text: gates — Stop ends the turn. Continue is not turned into a
-//!    lecture; empty Continue is treated as Stop.
+//! grok-4.6 / Responses (`cursor_wire`): Cursor tool names and hop geometry.
+//! No QwenPaw trajectory lectures, style/out/locate cards, or auto-oracle.
+//! Tool-hop assistant text is not replayed. Identical tools halt quietly at 6.
 //!
-//! Parse failures and think-cap hits retry the same messages (kwargs only).
-//! Trajectory detectors (doom / name / path / stutter / dump) inject one
-//! hidden observation and then stay silent. Step, time, and context budgets
-//! get the same treatment: one wrap-up hop, then a quiet finish that keeps
-//! the last spoken text. User abort is the only user-visible stop reason.
-//! `ThinkPolicy` kwargs stay frozen for the turn except an ephemeral no-tool
-//! think clip, watchdog restore, and a same-session auto-upgrade. A later
-//! clean step drops back to the turn baseline.
+//! Local Qwen still gets hidden observations (doom / stutter / dump) once,
+//! then silence. Step, time, and context budgets wrap once then finish.
 
 mod delta;
 mod dispatch;
@@ -55,7 +45,7 @@ use crate::tool_calls::{CancelFlag, ToolCall, ToolCoordinator};
 use crate::tools::{BlobStore, CodeIndex, ToolLimits, Workspace};
 
 pub use delta::TokenSink;
-pub use http::{parse_cached_tokens, parse_turn, HttpCompleter, ParseOutcome};
+pub use http::{HttpCompleter, ParseOutcome, parse_cached_tokens, parse_turn};
 pub use responses::{ResponsesCompleter, TransportCompleter};
 
 /// Used by `http.rs` / `responses.rs` when wrapping native tool_calls.
@@ -405,6 +395,8 @@ pub struct Agent<C> {
     code_index: Option<CodeIndex>,
     /// Lossy stutter already received one hidden observation this user turn.
     stutter_nudged: bool,
+    /// Dump/restate observation already landed this user turn.
+    dump_nudged: bool,
     /// Physics cap (steps / wall / context / tool budget) already got a wrap-up hop.
     physics_nudged: bool,
     /// Parse-fail cap already got one repair observation.

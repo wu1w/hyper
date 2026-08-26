@@ -27,7 +27,7 @@ agents_md_max_tokens = 400     # fail-closed; --agents-md-head clips instead of 
 [prompt]
 coding = false                 # unused; builtin identity is one agent contract
 file = "AGENT.md"              # workspace first, then ~/.grok-hyper/AGENT.md
-narrate = true                 # TUI/web: one-line progress narration per stage. --print/IM never narrate.
+narrate = true                 # TUI/web Qwen: one-line progress card. grok-4.6 / Responses ignores this (Cursor: empty tool-hop text).
 
 [policy]
 default_mode = "agent"

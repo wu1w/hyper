@@ -165,6 +165,7 @@ function hasRecentAssistant(events: SessionEvent[]): boolean {
       if (r.includes("abort") || r.includes("cancel")) return false;
     }
     if (e.type === "assistant" && (String(e.content || "").trim() || parseStoredMedia(e.media).length)) {
+      if ((e.tool_calls || []).length > 0 && !parseStoredMedia(e.media).length) continue;
       return true;
     }
   }
@@ -2213,7 +2214,17 @@ const HIDE_CLOSE = "</tool_response>";
 function hiddenNote(text: string): string | null {
   const t = text.trim();
   if (!t.startsWith(HIDE_OPEN) || !t.endsWith(HIDE_CLOSE)) return null;
-  return t.slice(HIDE_OPEN.length, Math.max(HIDE_OPEN.length, t.length - HIDE_CLOSE.length)).trim();
+  const inner = t
+    .slice(HIDE_OPEN.length, Math.max(HIDE_OPEN.length, t.length - HIDE_CLOSE.length))
+    .trim();
+  if (isHarnessNote(inner)) return "";
+  return inner;
+}
+
+function isHarnessNote(s: string): boolean {
+  return /\[(trajectory|locate|out|web|doc-read|oracle|baseline|style|cron|compact|verify:numeric|guard)\]/i.test(
+    s,
+  ) || s.startsWith("HYPER_WORKING_WINDOW=") || /^MEMORY(\.md| hot| hosts)/.test(s);
 }
 
 function firstLine(s: string): string {
@@ -2381,8 +2392,15 @@ function buildTurns(events: SessionEvent[], rows?: SubagentSnap[]): TurnGroup[] 
         }
         const media = parseStoredMedia(e.media);
         if (e.content || media.length) {
-          act = undefined;
-          turn().blocks.push({ kind: "text", text: e.content || "", media });
+          if ((e.tool_calls || []).length > 0 && !media.length) {
+            // Tool-hop narration is not the answer. Cursor keeps it in the
+            // activity strip; showing it as a bubble is 复读.
+            const t = firstLine(e.content || "");
+            if (t) activity().steps.push({ kind: "note", text: clipEnd(t, 160) });
+          } else {
+            act = undefined;
+            turn().blocks.push({ kind: "text", text: e.content || "", media });
+          }
         }
         (e.tool_calls || []).forEach((c, j) => {
           const name = c.function?.name || "tool";

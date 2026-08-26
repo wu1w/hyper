@@ -6,7 +6,7 @@
 
 use std::fmt;
 
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 
 use crate::config::Config;
 use crate::error::{Error, Result};
@@ -157,12 +157,17 @@ pub fn chat_to_input_items(msg: &ChatMessage) -> Vec<Value> {
             let mut out = Vec::new();
             // `store:false` has no encrypted reasoning to continue. Replaying
             // captured think as summary_text makes Grok restart the same
-            // preamble every hop (思考轨迹复读).
+            // preamble every hop (思考轨迹复读). The same is true of the
+            // visible essay on a tool hop: grok-4.6 is trained to continue
+            // from function_call + output, not from restating last hop.
             if let Some(calls) = &msg.tool_calls {
                 for c in calls {
                     if let Some(item) = openai_call_to_item(c) {
                         out.push(item);
                     }
+                }
+                if !out.is_empty() && msg.parts.is_empty() {
+                    return out;
                 }
             }
             let text = crate::platform_prefix::wash_message_content(
@@ -181,7 +186,30 @@ pub fn chat_to_input_items(msg: &ChatMessage) -> Vec<Value> {
 
 fn is_cursor_noise_user(msg: &ChatMessage) -> bool {
     let t = msg.content.as_deref().unwrap_or("");
-    crate::template::is_hidden_user_text(t) && t.contains("[locate]")
+    if !crate::template::is_hidden_user_text(t) {
+        return false;
+    }
+    let inner = unwrap_qwen_hidden(t);
+    let inner = inner.trim();
+    const DROP: &[&str] = &[
+        "[locate]",
+        "[trajectory]",
+        "[out]",
+        "[web]",
+        "[verify:numeric]",
+        "[doc-read]",
+        "[oracle]",
+        "[baseline]",
+        "[style]",
+        "[cron]",
+        "[compact]",
+        "[guard]",
+        "HYPER_WORKING_WINDOW=",
+        "MEMORY hot",
+        "MEMORY hosts",
+        "MEMORY.md",
+    ];
+    DROP.iter().any(|p| inner.contains(p))
 }
 
 fn openai_call_to_item(c: &Value) -> Option<Value> {
@@ -515,13 +543,56 @@ mod tests {
     fn hidden_user_is_unwrapped_without_qwen_tags() {
         let msgs = vec![
             ChatMessage::user("task"),
-            ChatMessage::hidden_user("[trajectory] same tool twice."),
+            ChatMessage::hidden_user("Steer: keep going."),
         ];
         let input = messages_to_responses_input(&msgs);
         let blob = serde_json::to_string(&input).unwrap();
         assert_eq!(input.len(), 2, "{blob}");
         assert!(!blob.contains("<tool_response>"), "{blob}");
-        assert!(blob.contains("[trajectory] same tool twice."), "{blob}");
+        assert!(blob.contains("Steer: keep going."), "{blob}");
+    }
+
+    #[test]
+    fn trajectory_hidden_user_is_dropped_from_responses() {
+        let msgs = vec![
+            ChatMessage::user("task"),
+            ChatMessage::hidden_user("[trajectory] same tool twice."),
+        ];
+        let input = messages_to_responses_input(&msgs);
+        let blob = serde_json::to_string(&input).unwrap();
+        assert_eq!(input.len(), 1, "{blob}");
+        assert!(!blob.contains("[trajectory]"), "{blob}");
+    }
+
+    #[test]
+    fn guard_and_memory_hidden_users_are_dropped_from_responses() {
+        let msgs = vec![
+            ChatMessage::user("task"),
+            ChatMessage::hidden_user("[guard] tests went red."),
+            ChatMessage::hidden_user("MEMORY hot\nprefer Chinese"),
+        ];
+        let input = messages_to_responses_input(&msgs);
+        let blob = serde_json::to_string(&input).unwrap();
+        assert_eq!(input.len(), 1, "{blob}");
+        assert!(!blob.contains("[guard]"), "{blob}");
+        assert!(!blob.contains("MEMORY hot"), "{blob}");
+    }
+
+    #[test]
+    fn tool_hop_assistant_text_is_not_replayed() {
+        let msg = ChatMessage::assistant_tools(
+            Some("I'll read a.rs next and then summarize the loop.".into()),
+            vec![json!({
+                "id": "c1",
+                "type": "function",
+                "function": {"name": "Read", "arguments": "{\"path\":\"a.rs\"}"}
+            })],
+        );
+        let input = messages_to_responses_input(&[msg]);
+        let blob = serde_json::to_string(&input).unwrap();
+        assert_eq!(input.len(), 1, "{blob}");
+        assert_eq!(input[0]["type"], "function_call");
+        assert!(!blob.contains("I'll read a.rs"), "{blob}");
     }
 
     #[test]

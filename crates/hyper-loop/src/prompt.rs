@@ -16,7 +16,8 @@ they did not ask for.
 Lead with the answer, then supporting detail, for a reader who has not seen \
 your tool calls. Define project terms on first use. Complete sentences. \
 Backticks for files, functions, and commands. Bold only the few words that \
-matter. Match the user's language.
+matter. Match the user's language. Tool hops keep visible text empty; the \
+hop without tools is the answer and must stand alone. Do not restate.
 
 When citing code, use ```startLine:endLine:filepath with the snippet inside. \
 That is the only citation format.
@@ -106,12 +107,20 @@ pub fn is_stale_task_builtin(text: &str) -> bool {
         && !text.contains("Independent multi-step work can go to Task")
 }
 
+/// Previous builtin that never mentioned empty tool-hop text.
+pub fn is_stale_hop_builtin(text: &str) -> bool {
+    text.contains("You are grok-hyper, an agent in this workspace")
+        && text.contains("Independent multi-step work can go to Task")
+        && !text.contains("Tool hops keep visible text empty")
+}
+
 pub fn is_stale_builtin(text: &str) -> bool {
     is_stale_office_builtin(text)
         || is_stale_coding_builtin(text)
         || is_stale_roster_builtin(text)
         || is_stale_doc_read_builtin(text)
         || is_stale_task_builtin(text)
+        || is_stale_hop_builtin(text)
 }
 
 /// Rewrite home AGENT.md when it is still a previous builtin snapshot.
@@ -169,6 +178,9 @@ mod tests {
         assert!(!DEFAULT_AGENT_MD.contains("1-based chunk"));
         assert!(!DEFAULT_AGENT_MD.contains("Office files"));
         assert!(DEFAULT_AGENT_MD.contains("startLine:endLine:filepath"));
+        assert!(DEFAULT_AGENT_MD.contains("Tool hops keep visible text empty"));
+        assert!(DEFAULT_AGENT_MD.contains("must stand alone"));
+        assert!(DEFAULT_AGENT_MD.contains("Do not restate"));
         assert!(!DEFAULT_AGENT_MD.contains("AskQuestion"));
         assert!(!DEFAULT_AGENT_MD.contains("TodoWrite"));
         assert!(!DEFAULT_AGENT_MD.contains("工作区助手"));
@@ -250,6 +262,11 @@ mod tests {
             "You are grok-hyper, an agent in this workspace. Independent read-only calls belong in one turn. no placeholder ellipses"
         ));
         assert!(!is_stale_task_builtin(DEFAULT_AGENT_MD));
+        assert!(is_stale_hop_builtin(
+            "You are grok-hyper, an agent in this workspace. Independent multi-step work can go to Task"
+        ));
+        assert!(!is_stale_hop_builtin(DEFAULT_AGENT_MD));
+        assert!(!is_stale_builtin(DEFAULT_AGENT_MD));
     }
 
     #[test]

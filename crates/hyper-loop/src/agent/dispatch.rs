@@ -3,7 +3,7 @@
 use std::collections::{HashMap, HashSet};
 use std::time::Duration;
 
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 
 use super::guard;
 use super::notes::forbids_tools;
@@ -16,11 +16,11 @@ use crate::memory::run_memory_search;
 use crate::paw_loop::fs_tool_path;
 use crate::permit::{self, PermitDecision};
 use crate::policy::ThinkPolicy;
-use crate::session::{run_recall, OpenAiToolCall, PolicyReason, SessionEvent};
+use crate::session::{OpenAiToolCall, PolicyReason, SessionEvent, run_recall};
 use crate::skills::run_skill;
 use crate::template::ChatMessage;
 use crate::tool_calls::{CancelFlag, TextBlock, ToolCall, ToolResponse, ToolState};
-use crate::tools::{bash_search_query, run_search, run_tool, search_dump_too_big, view, Workspace};
+use crate::tools::{Workspace, bash_search_query, run_search, run_tool, search_dump_too_big, view};
 use crate::tools_schema::{dispatch_name, is_parallel_safe};
 
 impl<C: Completer> Agent<C> {
@@ -161,6 +161,9 @@ impl<C: Completer> Agent<C> {
 
     pub(crate) fn apply_guard_note(&mut self, note: guard::GuardNote) {
         self.note(&format!("[guard] {}", note.label()));
+        if self.cursor_wire() {
+            return;
+        }
         self.push_hidden_user(note.text());
     }
 
@@ -168,7 +171,7 @@ impl<C: Completer> Agent<C> {
     /// can be told apart from a tree that was already red. Interactive turns
     /// skip this and only run the post-edit scoped oracle.
     pub(crate) async fn snapshot_test_baseline(&mut self) {
-        if !self.print || self.plan_mode || self.oracle_cmd.is_some() {
+        if self.cursor_wire() || !self.print || self.plan_mode || self.oracle_cmd.is_some() {
             return;
         }
         if !verify::workspace_has_tests(self.workspace.root()) {
@@ -201,6 +204,10 @@ impl<C: Completer> Agent<C> {
     /// and turns where the model already ran tests.
     /// Returns `None` if the oracle did not run, `Some(failed)` if it did.
     pub(crate) async fn oracle_tests_if_needed(&mut self) -> Option<bool> {
+        if self.cursor_wire() {
+            self.edit_guard.mark_oracle_ran();
+            return None;
+        }
         if self.plan_mode || self.pending_stop.is_some() || !self.edit_guard.wants_oracle() {
             return None;
         }
