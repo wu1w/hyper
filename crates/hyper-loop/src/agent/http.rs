@@ -44,12 +44,12 @@ pub struct HttpCompleter {
 
 impl HttpCompleter {
     pub async fn connect(cfg: &Config, policy: ThinkPolicy) -> Result<Self> {
-        let client = llm_client(cfg.server.connect_timeout_s, cfg.server.read_timeout_s)?;
+        let client = crate::llm_http::stream_client(cfg)?;
         let (model, owned) = match configured_chat_model(cfg) {
             Some(model) => (model, None),
             None => {
                 // GET /models must not inherit the 30-minute stream timeout.
-                let probe = llm_client(cfg.server.connect_timeout_s.min(5), 15)?;
+                let probe = crate::llm_http::probe_client(cfg.server.connect_timeout_s.min(5), 15)?;
                 fetch_model(&probe, cfg).await?
             }
         };
@@ -246,15 +246,6 @@ fn caps_for(cfg: &Config, model: &str, owned: Option<&str>) -> EndpointCaps {
         .profile
         .resolve(&cfg.server.base_url, model, owned);
     EndpointCaps::for_family(family, profile)
-}
-
-fn llm_client(connect_s: u64, timeout_s: u64) -> Result<Client> {
-    Client::builder()
-        .connect_timeout(Duration::from_secs(connect_s.max(1)))
-        .timeout(Duration::from_secs(timeout_s.max(5)))
-        .tcp_nodelay(true)
-        .build()
-        .map_err(|e| Error::Http(e.to_string()))
 }
 
 fn configured_chat_model(cfg: &Config) -> Option<String> {

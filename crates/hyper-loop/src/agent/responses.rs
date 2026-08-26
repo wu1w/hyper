@@ -3,12 +3,10 @@
 //! Chat Completions stays in [`super::http::HttpCompleter`]. Grok 4.6 never
 //! gets `chat_template_kwargs`, `enable_thinking`, or llama.cpp `id_slot`.
 
-use std::collections::HashSet;
-use std::sync::Mutex;
-use std::time::Duration;
-
 use reqwest::Client;
 use serde_json::{json, Map, Value};
+use std::collections::HashSet;
+use std::sync::Mutex;
 
 use super::delta::StreamPaint;
 use super::{Completer, HttpCompleter, ModelTurn, TokenSink};
@@ -42,11 +40,7 @@ impl ResponsesCompleter {
         resolved: &ResolvedTransport,
         policy: ThinkPolicy,
     ) -> Result<Self> {
-        let client = Client::builder()
-            .connect_timeout(Duration::from_secs(cfg.server.connect_timeout_s.max(1)))
-            .timeout(Duration::from_secs(cfg.server.read_timeout_s.max(5)))
-            .build()
-            .map_err(|e| Error::Http(e.to_string()))?;
+        let client = crate::llm_http::stream_client(cfg)?;
         let model = {
             let m = cfg.server.model.trim();
             if m.is_empty() {

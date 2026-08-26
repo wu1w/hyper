@@ -542,13 +542,7 @@ impl<C: Completer> Agent<C> {
         tools: Option<&[Value]>,
     ) -> Option<ModelTurn> {
         let Some(prev) = self.completer.policy() else {
-            self.arm_sink();
-            let wire = self.wire_messages();
-            let retry = tokio::select! {
-                biased;
-                _ = self.cancel.cancelled() => None,
-                turn = self.completer.complete(&wire, tools) => turn.ok(),
-            };
+            let retry = self.complete_resilient(tools).await.ok().flatten();
             return retry.filter(|t| !t.watchdog_hit && !t.parse_fail);
         };
         if !prev.enabled {
@@ -558,13 +552,7 @@ impl<C: Completer> Agent<C> {
         raised.max_think_tokens = raised.max_think_tokens.max(NO_TOOL_THINK_FLOOR);
         raised.raise_generation_cap(raised.max_think_tokens + NO_TOOL_ANSWER_RESERVE);
         self.completer.set_policy(raised);
-        self.arm_sink();
-        let wire = self.wire_messages();
-        let retry = tokio::select! {
-            biased;
-            _ = self.cancel.cancelled() => None,
-            turn = self.completer.complete(&wire, tools) => turn.ok(),
-        };
+        let retry = self.complete_resilient(tools).await.ok().flatten();
         self.completer.set_policy(prev);
         retry.filter(|t| !t.watchdog_hit && !t.parse_fail)
     }

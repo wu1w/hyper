@@ -80,19 +80,32 @@ pub async fn execute_turn(
     let prompt = req.prompt;
     let parts = req.parts;
     let policy = req.snapshot.policy;
-    let completer = tokio::select! {
-        biased;
-        _ = cancel.cancelled() => return TurnResult::aborted(),
-        c = TransportCompleter::connect(&cfg, policy.clone()) => match c {
-            Ok(c) => c,
-            Err(e) => {
-                return if cancel.is_cancelled() {
-                    TurnResult::aborted()
-                } else {
-                    TurnResult::fail(e.to_string())
-                };
-            }
+    let emit = req.emit.clone();
+    let completer = match crate::llm_http::retry_transient(
+        &cancel,
+        || TransportCompleter::connect(&cfg, policy.clone()),
+        |attempt, wait, err| {
+            emit.append(crate::session::SessionEvent::delta_reset());
+            emit.append(crate::session::SessionEvent::delta_chunk(
+                crate::session::DeltaChannel::Reasoning,
+                crate::llm_http::retry_status_line(attempt, wait),
+            ));
+            eprintln!("[net] connect retry #{attempt} after {wait:?}: {err}");
         },
+    )
+    .await
+    {
+        Ok(c) => {
+            emit.append(crate::session::SessionEvent::delta_reset());
+            c
+        }
+        Err(e) => {
+            return if cancel.is_cancelled() || e.to_string().contains("aborted") {
+                TurnResult::aborted()
+            } else {
+                TurnResult::fail(e.to_string())
+            };
+        }
     };
     let mut agent = match Agent::new(completer, opts) {
         Ok(a) => a,

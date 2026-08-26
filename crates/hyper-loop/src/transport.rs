@@ -201,8 +201,9 @@ pub async fn detect_wire(cfg: &Config, resolved: &ResolvedTransport) -> WireForm
 pub async fn probe_responses_path(resolved: &ResolvedTransport) -> bool {
     let url = format!("{}/responses", resolved.base_url.trim_end_matches('/'));
     let client = match reqwest::Client::builder()
-        .connect_timeout(std::time::Duration::from_secs(2))
-        .timeout(std::time::Duration::from_secs(8))
+        .connect_timeout(std::time::Duration::from_secs(10))
+        .timeout(std::time::Duration::from_secs(15))
+        .tcp_nodelay(true)
         .build()
     {
         Ok(c) => c,

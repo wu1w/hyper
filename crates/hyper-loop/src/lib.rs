@@ -17,6 +17,7 @@ pub mod echo;
 pub mod error;
 pub mod family;
 pub mod imagine;
+pub mod llm_http;
 pub mod mcp;
 pub mod media;
 pub mod memory;

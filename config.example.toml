@@ -15,7 +15,7 @@ model = "grok-4.6"
 # image_model = ""             # empty = grok-imagine-image-2.0. Independent of chat model
 profile = "auto"               # auto | xai | llamacpp | vllm | sglang | generic
 family = "grok46"              # grok46 | auto | qwen35 | qwen36 | qwen38
-connect_timeout_s = 5
+connect_timeout_s = 30         # TLS/handshake; remote endpoints also floor at 20s
 read_timeout_s = 1800
 
 [context]

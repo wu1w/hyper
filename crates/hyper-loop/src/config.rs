@@ -136,7 +136,7 @@ impl Default for ServerConfig {
             image_model: String::new(),
             profile: EngineProfile::Auto,
             family: Family::Grok46,
-            connect_timeout_s: 5,
+            connect_timeout_s: 30,
             read_timeout_s: 1800,
         }
     }

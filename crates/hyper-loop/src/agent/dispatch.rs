@@ -373,17 +373,59 @@ impl<C: Completer> Agent<C> {
         tools: Option<&[Value]>,
     ) -> Result<Option<ModelTurn>> {
         let prev = self.widen_no_tool_think();
-        self.arm_sink();
-        let wire = self.wire_messages();
-        let result = tokio::select! {
-            biased;
-            _ = self.cancel.cancelled() => Ok(None),
-            turn = self.completer.complete(&wire, tools) => Ok(Some(turn?)),
-        };
+        let result = self.complete_resilient(tools).await;
         if let Some(p) = prev {
             self.completer.set_policy(p);
         }
         result
+    }
+
+    /// One model hop. Transient endpoint drops retry with backoff so a flaky
+    /// path continues the same turn (tools already run stay) instead of erroring.
+    pub(crate) async fn complete_resilient(
+        &self,
+        tools: Option<&[Value]>,
+    ) -> Result<Option<ModelTurn>> {
+        let started = std::time::Instant::now();
+        let mut attempt = 0u32;
+        loop {
+            if self.cancel.is_cancelled() {
+                return Ok(None);
+            }
+            self.arm_sink();
+            let wire = self.wire_messages();
+            let result = tokio::select! {
+                biased;
+                _ = self.cancel.cancelled() => return Ok(None),
+                turn = self.completer.complete(&wire, tools) => turn,
+            };
+            match result {
+                Ok(turn) => return Ok(Some(turn)),
+                Err(e) if crate::llm_http::is_transient(&e) => {
+                    attempt += 1;
+                    if started.elapsed() >= crate::llm_http::RETRY_BUDGET {
+                        return Err(e);
+                    }
+                    let wait = crate::llm_http::retry_delay(attempt);
+                    self.signal_net_retry(attempt, wait, &e);
+                    tokio::select! {
+                        biased;
+                        _ = self.cancel.cancelled() => return Ok(None),
+                        _ = tokio::time::sleep(wait) => {}
+                    }
+                }
+                Err(e) => return Err(e),
+            }
+        }
+    }
+
+    fn signal_net_retry(&self, attempt: u32, wait: Duration, err: &crate::error::Error) {
+        let line = crate::llm_http::retry_status_line(attempt, wait);
+        self.note(&format!("[net] {line}{err}"));
+        if let Some(sink) = self.live_sink() {
+            sink.reset();
+            sink.reasoning(&line);
+        }
     }
 
     /// A turn that forbids tools spends its whole budget on one answer, so the

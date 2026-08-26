@@ -4,9 +4,7 @@
 //! Auth follows the chat rail; the URL can be a separate origin.
 
 use std::path::Path;
-use std::time::Duration;
 
-use reqwest::Client;
 use serde_json::{json, Value};
 
 use crate::config::Config;
@@ -87,12 +85,9 @@ pub async fn generate(
     let url = generations_url(&image_base);
     let model = cfg.server.resolved_image_model();
     let timeout_s = cfg.server.read_timeout_s.clamp(60, 180);
-    let client = Client::builder()
-        .connect_timeout(Duration::from_secs(cfg.server.connect_timeout_s.max(1)))
-        .timeout(Duration::from_secs(timeout_s))
-        .tcp_nodelay(true)
-        .build()
-        .map_err(|e| e.to_string())?;
+    let client =
+        crate::llm_http::build_client(crate::llm_http::effective_connect_timeout_s(cfg), timeout_s)
+            .map_err(|e| e.to_string())?;
     let body = json!({
         "model": model,
         "prompt": prompt,
