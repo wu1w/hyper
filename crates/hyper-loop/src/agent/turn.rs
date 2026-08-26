@@ -63,6 +63,7 @@ impl<C: Completer> Agent<C> {
         self.physics_nudged = false;
         self.parse_nudged = false;
         self.last_spoken = None;
+        self.last_essay = None;
         self.read_paths.clear();
         self.observed_paths = observed_from_messages(&self.messages, &self.workspace);
         let user = self.last_real_user().to_string();
@@ -182,14 +183,34 @@ impl<C: Completer> Agent<C> {
             }
             let mut trajectory_note = None;
             let mut dump_hop = false;
-            if let Some(prev) = self.last_spoken.clone() {
-                if self.is_answer_dump_hop(&prev, &turn) {
+            if self.cursor_wire()
+                && turn.tool_calls.is_empty()
+                && crate::stutter::is_blockquote_heavy(&turn.content)
+                && self.last_essay.is_none()
+                && self.last_spoken.is_none()
+            {
+                // First visible hop is a quote recap (usually of the user).
+                // Keep the inner text once, not the `>` wall.
+                turn.content = crate::stutter::strip_blockquote_prefix(&turn.content);
+            }
+            let dump_anchor = if self.cursor_wire() {
+                self.last_spoken.clone().or_else(|| self.last_essay.clone())
+            } else {
+                self.last_spoken.clone()
+            };
+            if let Some(prev) = dump_anchor {
+                let quote_dump = self.cursor_wire()
+                    && turn.tool_calls.is_empty()
+                    && crate::stutter::is_blockquote_heavy(&turn.content)
+                    && crate::stutter::is_substantial_reply(&prev);
+                if quote_dump || self.is_answer_dump_hop(&prev, &turn) {
+                    let keep = self.last_spoken.clone().unwrap_or(prev);
                     if turn.tool_calls.is_empty() {
                         // No tools means the model chose to stop. Keep the first
                         // identical bubble without labelling that choice a
                         // harness failure.
                         self.mark_clean();
-                        return self.finish(prev, None, steps);
+                        return self.finish(keep, None, steps);
                     }
                     dump_hop = true;
                     // grok-4.6 is trained to stop after a delivered answer.
@@ -199,7 +220,7 @@ impl<C: Completer> Agent<C> {
                         self.push_assistant(&turn);
                         self.defer_divergent_tools(std::mem::take(&mut turn.tool_calls));
                         self.mark_clean();
-                        return self.finish(prev, None, steps);
+                        return self.finish(keep, None, steps);
                     }
                     if !self.dump_nudged {
                         self.dump_nudged = true;
@@ -208,6 +229,9 @@ impl<C: Completer> Agent<C> {
                 }
             }
             self.push_assistant(&turn);
+            if crate::stutter::is_substantial_reply(&turn.content) && !dump_hop {
+                self.last_essay = Some(turn.content.clone());
+            }
             if Self::hop_locks_spoken(&turn) {
                 self.last_spoken = Some(turn.content.clone());
             }
