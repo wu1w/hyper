@@ -998,6 +998,47 @@ async fn grok_lossy_stutter_finishes_without_lecture() {
 }
 
 #[tokio::test]
+async fn grok_quote_recap_of_read_hop_keeps_essay() {
+    let dir = std::env::temp_dir().join(format!(
+        "hyper-grok-quote-{}",
+        uuid::Uuid::new_v4().simple()
+    ));
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(dir.join("ping.txt"), "pong\n").unwrap();
+    let essay = "I studied the grok-hyper agent loop in detail.\n\
+The core crate is hyper-loop and it runs a ReAct cycle.\n\
+Frozen tools stay byte-stable across hops for cache hits.\n\
+Template rendering uses the official chat template.\n\
+Adapter builds OpenAI-compat requests for local Qwen.\n\
+Sticky notes hold skill and MCP cards for the 27B.";
+    let quoted = essay
+        .lines()
+        .map(|l| format!("> {l}"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    let mut o = opts(&dir);
+    o.max_steps = 6;
+    o.peripheral = false;
+    let scripted = Recasting(Scripted {
+        turns: Mutex::new(VecDeque::from([
+            turn_said(essay, "read", json!({"path": "ping.txt"})),
+            turn_text(&quoted),
+        ])),
+        meter: false,
+    });
+    let mut agent = Agent::new(scripted, o).unwrap();
+    let out = agent.run("read ping.txt").await.unwrap();
+    assert_eq!(out.stop_reason, None);
+    assert_eq!(out.text, essay);
+    assert!(
+        !out.text.lines().any(|l| l.trim_start().starts_with('>')),
+        "{:?}",
+        out.text
+    );
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+#[tokio::test]
 async fn bash_rg_dump_is_folded_to_spans() {
     let dir = std::env::temp_dir().join(format!("hyper-rg-{}", uuid::Uuid::new_v4().simple()));
     std::fs::create_dir_all(dir.join("src")).unwrap();

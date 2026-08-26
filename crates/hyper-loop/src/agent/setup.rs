@@ -198,6 +198,7 @@ impl<C: Completer> Agent<C> {
             low_precision: lossy,
             parse_stop_after: if lossy { 2 } else { 3 },
             last_spoken: None,
+            last_essay: None,
             read_paths: HashSet::new(),
             observed_paths: HashSet::new(),
             window_overlay: opts.working_window_overlay,

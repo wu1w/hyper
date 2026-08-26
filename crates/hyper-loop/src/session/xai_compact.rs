@@ -204,6 +204,7 @@ fn is_cursor_noise_user(msg: &ChatMessage) -> bool {
         "[cron]",
         "[compact]",
         "[guard]",
+        "[archived]",
         "HYPER_WORKING_WINDOW=",
         "MEMORY hot",
         "MEMORY hosts",
@@ -576,6 +577,18 @@ mod tests {
         assert_eq!(input.len(), 1, "{blob}");
         assert!(!blob.contains("[guard]"), "{blob}");
         assert!(!blob.contains("MEMORY hot"), "{blob}");
+    }
+
+    #[test]
+    fn archived_hidden_user_is_dropped_from_responses() {
+        let msgs = vec![
+            ChatMessage::user("task"),
+            ChatMessage::hidden_user("[archived]\n## Active Task\nold work"),
+        ];
+        let input = messages_to_responses_input(&msgs);
+        let blob = serde_json::to_string(&input).unwrap();
+        assert_eq!(input.len(), 1, "{blob}");
+        assert!(!blob.contains("[archived]"), "{blob}");
     }
 
     #[test]

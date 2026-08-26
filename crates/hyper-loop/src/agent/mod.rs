@@ -378,6 +378,10 @@ pub struct Agent<C> {
     parse_stop_after: u32,
     /// Last substantial assistant content this user turn. Harness-only.
     last_spoken: Option<String>,
+    /// Last substantial assistant text this user turn, including tool-hop
+    /// essays. Dump detection uses this when `last_spoken` was not locked
+    /// (read-only hops). grok-4.6 often recaps that essay as markdown quotes.
+    last_essay: Option<String>,
     /// Paths successfully `read` this user turn. Re-reads after an answer are not progress.
     read_paths: HashSet<String>,
     /// Paths whose content the live transcript has seen (read/view/write/edit).
