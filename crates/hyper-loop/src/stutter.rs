@@ -47,6 +47,36 @@ pub fn is_restated_reply(prev: &str, next: &str) -> bool {
     trigram_jaccard(&a, &b) >= RESTATE_JACCARD
 }
 
+/// grok-4.6 recap: most non-empty lines are markdown quotes of earlier text.
+pub fn is_blockquote_heavy(s: &str) -> bool {
+    let lines: Vec<&str> = s
+        .lines()
+        .map(str::trim_end)
+        .filter(|l| !l.trim().is_empty())
+        .collect();
+    if lines.len() < 6 {
+        return false;
+    }
+    let quoted = lines
+        .iter()
+        .filter(|l| l.trim_start().starts_with('>'))
+        .count();
+    quoted * 3 >= lines.len() * 2
+}
+
+/// One layer of markdown quote markers. Nested `>>` becomes `>`.
+pub fn strip_blockquote_prefix(s: &str) -> String {
+    s.lines()
+        .map(|line| {
+            let rest = line.trim_start();
+            rest.strip_prefix("> ")
+                .or_else(|| rest.strip_prefix('>'))
+                .unwrap_or(rest)
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
 /// `rm` / `unlink` plus inspect/`echo` (the 27B often `ls && cat && rm`).
 /// `rm && cargo test` is still work.
 pub fn is_cleanup_bash(command: &str) -> bool {
@@ -187,11 +217,7 @@ fn trigram_jaccard(a: &str, b: &str) -> f32 {
     }
     let inter = ga.intersection(&gb).count() as f32;
     let union = ga.union(&gb).count() as f32;
-    if union == 0.0 {
-        0.0
-    } else {
-        inter / union
-    }
+    if union == 0.0 { 0.0 } else { inter / union }
 }
 
 fn char_trigrams(s: &str) -> HashSet<String> {
@@ -295,8 +321,7 @@ mod tests {
         assert!(is_stutter("", s));
     }
 
-    const ESSAY: &str =
-        "I studied the grok-hyper agent loop in detail. The core crate is hyper-loop. \
+    const ESSAY: &str = "I studied the grok-hyper agent loop in detail. The core crate is hyper-loop. \
 It runs a ReAct cycle with frozen tools read write edit bash. Template rendering uses the \
 official Qwen3.8 Jinja chat template. Adapter builds OpenAI-compat requests. Sticky notes \
 hold skill and MCP cards. This is a strong fit for the 27B local model because the prefix \
@@ -337,6 +362,27 @@ This is a different task from architecture review and names different files on p
             ESSAY,
             &ESSAY.replace("in detail", "carefully")
         ));
+    }
+
+    #[test]
+    fn markdown_quote_wall_is_blockquote_heavy() {
+        let lines = [
+            "I studied the grok-hyper agent loop in detail.",
+            "The core crate is hyper-loop.",
+            "It runs a ReAct cycle with frozen tools.",
+            "Template rendering uses the official chat template.",
+            "Adapter builds OpenAI-compat requests.",
+            "Sticky notes hold skill and MCP cards.",
+        ];
+        let quoted = lines
+            .iter()
+            .map(|l| format!("> {l}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(is_blockquote_heavy(&quoted));
+        assert!(!is_blockquote_heavy(&lines.join("\n")));
+        assert_eq!(strip_blockquote_prefix(&quoted), lines.join("\n"));
+        assert!(is_restated_reply(&lines.join(" "), &quoted));
     }
 
     #[test]
