@@ -1039,6 +1039,115 @@ Sticky notes hold skill and MCP cards for the 27B.";
 }
 
 #[tokio::test]
+async fn grok_empty_hop_then_file_quote_retries_then_keeps_real_answer() {
+    let dir = std::env::temp_dir().join(format!(
+        "hyper-grok-tool-recap-{}",
+        uuid::Uuid::new_v4().simple()
+    ));
+    std::fs::create_dir_all(&dir).unwrap();
+    let body = "I studied the grok-hyper agent loop in detail. The core crate is hyper-loop. \
+It runs a ReAct cycle with frozen tools read write edit bash. Template rendering uses the \
+official Qwen3.8 Jinja chat template. Adapter builds OpenAI-compat requests. Sticky notes \
+hold skill and MCP cards. This is a strong fit for the 27B local model because the prefix \
+is byte-stable and tools stay frozen.";
+    std::fs::write(dir.join("notes.md"), body).unwrap();
+    let quoted = body
+        .lines()
+        .map(|l| format!("> {l}"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    let answer = "Next I will add a unit test in agent/mod.rs that writes ping.txt then \
+reads it back. The test should use a Scripted completer and assert stop_reason is none. \
+Then I will run cargo test -p hyper-loop --lib. After green, update the cron job prompt. \
+This is a different task from architecture review and names different files on purpose.";
+    let mut o = opts(&dir);
+    o.max_steps = 8;
+    o.peripheral = false;
+    let scripted = Recasting(Scripted {
+        turns: Mutex::new(VecDeque::from([
+            turn_tool("read", json!({"path": "notes.md"})),
+            turn_text(&quoted),
+            turn_text(answer),
+        ])),
+        meter: false,
+    });
+    let mut agent = Agent::new(scripted, o).unwrap();
+    let out = agent.run("read notes.md").await.unwrap();
+    assert_eq!(out.text, answer);
+    assert!(!out.text.contains('>'), "{:?}", out.text);
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+#[tokio::test]
+async fn grok_user_paste_quote_is_not_the_answer() {
+    let dir = std::env::temp_dir().join(format!(
+        "hyper-grok-user-echo-{}",
+        uuid::Uuid::new_v4().simple()
+    ));
+    std::fs::create_dir_all(&dir).unwrap();
+    let paste = "I studied the grok-hyper agent loop in detail. The core crate is hyper-loop. \
+It runs a ReAct cycle with frozen tools read write edit bash. Template rendering uses the \
+official Qwen3.8 Jinja chat template. Adapter builds OpenAI-compat requests. Sticky notes \
+hold skill and MCP cards. This is a strong fit for the 27B local model because the prefix \
+is byte-stable and tools stay frozen.";
+    let quoted = paste
+        .split(". ")
+        .map(|l| format!("> {l}"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    let answer = "Next I will add a unit test in agent/mod.rs that writes ping.txt then \
+reads it back. The test should use a Scripted completer and assert stop_reason is none. \
+Then I will run cargo test -p hyper-loop --lib. After green, update the cron job prompt. \
+This is a different task from architecture review and names different files on purpose.";
+    let mut o = opts(&dir);
+    o.max_steps = 6;
+    o.peripheral = false;
+    let scripted = Recasting(Scripted {
+        turns: Mutex::new(VecDeque::from([turn_text(&quoted), turn_text(answer)])),
+        meter: false,
+    });
+    let mut agent = Agent::new(scripted, o).unwrap();
+    let out = agent.run(paste).await.unwrap();
+    assert_eq!(out.text, answer);
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+#[tokio::test]
+async fn grok_steer_is_plain_user_not_hidden_wrap() {
+    let dir = std::env::temp_dir().join(format!(
+        "hyper-grok-steer-{}",
+        uuid::Uuid::new_v4().simple()
+    ));
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(dir.join("note.txt"), "abc").unwrap();
+    let mut o = opts(&dir);
+    o.peripheral = false;
+    let scripted = Recasting(Scripted {
+        turns: Mutex::new(VecDeque::from([
+            turn_tool("read", json!({"path": "note.txt"})),
+            turn_text("ok focusing auth"),
+        ])),
+        meter: false,
+    });
+    let mut agent = Agent::new(scripted, o).unwrap();
+    let slot = std::sync::Arc::new(std::sync::Mutex::new(vec!["focus on auth".into()]));
+    agent.set_steer(slot);
+    let out = agent.run("read the note").await.unwrap();
+    assert!(out.text.contains("auth"));
+    let steer = agent
+        .messages
+        .iter()
+        .find(|m| m.role == "user" && m.content.as_deref().unwrap_or("").contains("focus on auth"))
+        .expect("steer user turn");
+    let body = steer.content.as_deref().unwrap_or("");
+    assert!(
+        !crate::template::is_hidden_user_text(body),
+        "grok steer must not be a Qwen tool_response wrap: {body}"
+    );
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+#[tokio::test]
 async fn bash_rg_dump_is_folded_to_spans() {
     let dir = std::env::temp_dir().join(format!("hyper-rg-{}", uuid::Uuid::new_v4().simple()));
     std::fs::create_dir_all(dir.join("src")).unwrap();
@@ -1206,12 +1315,10 @@ async fn print_mode_never_narrates() {
     o.print = true;
     let mut agent = Agent::new(scripted, o).unwrap();
     agent.run("hi").await.unwrap();
-    assert!(
-        agent
-            .messages
-            .iter()
-            .all(|m| !m.content.as_deref().unwrap_or("").contains("[style]"))
-    );
+    assert!(agent
+        .messages
+        .iter()
+        .all(|m| !m.content.as_deref().unwrap_or("").contains("[style]")));
     let _ = std::fs::remove_dir_all(dir);
 }
 
@@ -2380,7 +2487,8 @@ official Qwen3.8 Jinja chat template. Adapter builds OpenAI-compat requests. Sti
 hold skill and MCP cards. This is a strong fit for the 27B local model because the prefix \
 is byte-stable and tools stay frozen.";
     let again = essay.replace("in detail", "carefully");
-    let doc = "CONTRIBUTING\n\nFork the repo, open a PR against main, run cargo test -p hyper-loop \
+    let doc =
+        "CONTRIBUTING\n\nFork the repo, open a PR against main, run cargo test -p hyper-loop \
 --lib before you push. Do not bump the frozen tools array. Add a live scene only when the \
 public llama.cpp endpoint is up. Name the branch after the ticket. Ask for review from William.";
     let mut o = opts(&dir);
@@ -3250,6 +3358,10 @@ fn child_tools_omit_task() {
         !crate::tools_schema::has_tool(agent.tools(), "Task"),
         "children must not see Task"
     );
+    assert!(
+        !crate::tools_schema::has_tool(agent.tools(), "ComputerUse"),
+        "children must not see ComputerUse"
+    );
     let _ = std::fs::remove_dir_all(dir);
 }
 
@@ -3495,6 +3607,7 @@ async fn peripheral_off_keeps_frozen_four() {
     assert!(!names.contains(&"read"));
     assert!(!names.contains(&"bash"));
     assert!(names.contains(&"view"));
+    assert!(names.contains(&"ComputerUse"));
     assert!(!names.contains(&"memory_search"));
     let _ = std::fs::remove_dir_all(dir);
 }
@@ -3684,6 +3797,7 @@ fn from_config_enables_agents_md() {
         std::path::PathBuf::from("/tmp"),
     );
     assert!(o.agents_md);
+    assert!(o.computer_use);
 }
 
 #[tokio::test]

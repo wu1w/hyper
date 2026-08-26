@@ -10,12 +10,18 @@ use super::{Agent, AgentOutcome, Completer, ModelTurn};
 use crate::channel::take_steer;
 use crate::echo::strip_greeting_echo;
 use crate::error::Result;
-use crate::paw_loop::{GateCtx, GateDecision, ToolFingerprint, fs_tool_path};
+use crate::paw_loop::{fs_tool_path, GateCtx, GateDecision, ToolFingerprint};
 use crate::session::{PolicyReason, SessionEvent};
 use crate::sticky;
-use crate::template::{ChatMessage, is_hidden_user_text, wrap_tool_response};
+use crate::template::{is_hidden_user_text, wrap_tool_response, ChatMessage};
 use crate::tool_calls::{ToolCall, ToolState};
 use crate::tools_schema::dispatch_name;
+
+enum GrokHop {
+    Finish(Result<AgentOutcome>),
+    SkipRecap,
+    Proceed,
+}
 
 impl<C: Completer> Agent<C> {
     pub async fn run(&mut self, prompt: &str) -> Result<AgentOutcome> {
@@ -64,6 +70,8 @@ impl<C: Completer> Agent<C> {
         self.parse_nudged = false;
         self.last_spoken = None;
         self.last_essay = None;
+        self.tool_evidence.clear();
+        self.recap_retries = 0;
         self.read_paths.clear();
         self.observed_paths = observed_from_messages(&self.messages, &self.workspace);
         let user = self.last_real_user().to_string();
@@ -183,15 +191,12 @@ impl<C: Completer> Agent<C> {
             }
             let mut trajectory_note = None;
             let mut dump_hop = false;
-            if self.cursor_wire()
-                && turn.tool_calls.is_empty()
-                && crate::stutter::is_blockquote_heavy(&turn.content)
-                && self.last_essay.is_none()
-                && self.last_spoken.is_none()
-            {
-                // First visible hop is a quote recap (usually of the user).
-                // Keep the inner text once, not the `>` wall.
-                turn.content = crate::stutter::strip_blockquote_prefix(&turn.content);
+            if self.cursor_wire() && turn.tool_calls.is_empty() {
+                match self.grok_no_tool_hop(&turn, steps) {
+                    GrokHop::Finish(out) => return out,
+                    GrokHop::SkipRecap => continue,
+                    GrokHop::Proceed => {}
+                }
             }
             let dump_anchor = if self.cursor_wire() {
                 self.last_spoken.clone().or_else(|| self.last_essay.clone())
@@ -230,7 +235,9 @@ impl<C: Completer> Agent<C> {
             }
             self.push_assistant(&turn);
             if crate::stutter::is_substantial_reply(&turn.content) && !dump_hop {
-                self.last_essay = Some(turn.content.clone());
+                if !self.cursor_wire() || !self.is_source_or_quote_recap(&turn.content) {
+                    self.last_essay = Some(turn.content.clone());
+                }
             }
             if Self::hop_locks_spoken(&turn) {
                 self.last_spoken = Some(turn.content.clone());
@@ -332,6 +339,8 @@ impl<C: Completer> Agent<C> {
         };
         let content = if tool_calls.is_none() {
             Some(turn.content.clone())
+        } else if self.cursor_wire() {
+            None
         } else {
             empty_to_none(&turn.content)
         };
@@ -406,7 +415,13 @@ impl<C: Completer> Agent<C> {
 
     pub(crate) fn flush_steer(&mut self) {
         for note in take_steer(&self.steer) {
-            self.push_hidden_user(format!("Steer: {note}"));
+            if self.cursor_wire() {
+                // Mid-turn user text, not a Qwen <tool_response> wrap.
+                self.messages.push(ChatMessage::user(note.clone()));
+                self.log_event(SessionEvent::user(note));
+            } else {
+                self.push_hidden_user(format!("Steer: {note}"));
+            }
         }
     }
 
@@ -418,15 +433,10 @@ impl<C: Completer> Agent<C> {
                 ToolState::Interrupted => "interrupted",
             };
             self.note(&format!("[background {name} {status}]"));
-            let mut body = format!(
-                "[background {name} {status} id={}]\n{}",
-                response.id,
-                response.joined_text()
-            );
-            if let Some(blob) = &response.blob {
-                body.push_str(&format!("\n[blob {blob}]"));
-            }
-            self.push_hidden_user(body);
+            // The foreground hop already posted "running in background" as
+            // function_call_output. A second output for the same call_id is
+            // illegal on Responses, and a hidden user note makes grok recap
+            // stdout. The result stays on AwaitShell / bgwait.
         }
     }
 
@@ -506,6 +516,75 @@ impl<C: Completer> Agent<C> {
             }
         }
         dumpish
+    }
+
+    fn grok_no_tool_hop(&mut self, turn: &ModelTurn, steps: u32) -> GrokHop {
+        if !crate::stutter::is_substantial_reply(&turn.content) {
+            return GrokHop::Proceed;
+        }
+        if !self.is_grok_non_answer(&turn.content) {
+            return GrokHop::Proceed;
+        }
+        if let Some(keep) = self.keepable_essay() {
+            self.mark_clean();
+            return GrokHop::Finish(self.finish(keep, None, steps));
+        }
+        if self.recap_retries < 1 {
+            self.recap_retries += 1;
+            if let Some(sink) = self.live_sink() {
+                sink.clear_content();
+            }
+            return GrokHop::SkipRecap;
+        }
+        self.mark_clean();
+        GrokHop::Finish(self.finish(self.last_spoken.clone().unwrap_or_default(), None, steps))
+    }
+
+    fn keepable_essay(&self) -> Option<String> {
+        self.last_spoken
+            .iter()
+            .chain(self.last_essay.iter())
+            .find(|k| crate::stutter::is_substantial_reply(k) && !self.is_source_or_quote_recap(k))
+            .cloned()
+    }
+
+    fn is_grok_non_answer(&self, content: &str) -> bool {
+        if self.is_source_or_quote_recap(content) {
+            return true;
+        }
+        let prev = self.last_spoken.as_deref().or(self.last_essay.as_deref());
+        prev.is_some_and(|p| crate::stutter::is_restated_reply(p, content))
+    }
+
+    fn is_source_or_quote_recap(&self, content: &str) -> bool {
+        if crate::stutter::is_blockquote_heavy(content) {
+            return true;
+        }
+        let user = self.last_real_user();
+        crate::stutter::is_source_recap(user, content)
+            || crate::stutter::is_source_recap(&self.tool_evidence, content)
+    }
+
+    pub(crate) fn remember_tool_output(&mut self, text: &str) {
+        let t = text.trim();
+        if t.is_empty() || t.contains("running in background") {
+            return;
+        }
+        if t.chars().count() < 80 {
+            return;
+        }
+        if !self.tool_evidence.is_empty() {
+            self.tool_evidence.push('\n');
+        }
+        self.tool_evidence.push_str(t);
+        const CAP: usize = 16_384;
+        if self.tool_evidence.len() > CAP {
+            let mut i = self.tool_evidence.len() - CAP;
+            while i < self.tool_evidence.len() && !self.tool_evidence.is_char_boundary(i) {
+                i += 1;
+            }
+            self.tool_evidence = self.tool_evidence[i..].to_string();
+        }
     }
 
     pub(crate) fn is_dump_tool(&self, spoken: &str, content: &str, call: &ToolCall) -> bool {
@@ -735,7 +814,8 @@ pub(crate) const THINK_DIVERGENCE_NOTE: &str = "[trajectory] This turn's thinkin
 Compress known facts and open questions first; answer or act if the evidence is enough, else take only the smallest missing step.";
 
 /// One wrap-up hop when a physics cap would otherwise tombstone the turn.
-pub(crate) const PHYSICS_WRAP_NOTE: &str = "[trajectory] This turn is near the step, time, or context cap. \
+pub(crate) const PHYSICS_WRAP_NOTE: &str =
+    "[trajectory] This turn is near the step, time, or context cap. \
 Close with a user-visible conclusion from the evidence you have; do not start a new tool loop.";
 
 /// One repair hop after the parse-fail retry budget is spent.

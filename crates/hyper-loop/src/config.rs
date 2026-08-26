@@ -275,6 +275,9 @@ pub struct FeatureConfig {
     pub workspace_write_only: bool,
     /// TUI permission mode: ask | auto | yolo. `--print` never prompts.
     pub approvals: String,
+    /// Append ComputerUse (screenshot + mouse/keyboard on Windows / macOS).
+    /// Not spliced into the frozen Cursor 13.
+    pub computer_use: bool,
 }
 
 impl Default for FeatureConfig {
@@ -286,6 +289,7 @@ impl Default for FeatureConfig {
             mcp_auto_catalog: false,
             workspace_write_only: true,
             approvals: "ask".into(),
+            computer_use: true,
         }
     }
 }

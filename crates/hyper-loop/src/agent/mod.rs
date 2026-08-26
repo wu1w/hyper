@@ -45,7 +45,7 @@ use crate::tool_calls::{CancelFlag, ToolCall, ToolCoordinator};
 use crate::tools::{BlobStore, CodeIndex, ToolLimits, Workspace};
 
 pub use delta::TokenSink;
-pub use http::{HttpCompleter, ParseOutcome, parse_cached_tokens, parse_turn};
+pub use http::{parse_cached_tokens, parse_turn, HttpCompleter, ParseOutcome};
 pub use responses::{ResponsesCompleter, TransportCompleter};
 
 /// Used by `http.rs` / `responses.rs` when wrapping native tool_calls.
@@ -184,6 +184,8 @@ pub struct RunOpts {
     pub web: crate::config::WebConfig,
     /// Append `view` in agent mode (not spliced into the frozen four).
     pub media: bool,
+    /// Append `ComputerUse` in agent mode (Windows / macOS desktop control).
+    pub computer_use: bool,
     pub media_max_bytes: usize,
     pub media_bins: MediaBins,
     /// `AGENT.md` filename (workspace then home).
@@ -253,6 +255,7 @@ impl RunOpts {
             mcp: cfg.mcp.clone(),
             web: cfg.web.clone(),
             media: cfg.media.enabled,
+            computer_use: cfg.features.computer_use,
             media_max_bytes: cfg.media.max_bytes as usize,
             media_bins: MediaBins::from_config(&cfg.media),
             prompt_file: cfg.prompt.file.clone(),
@@ -382,6 +385,11 @@ pub struct Agent<C> {
     /// essays. Dump detection uses this when `last_spoken` was not locked
     /// (read-only hops). grok-4.6 often recaps that essay as markdown quotes.
     last_essay: Option<String>,
+    /// Concatenated substantial tool results this user turn (capped).
+    /// grok-4.6 recaps Read/Grep dumps as the "answer"; this is the source.
+    tool_evidence: String,
+    /// Silent retry after a no-tool recap with nothing keepable.
+    recap_retries: u32,
     /// Paths successfully `read` this user turn. Re-reads after an answer are not progress.
     read_paths: HashSet<String>,
     /// Paths whose content the live transcript has seen (read/view/write/edit).

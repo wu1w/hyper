@@ -25,7 +25,8 @@ use crate::template::ChatMessage;
 use crate::tool_calls::{CancelFlag, ToolCoordinator, COORDINATOR_OWNED_EXEC_TIMEOUT_SECS};
 use crate::tools::{BlobStore, CodeIndex, Workspace};
 use crate::tools_schema::{
-    agent_tools, code_tools, dispatch_name, has_tool, mcp_tool, memory_search_tool, view_tool,
+    agent_tools, code_tools, computer_use_tool, dispatch_name, has_tool, mcp_tool,
+    memory_search_tool, view_tool,
 };
 
 impl<C: Completer> Agent<C> {
@@ -199,6 +200,8 @@ impl<C: Completer> Agent<C> {
             parse_stop_after: if lossy { 2 } else { 3 },
             last_spoken: None,
             last_essay: None,
+            tool_evidence: String::new(),
+            recap_retries: 0,
             read_paths: HashSet::new(),
             observed_paths: HashSet::new(),
             window_overlay: opts.working_window_overlay,
@@ -357,6 +360,9 @@ pub(crate) fn bind_periphery(
     }
     if opts.media && matches!(tool_set, ToolSet::Agent) {
         tools.push(view_tool());
+    }
+    if opts.computer_use && matches!(tool_set, ToolSet::Agent) && opts.child.is_none() {
+        tools.push(computer_use_tool());
     }
     if opts.child.is_some() {
         tools.retain(|t| {

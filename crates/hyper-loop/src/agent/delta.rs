@@ -84,6 +84,15 @@ impl TokenSink {
         }
     }
 
+    /// Drop the live answer bubble; keep the think panel. Tool hops that
+    /// streamed narration first would otherwise flash as the reply.
+    pub fn clear_content(&self) {
+        match &self.kind {
+            TokenSinkKind::Events(emit) => emit.append(SessionEvent::delta_clear_content()),
+            TokenSinkKind::Stdio(_) | TokenSinkKind::Discard => {}
+        }
+    }
+
     pub fn reasoning(&self, text: &str) {
         if text.is_empty() {
             return;
@@ -181,6 +190,7 @@ impl StreamPaint {
     pub(super) fn push_raw(&mut self, reasoning: &str, content: &str, has_tools: bool) {
         self.start();
         if has_tools {
+            self.retract_streamed_content();
             self.hide_text = true;
         }
         let (think, text) = visible_raw(reasoning, content);
@@ -191,12 +201,24 @@ impl StreamPaint {
     }
 
     /// Already-parsed `ModelTurn` (JSON fallback). No tag split.
-    pub(super) fn push_clean(&mut self, reasoning: &str, content: &str) {
+    pub(super) fn push_clean(&mut self, reasoning: &str, content: &str, has_tools: bool) {
         self.start();
         self.emit_think(reasoning);
+        if has_tools {
+            self.hide_text = true;
+            return;
+        }
         if !self.defer_stdio {
             self.emit_text(content);
         }
+    }
+
+    fn retract_streamed_content(&mut self) {
+        if self.hide_text || self.text_n == 0 {
+            return;
+        }
+        self.sink.clear_content();
+        self.text_n = 0;
     }
 
     /// `--print` holds answer text until the hop is done. Tool hops stay on stderr.
@@ -374,6 +396,13 @@ mod tests {
         ));
         assert_eq!(texts(&events, DeltaChannel::Reasoning), "plan");
         assert_eq!(texts(&events, DeltaChannel::Content), "hi");
+        assert!(
+            events.iter().any(|e| matches!(
+                e,
+                SessionEvent::Delta(d) if d.reset && d.content_only
+            )),
+            "tool hop must retract the streamed answer bubble"
+        );
         assert!(!texts(&events, DeltaChannel::Content).contains("path"));
     }
 

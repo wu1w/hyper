@@ -118,6 +118,11 @@ pub fn deny_child_tool(kind: SubagentType, cap: CapabilityMode, call: &ToolCall)
             "Error: subagent depth limit: `{name}` cannot spawn nested Task children."
         ));
     }
+    if matches!(n.as_str(), "computeruse" | "computer") {
+        return Some(format!(
+            "Error: subagent cannot `{name}` (desktop control is parent-only)."
+        ));
+    }
     let cap = match (kind, cap) {
         (SubagentType::Explore | SubagentType::Plan, CapabilityMode::All)
         | (SubagentType::Explore | SubagentType::Plan, CapabilityMode::Execute)
@@ -301,6 +306,21 @@ mod tests {
         assert!(deny_child_tool(SubagentType::Explore, CapabilityMode::ReadOnly, &rm).is_some());
         let read = call("read", json!({"path": "a.rs"}));
         assert!(deny_child_tool(SubagentType::Explore, CapabilityMode::ReadOnly, &read).is_none());
+        let desk = call("ComputerUse", json!({"action": "screenshot"}));
+        assert!(deny_child_tool(SubagentType::Explore, CapabilityMode::All, &desk).is_some());
+        assert!(deny_child_tool(SubagentType::Plan, CapabilityMode::All, &desk).is_some());
+        assert!(deny_child_tool(SubagentType::Office, CapabilityMode::All, &desk).is_some());
+        assert!(deny_child_tool(SubagentType::GeneralPurpose, CapabilityMode::All, &desk).is_some());
+        assert!(deny_child_tool(
+            SubagentType::GeneralPurpose,
+            CapabilityMode::ReadOnly,
+            &desk
+        )
+        .is_some());
+        let click = call("ComputerUse", json!({"action": "click", "x": 1, "y": 1}));
+        assert!(
+            deny_child_tool(SubagentType::GeneralPurpose, CapabilityMode::All, &click).is_some()
+        );
     }
 
     #[test]

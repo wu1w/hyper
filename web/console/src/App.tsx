@@ -251,9 +251,12 @@ export function App() {
           setLive({ think: "", content: "" });
         } else if (msg.method === "event.append") {
           const e = msg.params as SessionEvent;
-          if (e.type === "delta") {
+            if (e.type === "delta") {
             setLive((l) => {
-              if (e.reset) return { think: "", content: "" };
+              if (e.reset) {
+                if (e.content_only) return { ...l, content: "" };
+                return { think: "", content: "" };
+              }
               if (e.channel === "reasoning") return { ...l, think: l.think + (e.text || "") };
               return { ...l, content: l.content + (e.text || "") };
             });

@@ -4,8 +4,9 @@
 //! Behavior kept: single owner of in-flight calls, offload vs kill deadlines,
 //! cooperative cancel then force-abort, four-tier timeout resolution.
 //! Offload detaches the join from the agent hop and keeps the child running
-//! until it finishes, is cancelled, or hits kill_at. The agent injects the
-//! real result as a follow-up hidden note (`take_finished`).
+//! until it finishes, is cancelled, or hits kill_at. The model collects the
+//! real result with AwaitShell (`bgwait`); the loop does not inject a hidden
+//! user note.
 //!
 //! Design changes vs Python:
 //! - no ContextVar / `Any` / agentscope `ToolResponse`

@@ -31,6 +31,7 @@ const VIEW: &str = r#"{"type":"function","function":{"name":"view","description"
 const SEARCH: &str = r#"{"type":"function","function":{"name":"search","description":"Find code.","parameters":{"type":"object","properties":{"query":{"type":"string"},"path":{"type":"string"}},"required":["query"]}}}"#;
 const WEB: &str = r#"{"type":"function","function":{"name":"web","description":"Web search (query) or fetch a page (url).","parameters":{"type":"object","properties":{"query":{"type":"string"},"url":{"type":"string"}}}}}"#;
 const ASK: &str = r#"{"type":"function","function":{"name":"ask","description":"Ask the user one multiple-choice question (2-4 options). First option is recommended. Blocks until they pick, skip, or type Other.","parameters":{"type":"object","properties":{"title":{"type":"string"},"prompt":{"type":"string"},"options":{"type":"array","items":{"type":"object","properties":{"id":{"type":"string"},"label":{"type":"string"}},"required":["label"]}}},"required":["prompt","options"]}}}"#;
+const COMPUTER_USE: &str = r#"{"type":"function","function":{"name":"ComputerUse","description":"See and control this Windows or macOS desktop. Coordinates are in the last screenshot image, origin top-left. Screenshot first, then click or type. macOS: Screen Recording + Accessibility. Windows: interactive desktop. action: screenshot | list_displays | click | double_click | right_click | move | drag | scroll | type | key | wait. key: enter, tab, cmd+c, ctrl+v, mod+c (cmd on Mac, ctrl on Windows). Not parallel-safe.","parameters":{"type":"object","properties":{"action":{"type":"string","description":"screenshot | list_displays | click | double_click | right_click | move | drag | scroll | type | key | wait"},"x":{"type":"number","description":"Image-space X from the last screenshot."},"y":{"type":"number"},"x2":{"type":"number","description":"Drag end X."},"y2":{"type":"number"},"text":{"type":"string","description":"Unicode text for type."},"keys":{"type":"string","description":"Chord for key: enter, cmd+c, ctrl+shift+t, mod+v."},"scroll_y":{"type":"integer","description":"Positive is down."},"display":{"type":"integer","description":"0-based display index. Default primary."},"ms":{"type":"integer","description":"wait milliseconds, max 8000."}},"required":["action"]}}}"#;
 
 fn parse(s: &'static str) -> Value {
     serde_json::from_str(s).expect("frozen tool JSON")
@@ -55,6 +56,7 @@ pub fn dispatch_name(name: &str) -> &str {
         | "awaitshell"
         | "get_command_or_subagent_output"
         | "wait_commands_or_subagents" => "awaitshell",
+        "ComputerUse" | "computer_use" | "computeruse" | "computer" => "computeruse",
         other => other,
     }
 }
@@ -129,6 +131,11 @@ pub fn mcp_tool() -> Value {
 
 pub fn view_tool() -> Value {
     parse(VIEW)
+}
+
+/// Extra blob. Do not splice into [`agent_tools`].
+pub fn computer_use_tool() -> Value {
+    parse(COMPUTER_USE)
 }
 
 /// Legacy code-index tool. Not in the frozen Cursor set; executor still accepts `search`.
@@ -228,6 +235,9 @@ mod tests {
         assert_eq!(dispatch_name("list_dir"), "glob");
         assert_eq!(dispatch_name("run_terminal_command"), "bash");
         assert_eq!(dispatch_name("wait_commands_or_subagents"), "awaitshell");
+        assert_eq!(dispatch_name("ComputerUse"), "computeruse");
+        assert_eq!(dispatch_name("computer_use"), "computeruse");
+        assert_eq!(dispatch_name("computer"), "computeruse");
     }
 
     #[test]
@@ -306,6 +316,11 @@ mod tests {
         assert_eq!(serde_json::to_string(&skill_tool()).unwrap(), SKILL);
         assert_eq!(serde_json::to_string(&mcp_tool()).unwrap(), MCP);
         assert_eq!(serde_json::to_string(&view_tool()).unwrap(), VIEW);
+        assert_eq!(
+            serde_json::to_string(&computer_use_tool()).unwrap(),
+            COMPUTER_USE
+        );
+        assert!(!has_tool(&tools, "ComputerUse"));
         assert_eq!(serde_json::to_string(&search_tool()).unwrap(), SEARCH);
         assert_eq!(serde_json::to_string(&web_tool()).unwrap(), WEB);
         assert_eq!(serde_json::to_string(&ask_tool()).unwrap(), ASK);

@@ -223,6 +223,10 @@ pub struct DeltaEvent {
     /// New model step / watchdog retry: drop the in-progress bubble (both channels).
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub reset: bool,
+    /// With `reset`: only retract the answer bubble (tool hop started after
+    /// visible text). Default false still clears think + content.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub content_only: bool,
 }
 
 fn is_zero_u64(n: &u64) -> bool {
@@ -500,6 +504,18 @@ impl SessionEvent {
             text: String::new(),
             delta: true,
             reset: true,
+            content_only: false,
+        })
+    }
+
+    /// Retract streamed hop narration once function_call items start.
+    pub fn delta_clear_content() -> Self {
+        Self::Delta(DeltaEvent {
+            channel: DeltaChannel::Content,
+            text: String::new(),
+            delta: true,
+            reset: true,
+            content_only: true,
         })
     }
 
@@ -509,6 +525,7 @@ impl SessionEvent {
             text: text.into(),
             delta: true,
             reset: false,
+            content_only: false,
         })
     }
 

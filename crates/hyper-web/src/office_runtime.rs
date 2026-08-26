@@ -93,9 +93,7 @@ pub enum EnsureError {
 impl EnsureError {
     pub fn user_hint(&self) -> String {
         match self {
-            Self::NoDocker => {
-                "完整编辑需要本机 Docker，当前使用内置预览。".into()
-            }
+            Self::NoDocker => "完整编辑需要本机 Docker，当前使用内置预览。".into(),
             Self::Other(_) => "文档服务暂时不可用，当前使用内置预览。".into(),
         }
     }
@@ -195,7 +193,10 @@ async fn wait_docs_ready(url: &str, timeout: Duration) -> bool {
     false
 }
 
-fn start_container_sync(office: &OfficeConfig, opts: EnsureOpts) -> std::result::Result<(), EnsureError> {
+fn start_container_sync(
+    office: &OfficeConfig,
+    opts: EnsureOpts,
+) -> std::result::Result<(), EnsureError> {
     if opts.wake_daemon {
         wake_daemon().map_err(|e| match e {
             EnsureError::NoDocker => EnsureError::NoDocker,
@@ -216,7 +217,9 @@ fn start_container_sync(office: &OfficeConfig, opts: EnsureOpts) -> std::result:
             .context("docker start")
             .map_err(EnsureError::Other)?;
         if !st.success() {
-            return Err(EnsureError::Other(anyhow!("docker start {CONTAINER} failed")));
+            return Err(EnsureError::Other(anyhow!(
+                "docker start {CONTAINER} failed"
+            )));
         }
         eprintln!("office: started {CONTAINER}");
         return Ok(());
@@ -302,9 +305,7 @@ fn wake_daemon() -> std::result::Result<(), EnsureError> {
     if docker_info_ok() {
         return Ok(());
     }
-    Err(EnsureError::Other(anyhow!(
-        "docker engine is not running"
-    )))
+    Err(EnsureError::Other(anyhow!("docker engine is not running")))
 }
 
 fn wait_info(timeout: Duration) -> bool {
@@ -358,7 +359,11 @@ fn docker_cmd() -> Result<Command> {
 }
 
 fn find_docker() -> Option<PathBuf> {
-    find_in_search_dirs(if cfg!(windows) { "docker.exe" } else { "docker" })
+    find_in_search_dirs(if cfg!(windows) {
+        "docker.exe"
+    } else {
+        "docker"
+    })
 }
 
 fn find_in_search_dirs(name: &str) -> Option<PathBuf> {
@@ -416,8 +421,12 @@ mod tests {
     #[test]
     fn search_dirs_cover_gui_launch_paths() {
         let dirs = docker_search_dirs();
-        assert!(dirs.iter().any(|p| p.ends_with("homebrew/bin") || p == Path::new("/opt/homebrew/bin")));
-        assert!(dirs.iter().any(|p| p.to_string_lossy().contains("Docker.app")));
+        assert!(dirs
+            .iter()
+            .any(|p| p.ends_with("homebrew/bin") || p == Path::new("/opt/homebrew/bin")));
+        assert!(dirs
+            .iter()
+            .any(|p| p.to_string_lossy().contains("Docker.app")));
     }
 
     #[test]

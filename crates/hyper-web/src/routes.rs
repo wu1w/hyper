@@ -18,7 +18,9 @@ use hyper_loop::permit::{ApprovalMode, PermitDecision};
 use hyper_loop::probe::ping_models;
 use hyper_loop::skills::SkillCatalog;
 use hyper_loop::slash::UsageRecap;
-use hyper_loop::tools_schema::{agent_tools, mcp_tool, skill_tool, view_tool, web_tool};
+use hyper_loop::tools_schema::{
+    agent_tools, computer_use_tool, mcp_tool, skill_tool, view_tool, web_tool,
+};
 use hyper_loop::transport::{self, SESSION_BASE_URL, XAI_BASE_URL};
 use serde::Deserialize;
 use serde_json::{json, Value};
@@ -71,8 +73,8 @@ pub fn router(state: AppState, dist: PathBuf) -> Router {
         .route("/auth/device", post(auth_device_start))
         .route("/auth/cancel", post(auth_cancel))
         .route("/auth/logout", post(auth_logout));
-    let api = crate::office::api_routes(api)
-        .layer(DefaultBodyLimit::max(crate::files::FILE_PUT_CAP));
+    let api =
+        crate::office::api_routes(api).layer(DefaultBodyLimit::max(crate::files::FILE_PUT_CAP));
 
     let cors = CorsLayer::new()
         // The console is same-origin in production. Cross-origin access is
@@ -832,6 +834,8 @@ struct ConfigPatch {
     /// 空串=清除;缺省=不动(GET 不回显 key 本体,只给 tavily_key_set)
     #[serde(default)]
     web_tavily_api_key: Option<String>,
+    #[serde(default)]
+    computer_use: Option<bool>,
     /// session | api_key | custom。只改默认 base_url；不读、不回显 grok login 密钥。
     #[serde(default)]
     auth_mode: Option<String>,
@@ -932,7 +936,13 @@ async fn config_post(
         if let Some(k) = &p.web_tavily_api_key {
             cfg.web.tavily_api_key = k.trim().to_string();
         }
+        if let Some(v) = p.computer_use {
+            cfg.features.computer_use = v;
+        }
     })?;
+    if p.computer_use.is_some() {
+        g.session.refresh_surface();
+    }
     let model = g.cfg.server.model.clone();
     let low_precision = g.cfg.policy.low_precision;
     let window = g.cfg.context.working_window;
@@ -1489,8 +1499,10 @@ async fn tools_get(State(st): State<AppState>) -> Json<Value> {
     Json(json!({
         "ok": true,
         "frozen": agent_tools(),
-        "note": "OpenAI tools[] stays frozen (read/write/edit/bash). view, mcp, and memory_search may be appended after that prefix; skill is never in tools[] (hidden cards / slash). Session start tools_hash includes whatever was appended at open.",
+        "note": "OpenAI tools[] stays frozen (Read/Write/StrReplace/Shell/…). view, ComputerUse, mcp, and memory_search may be appended after that prefix; skill is never in tools[] (hidden cards / slash). Session start tools_hash includes whatever was appended at open.",
         "view": view_tool(),
+        "computer": computer_use_tool(),
+        "computer_enabled": g.cfg.features.computer_use,
         "skill": skill_tool(),
         "mcp": mcp_tool(),
         "web": web,
@@ -1608,6 +1620,15 @@ mod tests {
         }))
         .unwrap();
         assert_eq!(patch.workspace_write_only, Some(false));
+    }
+
+    #[test]
+    fn config_patch_accepts_computer_use() {
+        let patch: ConfigPatch = serde_json::from_value(json!({
+            "computer_use": false
+        }))
+        .unwrap();
+        assert_eq!(patch.computer_use, Some(false));
     }
 
     #[test]

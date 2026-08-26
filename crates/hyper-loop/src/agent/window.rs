@@ -1,10 +1,10 @@
 //! Working-window compact: soft/hard thresholds, local archive, official xAI compact.
 
 use super::{
-    Agent, Completer, over_hard_threshold, over_soft_threshold, should_compact_at_user_turn,
+    over_hard_threshold, over_soft_threshold, should_compact_at_user_turn, Agent, Completer,
 };
-use crate::session::{SessionEvent, compact_messages, derive_messages, plan_compact};
-use crate::template::{RenderOpts, render};
+use crate::session::{compact_messages, derive_messages, plan_compact, SessionEvent};
+use crate::template::{render, RenderOpts};
 use crate::tokenize::count_tokens;
 use crate::tools_schema::{has_recall, recall_tool};
 

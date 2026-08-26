@@ -20,8 +20,9 @@ pub const DEFAULT_PLAN_FILE: &str = "plan.md";
 // 文案必须与 plan_mode_blocks 的放行面一致：只读 + plan.md 可写。
 pub const PLAN_CARD: &str = "\
 PLAN MODE. Allowed: Read, Glob, Grep, WebSearch, WebFetch, view, recall, \
-AskQuestion, and Write/StrReplace of plan.md (the session plan file). Do not \
-write other files. Mutating Shell, run_code, and mcp are blocked. Inspect the \
+AskQuestion, ComputerUse screenshot/list_displays/wait, and Write/StrReplace of \
+plan.md (the session plan file). Do not write other files. Mutating Shell, \
+run_code, mcp, and ComputerUse click/type are blocked. Inspect the \
 workspace and put the markdown plan in plan.md: files to change, steps, risks. \
 Do not implement yet.";
 
@@ -187,6 +188,8 @@ pub fn is_mutating(tool: &str) -> bool {
             | "mcp"
             | "strreplace"
             | "todowrite"
+            | "computeruse"
+            | "computer"
     )
 }
 
@@ -212,6 +215,7 @@ pub fn plan_mode_blocks_in(tool: &str, args: &Value, plan_file: &str) -> bool {
             !shell_allowed_in_plan(&cmd, plan_file)
         }
         "runcode" | "mcp" => true,
+        "computeruse" | "computer" => !crate::tools::computer::is_observe(args),
         _ => false,
     }
 }
@@ -476,6 +480,11 @@ mod tests {
         assert!(!PermitHub::needs_prompt(ApprovalMode::Auto, "Task"));
         assert!(!is_mutating("task"));
         assert!(!is_mutating("Task"));
+        assert!(is_mutating("ComputerUse"));
+        assert!(is_mutating("computer_use"));
+        assert!(PermitHub::needs_prompt(ApprovalMode::Ask, "ComputerUse"));
+        assert!(PermitHub::needs_prompt(ApprovalMode::Auto, "ComputerUse"));
+        assert!(!PermitHub::needs_prompt(ApprovalMode::Yolo, "ComputerUse"));
     }
 
     #[test]
@@ -536,6 +545,22 @@ mod tests {
         assert!(!plan_mode_blocks(
             "Shell",
             &serde_json::json!({"command": "rg foo"})
+        ));
+        assert!(!plan_mode_blocks(
+            "ComputerUse",
+            &serde_json::json!({"action": "screenshot"})
+        ));
+        assert!(!plan_mode_blocks(
+            "ComputerUse",
+            &serde_json::json!({"action": "wait", "ms": 200})
+        ));
+        assert!(plan_mode_blocks(
+            "ComputerUse",
+            &serde_json::json!({"action": "click", "x": 10, "y": 10})
+        ));
+        assert!(plan_mode_blocks(
+            "ComputerUse",
+            &serde_json::json!({"action": "type", "text": "hi"})
         ));
         assert!(!is_plan_file_path("notes/plan.md", DEFAULT_PLAN_FILE));
         assert!(!is_plan_file_path("notes/todo.md", DEFAULT_PLAN_FILE));

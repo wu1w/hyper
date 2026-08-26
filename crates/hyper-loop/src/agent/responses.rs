@@ -4,7 +4,7 @@
 //! gets `chat_template_kwargs`, `enable_thinking`, or llama.cpp `id_slot`.
 
 use reqwest::Client;
-use serde_json::{Map, Value, json};
+use serde_json::{json, Map, Value};
 use std::collections::HashSet;
 use std::sync::Mutex;
 
@@ -14,7 +14,7 @@ use crate::config::Config;
 use crate::error::{Error, Result};
 use crate::family::{EndpointCaps, EngineProfile, Family};
 use crate::policy::{Effort, ThinkPolicy};
-use crate::session::{OfficialCompaction, chat_to_input_items};
+use crate::session::{chat_to_input_items, OfficialCompaction};
 use crate::template::ChatMessage;
 use crate::tool_calls::ToolCall;
 use crate::transport::{GrokTransport, ResolvedTransport, WireFormat};
@@ -277,7 +277,10 @@ impl Completer for TransportCompleter {
     }
 
     fn recasts_xai_product(&self) -> bool {
-        matches!(self, Self::Responses(_))
+        match self {
+            Self::Responses(_) => true,
+            Self::Chat(c) => Completer::recasts_xai_product(c),
+        }
     }
 
     fn set_low_precision(&self, on: bool) {
@@ -909,7 +912,7 @@ fn paint_clean(sink: Option<TokenSink>, turn: &ModelTurn) {
         return;
     }
     let mut paint = StreamPaint::new(sink);
-    paint.push_clean(&turn.reasoning, &turn.content);
+    paint.push_clean(&turn.reasoning, &turn.content, !turn.tool_calls.is_empty());
     paint.finish(&turn.reasoning, &turn.content, !turn.tool_calls.is_empty());
 }
 

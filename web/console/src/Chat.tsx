@@ -2222,7 +2222,7 @@ function hiddenNote(text: string): string | null {
 }
 
 function isHarnessNote(s: string): boolean {
-  return /\[(trajectory|locate|out|web|doc-read|oracle|baseline|style|cron|compact|verify:numeric|guard)\]/i.test(
+  return /\[(trajectory|locate|out|web|doc-read|oracle|baseline|style|cron|compact|verify:numeric|guard|background)\b/i.test(
     s,
   ) || s.startsWith("HYPER_WORKING_WINDOW=") || /^MEMORY(\.md| hot| hosts)/.test(s);
 }

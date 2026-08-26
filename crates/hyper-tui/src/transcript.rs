@@ -118,6 +118,12 @@ impl Transcript {
         match event {
             SessionEvent::Delta(d) => {
                 if d.reset {
+                    if d.content_only {
+                        if let Some(live) = &mut self.live {
+                            live.content.clear();
+                        }
+                        return;
+                    }
                     self.live = Some(Live {
                         started: Some(Instant::now()),
                         ..Live::default()
@@ -475,6 +481,20 @@ mod tests {
     }
 
     #[test]
+    fn content_only_reset_retracts_answer_keeps_think() {
+        let mut t = Transcript::default();
+        t.apply(&SessionEvent::delta_reset());
+        t.apply(&SessionEvent::delta_chunk(DeltaChannel::Reasoning, "plan"));
+        t.apply(&SessionEvent::delta_chunk(
+            DeltaChannel::Content,
+            "I'll read the file next.",
+        ));
+        t.apply(&SessionEvent::delta_clear_content());
+        assert!(t.live_content().is_empty());
+        assert_eq!(t.live_think(), "plan");
+    }
+
+    #[test]
     fn assistant_markdown_hides_fence_markers() {
         let mut t = Transcript::default();
         t.apply(&SessionEvent::assistant(
@@ -500,5 +520,15 @@ impl Transcript {
     #[cfg(test)]
     fn live_is_clear(&self) -> bool {
         self.live.is_none()
+    }
+
+    #[cfg(test)]
+    fn live_think(&self) -> &str {
+        self.live.as_ref().map(|l| l.think.as_str()).unwrap_or("")
+    }
+
+    #[cfg(test)]
+    fn live_content(&self) -> &str {
+        self.live.as_ref().map(|l| l.content.as_str()).unwrap_or("")
     }
 }

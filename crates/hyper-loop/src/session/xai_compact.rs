@@ -6,7 +6,7 @@
 
 use std::fmt;
 
-use serde_json::{Value, json};
+use serde_json::{json, Value};
 
 use crate::config::Config;
 use crate::error::{Error, Result};
@@ -150,7 +150,7 @@ pub fn chat_to_input_items(msg: &ChatMessage) -> Vec<Value> {
             vec![json!({
                 "type": "function_call_output",
                 "call_id": call_id,
-                "output": msg.content.clone().unwrap_or_default(),
+                "output": function_call_output_value(msg),
             })]
         }
         "assistant" => {
@@ -205,12 +205,52 @@ fn is_cursor_noise_user(msg: &ChatMessage) -> bool {
         "[compact]",
         "[guard]",
         "[archived]",
+        "[background",
         "HYPER_WORKING_WINDOW=",
         "MEMORY hot",
         "MEMORY hosts",
         "MEMORY.md",
     ];
     DROP.iter().any(|p| inner.contains(p))
+}
+
+/// Text-only tool results stay a string (prefix-cache stable). `view` /
+/// `ComputerUse` screenshots go in the same `function_call_output` as
+/// Responses `input_image` parts so grok-4.6 actually sees the pixels.
+fn function_call_output_value(msg: &ChatMessage) -> Value {
+    let text = msg.content.clone().unwrap_or_default();
+    if msg.parts.is_empty() {
+        return Value::String(text);
+    }
+    let mut arr = Vec::new();
+    if !text.is_empty() {
+        arr.push(json!({ "type": "input_text", "text": text }));
+    }
+    for p in &msg.parts {
+        match p.kind {
+            crate::media::MediaKind::Image => {
+                let url = p.url.trim();
+                if url.is_empty() {
+                    continue;
+                }
+                arr.push(json!({
+                    "type": "input_image",
+                    "image_url": url,
+                }));
+            }
+            crate::media::MediaKind::Video | crate::media::MediaKind::Audio => {
+                arr.push(json!({
+                    "type": "input_text",
+                    "text": format!("[{}]", p.kind.as_str()),
+                }));
+            }
+        }
+    }
+    if arr.is_empty() {
+        Value::String(text)
+    } else {
+        Value::Array(arr)
+    }
 }
 
 fn openai_call_to_item(c: &Value) -> Option<Value> {
@@ -592,6 +632,19 @@ mod tests {
     }
 
     #[test]
+    fn background_hidden_user_is_dropped_from_responses() {
+        let msgs = vec![
+            ChatMessage::user("task"),
+            ChatMessage::hidden_user("[background bash finished id=c1]\nfn main() {}"),
+        ];
+        let input = messages_to_responses_input(&msgs);
+        let blob = serde_json::to_string(&input).unwrap();
+        assert_eq!(input.len(), 1, "{blob}");
+        assert!(!blob.contains("[background"), "{blob}");
+        assert!(!blob.contains("fn main"), "{blob}");
+    }
+
+    #[test]
     fn tool_hop_assistant_text_is_not_replayed() {
         let msg = ChatMessage::assistant_tools(
             Some("I'll read a.rs next and then summarize the loop.".into()),
@@ -626,6 +679,38 @@ mod tests {
         assert_eq!(input[0]["name"], "Read");
         assert_eq!(input[1]["type"], "function_call_output");
         assert_eq!(input[1]["call_id"], "c1");
+        assert!(input[1]["output"].is_string(), "{input:?}");
+    }
+
+    #[test]
+    fn tool_image_parts_replay_on_function_call_output() {
+        let mut msg = ChatMessage::tool("cu1", "screenshot Built-in: image 1280x800");
+        msg.parts = vec![crate::media::MediaPart::image_url(
+            "data:image/jpeg;base64,shot",
+        )];
+        let input = messages_to_responses_input(&[msg]);
+        assert_eq!(input.len(), 1);
+        assert_eq!(input[0]["type"], "function_call_output");
+        assert_eq!(input[0]["call_id"], "cu1");
+        let output = input[0]["output"].as_array().expect("multipart output");
+        assert!(
+            output.iter().any(|p| {
+                p["type"] == "input_text" && p["text"] == "screenshot Built-in: image 1280x800"
+            }),
+            "{output:?}"
+        );
+        assert!(
+            output.iter().any(|p| {
+                p["type"] == "input_image" && p["image_url"] == "data:image/jpeg;base64,shot"
+            }),
+            "{output:?}"
+        );
+        assert!(
+            output
+                .iter()
+                .all(|p| p["type"] != "image_url" && p["type"] != "text"),
+            "{output:?}"
+        );
     }
 
     #[test]

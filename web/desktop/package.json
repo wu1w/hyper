@@ -54,6 +54,9 @@
       "identity": null,
       "hardenedRuntime": false,
       "gatekeeperAssess": false,
+      "extendInfo": {
+        "NSScreenCaptureUsageDescription": "Hyper 需要截取屏幕，以便 ComputerUse 看到桌面并点击。"
+      },
       "extraResources": [
         {
           "from": "resources/mac",

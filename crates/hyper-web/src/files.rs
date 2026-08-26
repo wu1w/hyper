@@ -552,10 +552,14 @@ fn mime_of(name: &str) -> &'static str {
         "xml" => "application/xml",
         "csv" => "text/csv",
         "doc" => "application/msword",
-        "docx" | "docm" => "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+        "docx" | "docm" => {
+            "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
+        }
         "xls" => "application/vnd.ms-excel",
         "xlsx" | "xlsm" => "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-        "pptx" | "ppsx" | "pptm" => "application/vnd.openxmlformats-officedocument.presentationml.presentation",
+        "pptx" | "ppsx" | "pptm" => {
+            "application/vnd.openxmlformats-officedocument.presentationml.presentation"
+        }
         "ppt" => "application/vnd.ms-powerpoint",
         "odt" => "application/vnd.oasis.opendocument.text",
         "ods" => "application/vnd.oasis.opendocument.spreadsheet",
@@ -715,7 +719,10 @@ mod tests {
         assert_eq!(mime_of("styles.css"), "text/css");
         assert_eq!(mime_of("app.js"), "text/javascript");
         assert_eq!(mime_of("index.html"), "text/html");
-        assert_eq!(file_content_type("text/css").to_str().unwrap(), "text/css; charset=utf-8");
+        assert_eq!(
+            file_content_type("text/css").to_str().unwrap(),
+            "text/css; charset=utf-8"
+        );
         assert_eq!(
             file_content_type("text/javascript").to_str().unwrap(),
             "text/javascript; charset=utf-8"

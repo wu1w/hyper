@@ -220,6 +220,10 @@ impl Completer for HttpCompleter {
         self.low_precision.store(on, Ordering::Relaxed);
     }
 
+    fn recasts_xai_product(&self) -> bool {
+        grok_like_url(&self.url) || self.model.to_ascii_lowercase().contains("grok")
+    }
+
     fn media_caps(&self) -> crate::media::MediaCaps {
         let origin = self
             .url
@@ -358,7 +362,7 @@ fn paint_clean(sink: Option<TokenSink>, turn: &ModelTurn) {
         return;
     }
     let mut paint = StreamPaint::new(sink);
-    paint.push_clean(&turn.reasoning, &turn.content);
+    paint.push_clean(&turn.reasoning, &turn.content, !turn.tool_calls.is_empty());
     paint.finish(&turn.reasoning, &turn.content, !turn.tool_calls.is_empty());
 }
 

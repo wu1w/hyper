@@ -5,6 +5,7 @@
 
 mod bash;
 mod code_index;
+pub(crate) mod computer;
 pub(crate) mod doc;
 mod find;
 mod fold;
@@ -153,6 +154,7 @@ pub async fn run_tool(
             )
             .await
         }
+        "computeruse" => computer::computer_use(call, cancel).await,
         other => ToolResponse::text(
             &call.id,
             format!("Error: unknown tool '{other}'."),

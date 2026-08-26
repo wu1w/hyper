@@ -48,6 +48,9 @@ mcp_auto_catalog = false
 workspace_write_only = true
 # TUI: ask (prompt writes/bash) | auto (edits pass, bash prompts) | yolo
 approvals = "ask"
+# Extra tool: screenshot + mouse/keyboard on the machine running Hyper (Windows / macOS).
+# Not in the frozen Cursor 13. Click/type prompt in ask/auto; screenshot does not.
+computer_use = true
 
 [sidecar]
 transport = "stdio-jsonrpc"

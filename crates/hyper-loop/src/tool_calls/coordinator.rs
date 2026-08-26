@@ -97,7 +97,8 @@ impl ToolCoordinator {
     }
 
     /// Completed background tools. Each id already had a foreground
-    /// "running in background" tool result; these are follow-up notes.
+    /// "running in background" tool result. Drain so the loop does not
+    /// re-observe; the model sees the real output via AwaitShell.
     /// Skips ids already consumed by AwaitShell via [`super::bgwait`].
     pub fn take_finished(&self) -> Vec<(String, ToolResponse)> {
         lock_unpoison(&self.finished)
@@ -230,7 +231,7 @@ impl ToolCoordinator {
                             .unwrap_or_default();
                         self.spawn_watch(id.clone(), name, join, cancel, deadlines.kill_at);
                         let text = format!(
-                            "running in background (id={id}). Keep going; the result will be posted as a follow-up note when it finishes."
+                            "running in background (id={id}). Keep going. Call AwaitShell with shell_id or task_id {id} when you need the result."
                         );
                         let original_chars = text.chars().count();
                         return ToolResponse {

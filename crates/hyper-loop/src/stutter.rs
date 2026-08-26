@@ -47,21 +47,35 @@ pub fn is_restated_reply(prev: &str, next: &str) -> bool {
     trigram_jaccard(&a, &b) >= RESTATE_JACCARD
 }
 
-/// grok-4.6 recap: most non-empty lines are markdown quotes of earlier text.
+/// grok-4.6 recap: markdown quote wall of earlier text (user paste or tool output).
+/// Three quoted lines at ≥50% of the hop is enough — five-line recaps were
+/// slipping through the old six-line / two-thirds gate.
 pub fn is_blockquote_heavy(s: &str) -> bool {
     let lines: Vec<&str> = s
         .lines()
         .map(str::trim_end)
         .filter(|l| !l.trim().is_empty())
         .collect();
-    if lines.len() < 6 {
+    if lines.len() < 3 {
         return false;
     }
     let quoted = lines
         .iter()
         .filter(|l| l.trim_start().starts_with('>'))
         .count();
-    quoted * 3 >= lines.len() * 2
+    quoted >= 3 && quoted * 2 >= lines.len()
+}
+
+/// Answer is mostly a restatement of `source` (Read/Grep dump, user paste).
+pub fn is_source_recap(source: &str, answer: &str) -> bool {
+    if !is_substantial_reply(answer) {
+        return false;
+    }
+    let src = normalize_reply(source);
+    if src.chars().count() < MIN_RESTATE_CHARS {
+        return false;
+    }
+    is_restated_reply(source, answer) || source_coverage(answer, source) >= SOURCE_COVERAGE
 }
 
 /// One layer of markdown quote markers. Nested `>>` becomes `>`.
@@ -178,7 +192,19 @@ fn command_head(p: &str) -> &str {
 
 const MIN_RESTATE_CHARS: usize = 160;
 const RESTATE_JACCARD: f32 = 0.82;
+/// Fraction of answer trigrams that already appear in tool/user source.
+const SOURCE_COVERAGE: f32 = 0.62;
 const GRAM_SCAN: usize = 800;
+
+fn source_coverage(answer: &str, source: &str) -> f32 {
+    let ga = char_trigrams(&normalize_reply(answer));
+    let gb = char_trigrams(&normalize_reply(source));
+    if ga.is_empty() || gb.is_empty() {
+        return 0.0;
+    }
+    let hit = ga.intersection(&gb).count() as f32;
+    hit / ga.len() as f32
+}
 
 fn similar_reply_scale(na: usize, nb: usize) -> bool {
     let (lo, hi) = if na <= nb { (na, nb) } else { (nb, na) };
@@ -217,7 +243,11 @@ fn trigram_jaccard(a: &str, b: &str) -> f32 {
     }
     let inter = ga.intersection(&gb).count() as f32;
     let union = ga.union(&gb).count() as f32;
-    if union == 0.0 { 0.0 } else { inter / union }
+    if union == 0.0 {
+        0.0
+    } else {
+        inter / union
+    }
 }
 
 fn char_trigrams(s: &str) -> HashSet<String> {
@@ -321,7 +351,8 @@ mod tests {
         assert!(is_stutter("", s));
     }
 
-    const ESSAY: &str = "I studied the grok-hyper agent loop in detail. The core crate is hyper-loop. \
+    const ESSAY: &str =
+        "I studied the grok-hyper agent loop in detail. The core crate is hyper-loop. \
 It runs a ReAct cycle with frozen tools read write edit bash. Template rendering uses the \
 official Qwen3.8 Jinja chat template. Adapter builds OpenAI-compat requests. Sticky notes \
 hold skill and MCP cards. This is a strong fit for the 27B local model because the prefix \
@@ -383,6 +414,28 @@ This is a different task from architecture review and names different files on p
         assert!(!is_blockquote_heavy(&lines.join("\n")));
         assert_eq!(strip_blockquote_prefix(&quoted), lines.join("\n"));
         assert!(is_restated_reply(&lines.join(" "), &quoted));
+        let short = lines[..4]
+            .iter()
+            .map(|l| format!("> {l}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(is_blockquote_heavy(&short), "four-line quote wall");
+        assert!(!is_blockquote_heavy("> one\n> two\nplain"));
+    }
+
+    #[test]
+    fn paraphrase_of_tool_output_is_source_recap() {
+        assert!(is_source_recap(
+            ESSAY,
+            &ESSAY.replace("in detail", "carefully")
+        ));
+        let original = "Next I will add a unit test in agent/mod.rs that writes ping.txt then \
+reads it back. The test should use a Scripted completer and assert stop_reason is none. \
+Then I will run cargo test -p hyper-loop --lib. After green, update the cron job prompt. \
+This is a different task from architecture review and names different files on purpose.";
+        assert!(is_substantial_reply(original));
+        assert!(!is_source_recap(ESSAY, original));
+        assert!(!is_source_recap("pong\n", ESSAY));
     }
 
     #[test]

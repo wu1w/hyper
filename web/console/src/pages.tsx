@@ -1233,18 +1233,38 @@ export function ToolsPage({ active = true }: { active?: boolean }) {
     note?: string;
     frozen?: Array<{ function?: { name: string; description: string; parameters?: unknown } }>;
     view?: { function?: { name: string; description: string } };
+    computer?: { function?: { name: string; description: string } };
+    computer_enabled?: boolean;
     skill?: { function?: { name: string; description: string } };
     mcp?: { function?: { name: string; description: string } };
     web?: { function?: { name?: string; description?: string } };
   }>({});
   const [webCfg, setWebCfg] = useState<WebCfg | null>(null);
+  const [computerOn, setComputerOn] = useState(true);
+  const [computerMsg, setComputerMsg] = useState("");
   useEffect(() => {
     if (!active) return;
-    api<typeof j>("/tools").then(setJ);
-    api<{ web?: WebCfg }>("/config")
-      .then((c) => setWebCfg(c.web ?? null))
+    api<typeof j>("/tools").then((t) => {
+      setJ(t);
+      if (typeof t.computer_enabled === "boolean") setComputerOn(t.computer_enabled);
+    });
+    api<{ web?: WebCfg; features?: { computer_use?: boolean } }>("/config")
+      .then((c) => {
+        setWebCfg(c.web ?? null);
+        if (typeof c.features?.computer_use === "boolean") setComputerOn(c.features.computer_use);
+      })
       .catch(() => setWebCfg(null));
   }, [active]);
+  const saveComputer = async (v: boolean) => {
+    setComputerMsg("");
+    try {
+      await api("/config", { method: "POST", body: JSON.stringify({ computer_use: v }) });
+      setComputerOn(v);
+      setComputerMsg("已保存，下一轮对话生效");
+    } catch (e) {
+      setComputerMsg(failMsg(e));
+    }
+  };
   const frozen = j.frozen || [];
   // 实际引擎以 tools 描述里的 "provider: xxx" 为准（它考虑了 env / MCP 里的 key），config 兜底。
   const webDesc = j.web?.function?.description || "";
@@ -1301,9 +1321,33 @@ export function ToolsPage({ active = true }: { active?: boolean }) {
               mcp
             </h2>
             <div className="sub">{j.mcp?.function?.description || "MCP 调用"}</div>
-            <span className="pill idle" style={{ marginTop: 8, display: "inline-block" }}>
+              <span className="pill idle" style={{ marginTop: 8, display: "inline-block" }}>
               有服务器时追加
             </span>
+          </div>
+          <div className="card">
+            <h2>
+              <Icon name="command" />
+              ComputerUse
+            </h2>
+            <div className="sub">
+              {j.computer?.function?.description ||
+                "截屏并控制本机键鼠（Windows / macOS）。坐标以最近一张截图为准。"}
+            </div>
+            <div className="switch-row" style={{ marginTop: 8 }}>
+              <span className={`pill ${computerOn ? "ok" : "idle"}`}>
+                {computerOn ? "已启用" : "未启用"}
+              </span>
+              <Switch
+                checked={computerOn}
+                onChange={(v) => void saveComputer(v)}
+                label="启用 ComputerUse"
+              />
+            </div>
+            <div className="sub" style={{ marginTop: 8 }}>
+              在运行 hyper 的这台电脑上执行，不是浏览器里。macOS 需「屏幕录制」+「辅助功能」；点击/打字在 ask/auto 下会审批。Task 子代理看不到也不会执行。下一轮对话生效。
+            </div>
+            {computerMsg ? <div className="sub" style={{ marginTop: 6 }}>{computerMsg}</div> : null}
           </div>
           <div className="card">
             <h2>
@@ -1331,7 +1375,7 @@ export function ToolsPage({ active = true }: { active?: boolean }) {
           <ul className="sub" style={{ margin: "6px 0 0", paddingLeft: 18, lineHeight: 1.9 }}>
             <li>盲覆写保护：Write 一个本会话没读过的已有文件会被拒绝，先 Read 再写。</li>
             <li>复读围栏：同一工具同参数连打先提醒、再停机，防死循环烧 token。</li>
-            <li>审批门控：ask 模式下 Write / StrReplace / Shell / mcp 逐一批准。Task 本身不弹窗，子代理里的写入仍会。</li>
+            <li>审批门控：ask 模式下 Write / StrReplace / Shell / mcp / ComputerUse 点击打字逐一批准。截屏不弹窗。Task 本身不弹窗，子代理里的写入仍会。ComputerUse 只给父代理。</li>
             <li>工作区边界：文件工具只能操作当前文件夹内路径。</li>
           </ul>
         </div>
@@ -2025,7 +2069,7 @@ export function SecurityPage({ active = true }: { active?: boolean }) {
             onChange={setMode}
           />
           <div className="sub" style={{ marginTop: 12 }}>
-            门控：write · edit · bash · run_code · mcp
+            门控：write · edit · bash · run_code · mcp · ComputerUse（点击/打字；截屏不审批）
           </div>
           <div className="setting-divider" />
           <h2>

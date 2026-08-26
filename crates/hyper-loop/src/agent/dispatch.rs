@@ -3,7 +3,7 @@
 use std::collections::{HashMap, HashSet};
 use std::time::Duration;
 
-use serde_json::{Value, json};
+use serde_json::{json, Value};
 
 use super::guard;
 use super::notes::forbids_tools;
@@ -16,11 +16,11 @@ use crate::memory::run_memory_search;
 use crate::paw_loop::fs_tool_path;
 use crate::permit::{self, PermitDecision};
 use crate::policy::ThinkPolicy;
-use crate::session::{OpenAiToolCall, PolicyReason, SessionEvent, run_recall};
+use crate::session::{run_recall, OpenAiToolCall, PolicyReason, SessionEvent};
 use crate::skills::run_skill;
 use crate::template::ChatMessage;
 use crate::tool_calls::{CancelFlag, TextBlock, ToolCall, ToolResponse, ToolState};
-use crate::tools::{Workspace, bash_search_query, run_search, run_tool, search_dump_too_big, view};
+use crate::tools::{bash_search_query, run_search, run_tool, search_dump_too_big, view, Workspace};
 use crate::tools_schema::{dispatch_name, is_parallel_safe};
 
 impl<C: Completer> Agent<C> {
@@ -332,6 +332,11 @@ impl<C: Completer> Agent<C> {
         let Some(hub) = &self.permit else {
             return None;
         };
+        if dispatch_name(name) == "computeruse"
+            && crate::tools::computer::is_observe(&call.arguments)
+        {
+            return None;
+        }
         match hub.check(name, &preview_args(call), &self.cancel).await {
             PermitDecision::Allow => None,
             PermitDecision::Always => {
@@ -638,6 +643,7 @@ impl<C: Completer> Agent<C> {
     }
 
     pub(crate) fn commit_tool(&mut self, name: &str, response: ToolResponse) {
+        self.remember_tool_output(&response.joined_text());
         let stored: Vec<crate::session::StoredMedia> = response
             .media
             .iter()
@@ -816,6 +822,9 @@ fn preview_args(call: &ToolCall) -> String {
         .or_else(|| call.arguments.get("pattern"))
         .or_else(|| call.arguments.get("glob_pattern"))
         .or_else(|| call.arguments.get("search_term"))
+        .or_else(|| call.arguments.get("action"))
+        .or_else(|| call.arguments.get("keys"))
+        .or_else(|| call.arguments.get("text"))
         .and_then(|v| v.as_str())
         .map(|s| s.to_string())
         .or_else(|| call.arguments.get("seq").map(|v| v.to_string()))

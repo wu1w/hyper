@@ -135,6 +135,7 @@ export type SessionEvent = {
   channel?: string;
   delta?: boolean;
   reset?: boolean;
+  content_only?: boolean;
   prompt_tokens?: number;
   completion_tokens?: number;
   cached_tokens?: number | null;

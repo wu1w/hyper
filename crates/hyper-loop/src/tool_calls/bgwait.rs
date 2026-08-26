@@ -1,8 +1,7 @@
 //! Global wait map for coordinator-offloaded tool calls (background Shell).
 //!
 //! AwaitShell looks here after the subagent registry. Drain (`take_finished`)
-//! skips ids already consumed by AwaitShell so the result is not double-posted
-//! as a hidden note.
+//! skips ids already consumed by AwaitShell so the result is not double-posted.
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex, OnceLock};

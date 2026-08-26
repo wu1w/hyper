@@ -29,6 +29,12 @@ regex = "1"
 zip = { version = "2", default-features = false, features = ["deflate"] }
 calamine = "0.26"
 pdf-extract = "0.10"
+image = { version = "0.25", default-features = false, features = ["jpeg", "png"] }
+
+# Screenshot + mouse/keyboard for ComputerUse (Windows / macOS).
+[target.'cfg(any(target_os = "macos", target_os = "windows"))'.dependencies]
+xcap = "0.7"
+enigo = "0.3"
 
 # bash 工具进程组 kill（setpgid + kill(-pgid)）。已在依赖树中。
 [target.'cfg(unix)'.dependencies]

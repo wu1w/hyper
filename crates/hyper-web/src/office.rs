@@ -253,7 +253,9 @@ async fn office_forcesave(
         .wait(&body.key)
         .await
         .map_err(|e| (StatusCode::BAD_GATEWAY, e))?;
-    Ok(Json(json!({"ok": true, "path": body.path, "key": body.key})))
+    Ok(Json(
+        json!({"ok": true, "path": body.path, "key": body.key}),
+    ))
 }
 
 async fn bridge_file(
@@ -280,10 +282,7 @@ async fn bridge_file(
             .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
             .map_err(|e| (StatusCode::NOT_FOUND, e.to_string()))?;
     let mut headers = HeaderMap::new();
-    headers.insert(
-        header::CONTENT_TYPE,
-        crate::files::file_content_type(&mime),
-    );
+    headers.insert(header::CONTENT_TYPE, crate::files::file_content_type(&mime));
     Ok((headers, body).into_response())
 }
 
@@ -408,10 +407,7 @@ async fn command_forcesave(office: &OfficeConfig, key: &str) -> Result<()> {
     let token = jwt_sign(&office.jwt_secret, &payload)?;
     let mut body = payload;
     body["token"] = json!(token);
-    let url = format!(
-        "{}/coauthoring/CommandService.ashx",
-        office.docs_origin()
-    );
+    let url = format!("{}/coauthoring/CommandService.ashx", office.docs_origin());
     let client = reqwest::Client::builder()
         .timeout(Duration::from_secs(15))
         .build()?;
@@ -473,7 +469,11 @@ pub fn document_key(path: &str, mtime_secs: u64, len: u64) -> String {
 }
 
 pub fn file_ext(path: &str) -> String {
-    let n = path.rsplit(['/', '\\']).next().unwrap_or(path).to_ascii_lowercase();
+    let n = path
+        .rsplit(['/', '\\'])
+        .next()
+        .unwrap_or(path)
+        .to_ascii_lowercase();
     let i = n.rfind('.').unwrap_or(n.len());
     n[i..].to_string()
 }
@@ -536,9 +536,7 @@ fn mint_token(secret: &str, path: &str, kind: &str, ttl: u64) -> Result<String> 
 }
 
 fn verify_token(secret: &str, token: &str) -> Result<TokenClaims> {
-    let (body, mac) = token
-        .rsplit_once('.')
-        .ok_or_else(|| anyhow!("bad token"))?;
+    let (body, mac) = token.rsplit_once('.').ok_or_else(|| anyhow!("bad token"))?;
     let expect = hmac_hex(secret, body.as_bytes())?;
     if !ct_eq(mac.as_bytes(), expect.as_bytes()) {
         bail!("bad token mac");
@@ -552,8 +550,7 @@ fn verify_token(secret: &str, token: &str) -> Result<TokenClaims> {
 }
 
 fn hmac_hex(secret: &str, data: &[u8]) -> Result<String> {
-    let mut mac =
-        HmacSha256::new_from_slice(secret.as_bytes()).map_err(|e| anyhow!("{e}"))?;
+    let mut mac = HmacSha256::new_from_slice(secret.as_bytes()).map_err(|e| anyhow!("{e}"))?;
     mac.update(data);
     Ok(hex_lower(&mac.finalize().into_bytes()))
 }
@@ -582,8 +579,7 @@ pub fn jwt_sign(secret: &str, payload: &Value) -> Result<String> {
     let header = URL_SAFE_NO_PAD.encode(br#"{"alg":"HS256","typ":"JWT"}"#);
     let body = URL_SAFE_NO_PAD.encode(serde_json::to_vec(payload)?);
     let signing = format!("{header}.{body}");
-    let mut mac =
-        HmacSha256::new_from_slice(secret.as_bytes()).map_err(|e| anyhow!("{e}"))?;
+    let mut mac = HmacSha256::new_from_slice(secret.as_bytes()).map_err(|e| anyhow!("{e}"))?;
     mac.update(signing.as_bytes());
     let sig = URL_SAFE_NO_PAD.encode(mac.finalize().into_bytes());
     Ok(format!("{signing}.{sig}"))
@@ -598,8 +594,7 @@ pub fn jwt_verify(secret: &str, token: &str) -> Result<Value> {
         bail!("bad jwt");
     }
     let signing = format!("{header}.{body}");
-    let mut mac =
-        HmacSha256::new_from_slice(secret.as_bytes()).map_err(|e| anyhow!("{e}"))?;
+    let mut mac = HmacSha256::new_from_slice(secret.as_bytes()).map_err(|e| anyhow!("{e}"))?;
     mac.update(signing.as_bytes());
     let expect = URL_SAFE_NO_PAD.encode(mac.finalize().into_bytes());
     if !ct_eq(sig.as_bytes(), expect.as_bytes()) {
@@ -702,7 +697,9 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("hyper-oo-{}", uuid::Uuid::new_v4().simple()));
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("config.toml");
-        hyper_loop::config::Config::default().save_to(&path).unwrap();
+        hyper_loop::config::Config::default()
+            .save_to(&path)
+            .unwrap();
         let a = persist_office_secret(&path).unwrap();
         assert_eq!(a.jwt_secret.len(), 64);
         let b = persist_office_secret(&path).unwrap();

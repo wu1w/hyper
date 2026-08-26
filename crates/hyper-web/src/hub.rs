@@ -205,10 +205,7 @@ impl AppState {
             };
             match crate::office_runtime::ensure_office(&office, EnsureOpts::web_auto()).await {
                 Ok(r) if r.ready => boot.set(false, ""),
-                Ok(_) => boot.set(
-                    false,
-                    "文档服务仍在启动，稍后重新打开文件即可完整编辑。",
-                ),
+                Ok(_) => boot.set(false, "文档服务仍在启动，稍后重新打开文件即可完整编辑。"),
                 Err(e) => {
                     eprintln!("office: {e}");
                     boot.set(false, e.user_hint());
