@@ -16,6 +16,8 @@ pub fn reply_text(body: impl Into<String>) -> Vec<ContentPart> {
     }
 }
 
+pub use super::xfer::reply_parts;
+
 pub fn parts_to_text(parts: &[ContentPart]) -> String {
     let mut text = String::new();
     for p in parts {

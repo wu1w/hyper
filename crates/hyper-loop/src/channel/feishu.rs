@@ -20,7 +20,6 @@ use crate::error::{Error, Result};
 
 use super::envelope::{ContentPart, NativePayload};
 use super::manager::ChannelManager;
-use super::outbound::parts_to_text;
 use super::ChannelEndpoint;
 
 const FEISHU_BASE: &str = "https://open.feishu.cn";
@@ -33,6 +32,14 @@ const PB_CONTROL: i32 = 0;
 const PB_DATA: i32 = 1;
 
 type WsWrite = SplitSink<WebSocketStream<MaybeTlsStream<TcpStream>>, Message>;
+
+#[derive(Clone)]
+struct FeishuApi {
+    http: reqwest::Client,
+    app_id: String,
+    secret: String,
+    base: String,
+}
 
 static TOKEN: StdMutex<Option<CachedToken>> = StdMutex::new(None);
 
@@ -232,15 +239,25 @@ pub async fn send(
     let Some((app_id, secret)) = credentials(ep) else {
         return Err(Error::msg("feishu send: missing credentials"));
     };
-    let text = parts_to_text(parts);
-    if text.trim().is_empty() {
-        return Ok(());
-    }
     let http = reqwest::Client::builder()
-        .timeout(Duration::from_secs(20))
+        .timeout(Duration::from_secs(30))
         .build()?;
     let base = open_base(ep);
-    send_text(&http, env, base, &app_id, &secret, &text).await
+    let text = super::xfer::spoken_text(parts);
+    if !text.trim().is_empty() {
+        send_text(&http, env, base, &app_id, &secret, &text).await?;
+    }
+    for part in parts {
+        if matches!(part, ContentPart::Text { .. }) {
+            continue;
+        }
+        if let Err(e) = send_media(&http, env, base, &app_id, &secret, part).await {
+            eprintln!("hyper feishu media: {e}");
+            let line = part.fallback_line().unwrap_or_else(|| "[文件]".into());
+            let _ = send_text(&http, env, base, &app_id, &secret, &line).await;
+        }
+    }
+    Ok(())
 }
 
 async fn run_once(
@@ -282,6 +299,12 @@ async fn run_once(
         }
     });
     let mut frags: HashMap<String, Vec<Option<Vec<u8>>>> = HashMap::new();
+    let api = FeishuApi {
+        http: http.clone(),
+        app_id: app_id.to_string(),
+        secret: secret.to_string(),
+        base: base.to_string(),
+    };
     while let Some(frame) = read.next().await {
         let frame = frame.map_err(|e| Error::msg(format!("feishu ws: {e}")))?;
         match frame {
@@ -291,10 +314,10 @@ async fn run_once(
             Message::Pong(_) => {}
             Message::Close(_) => break,
             Message::Text(text) => {
-                handle_text(ep, mgr, &write, &text).await;
+                handle_text(ep, mgr, &api, &write, &text).await;
             }
             Message::Binary(bin) => {
-                handle_binary(ep, mgr, &write, &bin, &mut frags).await;
+                handle_binary(ep, mgr, &api, &write, &bin, &mut frags).await;
             }
             _ => {}
         }
@@ -306,6 +329,7 @@ async fn run_once(
 async fn handle_text(
     ep: &ChannelEndpoint,
     mgr: &ChannelManager,
+    api: &FeishuApi,
     write: &Arc<Mutex<WsWrite>>,
     text: &str,
 ) {
@@ -324,19 +348,20 @@ async fn handle_text(
     if let Some(ack) = json_ack(&v) {
         let _ = write.lock().await.send(Message::Text(ack.into())).await;
     }
-    ingest_json(ep, mgr, &v).await;
+    ingest_json(ep, mgr, api, &v).await;
 }
 
 async fn handle_binary(
     ep: &ChannelEndpoint,
     mgr: &ChannelManager,
+    api: &FeishuApi,
     write: &Arc<Mutex<WsWrite>>,
     bin: &[u8],
     frags: &mut HashMap<String, Vec<Option<Vec<u8>>>>,
 ) {
     if bin.first().copied() == Some(b'{') {
         if let Ok(text) = std::str::from_utf8(bin) {
-            handle_text(ep, mgr, write, text).await;
+            handle_text(ep, mgr, api, write, text).await;
             return;
         }
     }
@@ -365,14 +390,15 @@ async fn handle_binary(
             return;
         };
         match serde_json::from_slice::<Value>(&payload) {
-            Ok(v) => ingest_json(ep, mgr, &v).await,
+            Ok(v) => ingest_json(ep, mgr, api, &v).await,
             Err(_) => eprintln!("hyper feishu: non-json frame, skipping"),
         }
     }
 }
 
-async fn ingest_json(ep: &ChannelEndpoint, mgr: &ChannelManager, v: &Value) {
-    if let Some(env) = native_from_envelope(ep, v) {
+async fn ingest_json(ep: &ChannelEndpoint, mgr: &ChannelManager, api: &FeishuApi, v: &Value) {
+    if let Some(mut env) = native_from_envelope(ep, v) {
+        enrich_feishu_media(api, &mut env).await;
         if let Err(e) = mgr.ingest(env).await {
             eprintln!("hyper feishu ingest: {e}");
         }
@@ -519,15 +545,199 @@ async fn send_text(
     secret: &str,
     text: &str,
 ) -> Result<()> {
+    send_im(
+        http,
+        env,
+        base,
+        app_id,
+        secret,
+        "text",
+        json!({"text": text}),
+    )
+    .await
+}
+
+async fn send_media(
+    http: &reqwest::Client,
+    env: &NativePayload,
+    base: &str,
+    app_id: &str,
+    secret: &str,
+    part: &ContentPart,
+) -> Result<()> {
+    let blob = super::xfer::load_part(part, None).await?;
+    match blob.kind {
+        super::xfer::Kind::Image => {
+            let key = upload_image(http, base, app_id, secret, &blob).await?;
+            send_im(
+                http,
+                env,
+                base,
+                app_id,
+                secret,
+                "image",
+                json!({"image_key": key}),
+            )
+            .await
+        }
+        super::xfer::Kind::Audio => {
+            let key = upload_file(http, base, app_id, secret, &blob, "stream").await?;
+            send_im(
+                http,
+                env,
+                base,
+                app_id,
+                secret,
+                "audio",
+                json!({"file_key": key}),
+            )
+            .await
+        }
+        super::xfer::Kind::Video => {
+            let key = upload_file(http, base, app_id, secret, &blob, "mp4").await?;
+            send_im(
+                http,
+                env,
+                base,
+                app_id,
+                secret,
+                "media",
+                json!({"file_key": key}),
+            )
+            .await
+        }
+        super::xfer::Kind::File => {
+            let ft = feishu_file_type(&blob.name);
+            let key = upload_file(http, base, app_id, secret, &blob, ft).await?;
+            send_im(
+                http,
+                env,
+                base,
+                app_id,
+                secret,
+                "file",
+                json!({"file_key": key}),
+            )
+            .await
+        }
+    }
+}
+
+fn feishu_file_type(name: &str) -> &'static str {
+    let ext = name
+        .rsplit_once('.')
+        .map(|(_, e)| e.to_ascii_lowercase())
+        .unwrap_or_default();
+    match ext.as_str() {
+        "opus" => "opus",
+        "mp4" => "mp4",
+        "pdf" => "pdf",
+        "doc" | "docx" => "doc",
+        "xls" | "xlsx" => "xls",
+        "ppt" | "pptx" => "ppt",
+        _ => "stream",
+    }
+}
+
+async fn upload_image(
+    http: &reqwest::Client,
+    base: &str,
+    app_id: &str,
+    secret: &str,
+    blob: &super::xfer::Blob,
+) -> Result<String> {
+    let form = reqwest::multipart::Form::new()
+        .text("image_type", "message")
+        .part("image", super::xfer::bytes_part(blob));
+    upload_form(
+        http,
+        base,
+        app_id,
+        secret,
+        &format!("{base}/open-apis/im/v1/images"),
+        form,
+        "image_key",
+    )
+    .await
+}
+
+async fn upload_file(
+    http: &reqwest::Client,
+    base: &str,
+    app_id: &str,
+    secret: &str,
+    blob: &super::xfer::Blob,
+    file_type: &str,
+) -> Result<String> {
+    let form = reqwest::multipart::Form::new()
+        .text("file_type", file_type.to_string())
+        .text("file_name", blob.name.clone())
+        .part("file", super::xfer::bytes_part(blob));
+    upload_form(
+        http,
+        base,
+        app_id,
+        secret,
+        &format!("{base}/open-apis/im/v1/files"),
+        form,
+        "file_key",
+    )
+    .await
+}
+
+async fn upload_form(
+    http: &reqwest::Client,
+    base: &str,
+    app_id: &str,
+    secret: &str,
+    url: &str,
+    form: reqwest::multipart::Form,
+    key_field: &str,
+) -> Result<String> {
+    let token = tenant_token(http, base, app_id, secret).await?;
+    let resp = http
+        .post(url)
+        .header("Authorization", format!("Bearer {token}"))
+        .multipart(form)
+        .send()
+        .await?;
+    let status = resp.status();
+    let data: Value = resp.json().await.unwrap_or(Value::Null);
+    let code = data.get("code").and_then(Value::as_i64).unwrap_or(-1);
+    if status.is_success() && code == 0 {
+        let key = js_str(&data["data"][key_field]);
+        if key.is_empty() {
+            return Err(Error::msg(format!("feishu upload: missing {key_field}")));
+        }
+        return Ok(key);
+    }
+    if status.as_u16() == 401 || code == 99991663 {
+        clear_token(app_id);
+    }
+    Err(Error::msg(format!(
+        "feishu upload HTTP {status} code={code} msg={}",
+        js_str(&data["msg"])
+    )))
+}
+
+async fn send_im(
+    http: &reqwest::Client,
+    env: &NativePayload,
+    base: &str,
+    app_id: &str,
+    secret: &str,
+    msg_type: &str,
+    content: Value,
+) -> Result<()> {
     let id_type = receive_id_type(env);
     let receive_id = receive_id(env, &id_type);
     if receive_id.is_empty() {
         return Err(Error::msg("feishu send: missing chat_id / open_id"));
     }
-    let content = serde_json::to_string(&json!({"text": text})).unwrap_or_else(|_| "{}".into());
+    let content = serde_json::to_string(&content).unwrap_or_else(|_| "{}".into());
     let body = json!({
         "receive_id": receive_id,
-        "msg_type": "text",
+        "msg_type": msg_type,
         "content": content,
         "uuid": uuid::Uuid::new_v4().to_string(),
     });
@@ -659,7 +869,143 @@ fn native_from_event(ep: &ChannelEndpoint, event: &Value) -> Option<NativePayloa
         .insert("receive_id_type".into(), json!(receive_id_type));
     env.meta.insert("receive_id".into(), json!(receive_id));
     env.meta.insert("is_mentioned".into(), json!(mentioned));
+    let obj = parse_content_obj(&message["content"]);
+    let image_key = js_str(&obj["image_key"]);
+    let file_key = js_str(&obj["file_key"]);
+    if !image_key.is_empty() {
+        env.meta
+            .insert("image_key".into(), json!(image_key.clone()));
+        env.meta.insert("resource_key".into(), json!(image_key));
+        env.meta.insert("resource_type".into(), json!("image"));
+    } else if !file_key.is_empty() {
+        env.meta.insert("file_key".into(), json!(file_key.clone()));
+        env.meta.insert("resource_key".into(), json!(file_key));
+        let ty = match msg_type.trim().to_ascii_lowercase().as_str() {
+            "image" | "sticker" => "image",
+            _ => "file",
+        };
+        env.meta.insert("resource_type".into(), json!(ty));
+    }
     Some(env)
+}
+
+async fn enrich_feishu_media(api: &FeishuApi, env: &mut NativePayload) {
+    let mid = js_str(env.meta.get("message_id").unwrap_or(&Value::Null));
+    let key = js_str(env.meta.get("resource_key").unwrap_or(&Value::Null));
+    if mid.is_empty() || key.is_empty() {
+        return;
+    }
+    let ty = js_str(env.meta.get("resource_type").unwrap_or(&Value::Null));
+    let ty = if ty.is_empty() { "file" } else { ty.as_str() };
+    match download_resource(api, &mid, &key, ty).await {
+        Ok(part) => {
+            super::xfer::splice_media(&mut env.content_parts, part);
+            env.text = super::xfer::query_text_of(&env.content_parts);
+        }
+        Err(e) => eprintln!("hyper feishu media: {e}"),
+    }
+}
+
+async fn download_resource(
+    api: &FeishuApi,
+    message_id: &str,
+    key: &str,
+    ty: &str,
+) -> Result<ContentPart> {
+    let token = tenant_token(&api.http, &api.base, &api.app_id, &api.secret).await?;
+    let url = format!(
+        "{}/open-apis/im/v1/messages/{}/resources/{}?type={}",
+        api.base,
+        urlencoding_seg(message_id),
+        urlencoding_seg(key),
+        urlencoding_seg(ty)
+    );
+    let resp = api
+        .http
+        .get(&url)
+        .header("Authorization", format!("Bearer {token}"))
+        .send()
+        .await?;
+    if !resp.status().is_success() {
+        return Err(Error::msg(format!(
+            "feishu resource HTTP {}",
+            resp.status()
+        )));
+    }
+    let mime = resp
+        .headers()
+        .get(reqwest::header::CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("")
+        .split(';')
+        .next()
+        .unwrap_or("")
+        .trim()
+        .to_string();
+    let name = disposition_name(resp.headers()).unwrap_or_else(|| {
+        if ty == "image" {
+            "image.jpg".into()
+        } else {
+            "file.bin".into()
+        }
+    });
+    let bytes = resp.bytes().await?;
+    if bytes.len() > super::xfer::FETCH_CAP {
+        return Err(Error::msg("feishu resource over cap"));
+    }
+    let kind = super::xfer::kind_from_mime_name(&mime, &name);
+    let mime = if mime.is_empty() {
+        super::xfer::guess_mime(&name, kind).to_string()
+    } else {
+        mime
+    };
+    super::xfer::blob_to_inbound_part(super::xfer::Blob {
+        kind,
+        mime,
+        name,
+        bytes: bytes.to_vec(),
+    })
+}
+
+fn urlencoding_seg(s: &str) -> String {
+    let mut out = String::new();
+    for b in s.as_bytes() {
+        match *b {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
+                out.push(*b as char);
+            }
+            _ => out.push_str(&format!("%{b:02X}")),
+        }
+    }
+    out
+}
+
+fn disposition_name(headers: &reqwest::header::HeaderMap) -> Option<String> {
+    let raw = headers
+        .get(reqwest::header::CONTENT_DISPOSITION)?
+        .to_str()
+        .ok()?;
+    for part in raw.split(';') {
+        let part = part.trim();
+        if let Some(v) = part.strip_prefix("filename*=") {
+            let v = v.trim().trim_matches('"');
+            if let Some((_, name)) = v.split_once("''") {
+                return Some(name.to_string());
+            }
+        }
+        if let Some(v) = part.strip_prefix("filename=") {
+            return Some(v.trim().trim_matches('"').to_string());
+        }
+    }
+    None
+}
+
+fn parse_content_obj(content: &Value) -> Value {
+    match content {
+        Value::String(s) => serde_json::from_str(s).unwrap_or(Value::Null),
+        Value::Object(_) => content.clone(),
+        _ => Value::Null,
+    }
 }
 
 #[cfg(test)]
@@ -1092,6 +1438,15 @@ mod tests {
     }
 
     #[test]
+    fn feishu_file_type_ext() {
+        assert_eq!(feishu_file_type("a.pdf"), "pdf");
+        assert_eq!(feishu_file_type("a.PDF"), "pdf");
+        assert_eq!(feishu_file_type("notes.docx"), "doc");
+        assert_eq!(feishu_file_type("clip.mp4"), "mp4");
+        assert_eq!(feishu_file_type("bin.xyz"), "stream");
+    }
+
+    #[test]
     fn native_ingests_image() {
         let ep = ep_with(&[]);
         let v = json!({
@@ -1108,6 +1463,9 @@ mod tests {
         });
         let env = native_from_envelope(&ep, &v).expect("image");
         assert_eq!(env.text, "[图片]");
+        assert_eq!(env.meta["image_key"], json!("img_x"));
+        assert_eq!(env.meta["resource_key"], json!("img_x"));
+        assert_eq!(env.meta["resource_type"], json!("image"));
     }
 
     #[test]

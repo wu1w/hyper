@@ -7,7 +7,7 @@ use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::Mutex;
-use std::time::UNIX_EPOCH;
+use std::time::{Duration, Instant, UNIX_EPOCH};
 
 use rusqlite::{params, Connection, Transaction};
 
@@ -20,6 +20,30 @@ const RENDER_CHARS: usize = 4000;
 const MAX_FILES: usize = 50_000;
 const MAX_FILE_BYTES: usize = 1024 * 1024;
 const INDEX_SCHEMA: i64 = 2;
+/// Agent::new rebuilds the index every turn. A persistent sqlite that was
+/// scanned moments ago is still current; skip git-ls + metadata until this
+/// window elapses so Windows doesn't re-walk tens of thousands of files.
+const RESCAN_EVERY: Duration = Duration::from_secs(12);
+static LAST_FULL_SCAN: Mutex<Option<(PathBuf, Instant)>> = Mutex::new(None);
+
+fn scan_key(root: &Path) -> PathBuf {
+    std::fs::canonicalize(root).unwrap_or_else(|_| root.to_path_buf())
+}
+
+fn reuse_persistent(root: &Path) -> bool {
+    let key = scan_key(root);
+    let Ok(g) = LAST_FULL_SCAN.lock() else {
+        return false;
+    };
+    g.as_ref()
+        .is_some_and(|(p, t)| p == &key && t.elapsed() < RESCAN_EVERY)
+}
+
+fn mark_scanned(root: &Path) {
+    if let Ok(mut g) = LAST_FULL_SCAN.lock() {
+        *g = Some((scan_key(root), Instant::now()));
+    }
+}
 
 const SKIP_DIR: &[&str] = &[
     ".git",
@@ -64,6 +88,11 @@ impl CodeIndex {
             idx.sync_root(root, collect_nested_git_files(root));
             return idx;
         }
+        if reuse_persistent(root) {
+            if let Some(idx) = Self::persistent(root) {
+                return idx;
+            }
+        }
         let tracked = git_ls_files(root);
         let mut files = tracked.clone().unwrap_or_else(|| walk_fallback(root));
         if tracked.is_some() {
@@ -79,6 +108,9 @@ impl CodeIndex {
             Self::empty()
         };
         idx.sync_root(root, files);
+        if tracked.is_some() {
+            mark_scanned(root);
+        }
         idx
     }
 
@@ -902,6 +934,9 @@ fn walk_nested_git(root: &Path, dir: &Path, depth: usize, out: &mut Vec<PathBuf>
             continue;
         }
         let path = entry.path();
+        if super::path::is_reparse_or_symlink(&path) {
+            continue;
+        }
         if path.join(".git").exists() {
             if let Some(files) = git_ls_files_raw(&path) {
                 for f in files {
@@ -950,6 +985,9 @@ fn walk_dir(root: &Path, dir: &Path, out: &mut Vec<PathBuf>) {
         };
         if ft.is_dir() {
             if SKIP_DIR.contains(&name_s.as_ref()) {
+                continue;
+            }
+            if super::path::is_reparse_or_symlink(&path) {
                 continue;
             }
             walk_dir(root, &path, out);

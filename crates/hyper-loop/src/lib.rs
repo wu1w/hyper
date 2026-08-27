@@ -108,4 +108,4 @@ pub use template::{
     is_hidden_user_text, wrap_tool_response, ChatMessage, RenderOpts, RenderedPrompt,
 };
 pub use tool_calls::{CancelFlag, ToolCall, ToolCoordinator, ToolResponse, ToolState};
-pub use tools::{BlobStore, Workspace};
+pub use tools::{is_reparse_or_symlink, BlobStore, Workspace};

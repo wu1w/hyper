@@ -6,6 +6,7 @@ license.workspace = true
 description = "Core loop, family adapters, and probe for grok-hyper"
 
 [dependencies]
+aes = "0.8"
 aes-gcm.workspace = true
 base64.workspace = true
 encoding_rs.workspace = true
@@ -17,6 +18,7 @@ minijinja-contrib.workspace = true
 reqwest.workspace = true
 serde.workspace = true
 serde_json.workspace = true
+md-5 = "0.10"
 sha2.workspace = true
 thiserror.workspace = true
 tokenizers.workspace = true

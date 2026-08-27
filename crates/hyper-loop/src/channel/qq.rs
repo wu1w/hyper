@@ -6,6 +6,8 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
+use base64::engine::general_purpose::STANDARD;
+use base64::Engine;
 use futures::{SinkExt, StreamExt};
 use serde_json::{json, Value};
 use tokio::sync::Mutex;
@@ -222,7 +224,12 @@ async fn run_once(
                 if t == "READY" {
                     let sid = payload["d"]["session_id"].as_str().unwrap_or("");
                     eprintln!("hyper qq ready session={sid}");
-                } else if let Some(env) = native_from_event(ep, t, &payload["d"]) {
+                } else if let Some(mut env) = native_from_event(ep, t, &payload["d"]) {
+                    super::xfer::hydrate_http_parts(&mut env.content_parts).await;
+                    env.text = super::xfer::query_text_of(&env.content_parts);
+                    if env.content_parts.is_empty() {
+                        continue;
+                    }
                     if let Err(e) = mgr.ingest(env).await {
                         eprintln!("hyper qq ingest: {e}");
                     }
@@ -292,20 +299,51 @@ fn native_from_event(ep: &ChannelEndpoint, t: &str, d: &Value) -> Option<NativeP
             let name = first_str(&[&a["filename"], &a["file_name"], &a["name"]]);
             let url = first_str(&[&a["url"], &a["content"]]);
             let ctype = first_str(&[&a["content_type"], &a["contentType"]]).to_ascii_lowercase();
-            if ctype.starts_with("image/")
+            let kind = if ctype.starts_with("image/")
                 || name.to_ascii_lowercase().ends_with(".png")
                 || name.to_ascii_lowercase().ends_with(".jpg")
                 || name.to_ascii_lowercase().ends_with(".jpeg")
+                || name.to_ascii_lowercase().ends_with(".gif")
+                || name.to_ascii_lowercase().ends_with(".webp")
             {
-                if url.starts_with("http://") || url.starts_with("https://") {
-                    parts.push(ContentPart::Image {
+                super::xfer::Kind::Image
+            } else if ctype.starts_with("audio/") {
+                super::xfer::Kind::Audio
+            } else if ctype.starts_with("video/") {
+                super::xfer::Kind::Video
+            } else {
+                super::xfer::Kind::File
+            };
+            if url.starts_with("http://") || url.starts_with("https://") {
+                let mime = if ctype.is_empty() {
+                    super::xfer::guess_mime(&name, kind).to_string()
+                } else {
+                    ctype
+                };
+                parts.push(match kind {
+                    super::xfer::Kind::Image => ContentPart::Image {
                         image_url: url,
                         url: String::new(),
-                        mime: "image/jpeg".into(),
-                    });
-                } else {
-                    parts.push(ContentPart::text("[图片]"));
-                }
+                        mime,
+                    },
+                    super::xfer::Kind::Audio => ContentPart::Audio {
+                        audio_url: url,
+                        url: String::new(),
+                        mime,
+                    },
+                    super::xfer::Kind::Video => ContentPart::Video {
+                        video_url: url,
+                        url: String::new(),
+                        mime,
+                    },
+                    super::xfer::Kind::File => ContentPart::File {
+                        file_url: url,
+                        file_id: String::new(),
+                        name: if name.is_empty() { "file".into() } else { name },
+                    },
+                });
+            } else if kind == super::xfer::Kind::Image {
+                parts.push(ContentPart::text("[图片]"));
             } else if !name.is_empty() {
                 parts.push(ContentPart::text(format!("[文件] {name}")));
             } else {
@@ -359,47 +397,215 @@ pub async fn send(
     let Some((app_id, secret)) = credentials(ep) else {
         return Err(Error::msg("qq send: missing credentials"));
     };
-    let text = super::outbound::parts_to_text(parts);
-    if text.trim().is_empty() {
-        return Ok(());
-    }
     let http = reqwest::Client::new();
     let token = access_token(&http, &app_id, &secret).await?;
+    let bases = api_bases(ep);
+    let text = super::xfer::spoken_text(parts);
+    if !text.trim().is_empty() {
+        send_typed(
+            &http,
+            &token,
+            &bases,
+            env,
+            0,
+            json!({ "content": clip_qq(&text) }),
+        )
+        .await?;
+    }
+    for part in parts {
+        if matches!(part, ContentPart::Text { .. }) {
+            continue;
+        }
+        if let Err(e) = send_media(&http, &token, &bases, env, part).await {
+            eprintln!("hyper qq media: {e}");
+            let line = part.fallback_line().unwrap_or_else(|| "[文件]".into());
+            let _ = send_typed(
+                &http,
+                &token,
+                &bases,
+                env,
+                0,
+                json!({ "content": clip_qq(&line) }),
+            )
+            .await;
+        }
+    }
+    Ok(())
+}
+
+fn clip_qq(text: &str) -> String {
+    text.chars().take(2000).collect()
+}
+
+fn qq_file_type(kind: super::xfer::Kind) -> i32 {
+    match kind {
+        super::xfer::Kind::Image => 1,
+        super::xfer::Kind::Video => 2,
+        super::xfer::Kind::Audio => 3,
+        super::xfer::Kind::File => 4,
+    }
+}
+
+fn messages_path(env: &NativePayload) -> Result<String> {
     let msg_type = env
         .meta
         .get("message_type")
         .and_then(Value::as_str)
         .unwrap_or("c2c");
-    let path = if msg_type == "group" {
+    if msg_type == "group" {
         let id = env
             .meta
             .get("group_openid")
             .and_then(Value::as_str)
             .unwrap_or("");
-        format!("/v2/groups/{id}/messages")
+        if id.is_empty() {
+            return Err(Error::msg("qq send: missing group_openid"));
+        }
+        Ok(format!("/v2/groups/{id}/messages"))
     } else {
         let id = env
             .meta
             .get("user_openid")
             .and_then(Value::as_str)
             .unwrap_or(&env.sender_id);
-        format!("/v2/users/{id}/messages")
-    };
+        if id.is_empty() {
+            return Err(Error::msg("qq send: missing user_openid"));
+        }
+        Ok(format!("/v2/users/{id}/messages"))
+    }
+}
+
+fn files_path(env: &NativePayload) -> Result<String> {
+    let msg_type = env
+        .meta
+        .get("message_type")
+        .and_then(Value::as_str)
+        .unwrap_or("c2c");
+    if msg_type == "group" {
+        let id = env
+            .meta
+            .get("group_openid")
+            .and_then(Value::as_str)
+            .unwrap_or("");
+        if id.is_empty() {
+            return Err(Error::msg("qq send: missing group_openid"));
+        }
+        Ok(format!("/v2/groups/{id}/files"))
+    } else {
+        let id = env
+            .meta
+            .get("user_openid")
+            .and_then(Value::as_str)
+            .unwrap_or(&env.sender_id);
+        if id.is_empty() {
+            return Err(Error::msg("qq send: missing user_openid"));
+        }
+        Ok(format!("/v2/users/{id}/files"))
+    }
+}
+
+async fn send_typed(
+    http: &reqwest::Client,
+    token: &str,
+    bases: &[String],
+    env: &NativePayload,
+    msg_type: i64,
+    extra: Value,
+) -> Result<()> {
+    let path = messages_path(env)?;
     let seq = MSG_SEQ.fetch_add(1, Ordering::Relaxed);
-    let mut body = json!({
-        "content": text.chars().take(2000).collect::<String>(),
-        "msg_type": 0,
-        "msg_seq": seq,
-    });
+    let mut body = extra;
+    if !body.is_object() {
+        body = json!({});
+    }
+    body["msg_type"] = json!(msg_type);
+    body["msg_seq"] = json!(seq);
     if let Some(id) = env.meta.get("msg_id").and_then(Value::as_str) {
         body["msg_id"] = json!(id);
     }
+    post_first_ok(http, token, bases, &path, &body).await?;
+    Ok(())
+}
+
+async fn send_media(
+    http: &reqwest::Client,
+    token: &str,
+    bases: &[String],
+    env: &NativePayload,
+    part: &ContentPart,
+) -> Result<()> {
+    let blob = super::xfer::load_part(part, None).await?;
+    let file_type = qq_file_type(blob.kind);
+    let info = upload_qq_file(http, token, bases, env, file_type, part, &blob).await?;
+    send_typed(
+        http,
+        token,
+        bases,
+        env,
+        7,
+        json!({ "media": { "file_info": info } }),
+    )
+    .await
+}
+
+async fn upload_qq_file(
+    http: &reqwest::Client,
+    token: &str,
+    bases: &[String],
+    env: &NativePayload,
+    file_type: i32,
+    part: &ContentPart,
+    blob: &super::xfer::Blob,
+) -> Result<String> {
+    let path = files_path(env)?;
+    if let Some(url) = super::xfer::http_src(part) {
+        let body = json!({
+            "file_type": file_type,
+            "url": url,
+            "srv_send_msg": false,
+        });
+        if let Ok(data) = post_first_ok(http, token, bases, &path, &body).await {
+            if let Some(info) = qq_file_info(&data) {
+                return Ok(info);
+            }
+        }
+    }
+    let body = json!({
+        "file_type": file_type,
+        "file_data": STANDARD.encode(&blob.bytes),
+        "srv_send_msg": false,
+    });
+    let data = post_first_ok(http, token, bases, &path, &body).await?;
+    qq_file_info(&data).ok_or_else(|| Error::msg(format!("qq files: no file_info {data}")))
+}
+
+fn qq_file_info(data: &Value) -> Option<String> {
+    for key in ["file_info", "fileInfo"] {
+        let s = data.get(key).and_then(Value::as_str).unwrap_or("");
+        if !s.is_empty() {
+            return Some(s.to_string());
+        }
+        let s = data["data"][key].as_str().unwrap_or("");
+        if !s.is_empty() {
+            return Some(s.to_string());
+        }
+    }
+    None
+}
+
+async fn post_first_ok(
+    http: &reqwest::Client,
+    token: &str,
+    bases: &[String],
+    path: &str,
+    body: &Value,
+) -> Result<Value> {
     let mut last = Error::msg("qq send failed");
-    for base in api_bases(ep) {
+    for base in bases {
         let resp = match http
             .post(format!("{base}{path}"))
             .header("Authorization", format!("QQBot {token}"))
-            .json(&body)
+            .json(body)
             .send()
             .await
         {
@@ -409,14 +615,60 @@ pub async fn send(
                 continue;
             }
         };
-        if resp.status().is_success() {
-            return Ok(());
+        let status = resp.status();
+        let data: Value = resp.json().await.unwrap_or(Value::Null);
+        if status.is_success() {
+            return Ok(data);
         }
-        last = Error::msg(format!(
-            "qq send {} {}",
-            resp.status(),
-            resp.text().await.unwrap_or_default()
-        ));
+        last = Error::msg(format!("qq {path} {status} {data}"));
     }
     Err(last)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn file_type_mapping() {
+        assert_eq!(qq_file_type(super::super::xfer::Kind::Image), 1);
+        assert_eq!(qq_file_type(super::super::xfer::Kind::Video), 2);
+        assert_eq!(qq_file_type(super::super::xfer::Kind::Audio), 3);
+        assert_eq!(qq_file_type(super::super::xfer::Kind::File), 4);
+    }
+
+    #[test]
+    fn native_image_attachment() {
+        let ep = ChannelEndpoint {
+            kind: "qq".into(),
+            ..ChannelEndpoint::default()
+        };
+        let d = json!({
+            "author": {"user_openid": "u1", "username": "will"},
+            "content": "see",
+            "id": "m1",
+            "attachments": [{
+                "filename": "a.png",
+                "url": "https://cdn.example/a.png",
+                "content_type": "image/png"
+            }]
+        });
+        let env = native_from_event(&ep, "C2C_MESSAGE_CREATE", &d).unwrap();
+        assert_eq!(env.sender_id, "u1");
+        assert!(env
+            .content_parts
+            .iter()
+            .any(|p| matches!(p, ContentPart::Image { .. })));
+        assert_eq!(messages_path(&env).unwrap(), "/v2/users/u1/messages");
+        assert_eq!(files_path(&env).unwrap(), "/v2/users/u1/files");
+    }
+
+    #[test]
+    fn group_paths() {
+        let mut env = NativePayload::default();
+        env.meta.insert("message_type".into(), json!("group"));
+        env.meta.insert("group_openid".into(), json!("g1"));
+        assert_eq!(messages_path(&env).unwrap(), "/v2/groups/g1/messages");
+        assert_eq!(files_path(&env).unwrap(), "/v2/groups/g1/files");
+    }
 }

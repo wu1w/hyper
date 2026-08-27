@@ -349,6 +349,8 @@ pub struct AgentOutcome {
     pub pending_steer: Vec<String>,
     /// CLI `print` already painted answer tokens to stdout.
     pub streamed_text: bool,
+    /// Workspace-relative files this turn wrote that channels should send.
+    pub channel_files: Vec<String>,
 }
 
 pub struct Agent<C> {
@@ -435,4 +437,5 @@ pub struct Agent<C> {
     persist_session: bool,
     session_dir: Option<PathBuf>,
     home: Option<PathBuf>,
+    channel_files: Vec<String>,
 }

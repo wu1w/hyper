@@ -31,7 +31,7 @@ pub(super) const STALE_TMP_MAX_AGE: Duration = Duration::from_secs(300);
 
 pub use code_index::{bash_search_query, run_search, search_dump_too_big, CodeIndex};
 pub use fold::{fold_text, BlobStore, Folded};
-pub use path::Workspace;
+pub use path::{is_reparse_or_symlink, Workspace};
 pub use view::view;
 pub use web::WebRunner;
 

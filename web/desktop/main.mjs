@@ -117,8 +117,12 @@ function attachSidecarLog(child) {
     const dir = path.join(app.getPath("home"), ".grok-hyper");
     mkdirSync(dir, { recursive: true });
     const out = createWriteStream(path.join(dir, "desktop.log"), { flags: "w" });
+    const MAX = 8 * 1024 * 1024;
+    let written = 0;
     const write = (chunk) => {
+      if (written >= MAX) return;
       try {
+        written += chunk.length;
         out.write(chunk);
       } catch {
         /* ignore */
@@ -145,30 +149,42 @@ function waitForUrl(child) {
     const timer = setTimeout(() => {
       if (settled) return;
       settled = true;
+      detach();
       reject(new Error(`hyper web 在 ${READY_MS / 1000}s 内没有打出监听地址`));
     }, READY_MS);
 
-    // Keep reading after the ready line. Windows anonymous pipes are ~4KB;
-    // dropping the listeners lets hyper block on eprintln and freeze the turn.
+    // attachSidecarLog keeps the pipes drained for the process lifetime
+    // (Windows anonymous pipes are ~4KB; a full pipe freezes hyper). This
+    // waiter only scans until the ready line, then detaches so `buf` cannot
+    // grow without bound.
+    const detach = () => {
+      child.stdout?.off("data", onData);
+      child.stderr?.off("data", onData);
+    };
     const onData = (chunk) => {
-      buf += chunk.toString("utf8");
+      const text = chunk.toString("utf8");
       if (settled) return;
+      buf += text;
+      if (buf.length > 64_000) buf = buf.slice(-32_000);
       const m = buf.match(READY_RE);
       if (!m) return;
       settled = true;
       clearTimeout(timer);
+      detach();
       resolve(m[1].replace(/\/?$/, "/"));
     };
     const onExit = (code, signal) => {
       if (settled) return;
       settled = true;
       clearTimeout(timer);
+      detach();
       reject(new Error(`hyper web 提前退出 (code=${code} signal=${signal})\n${buf.trim()}`));
     };
     const onError = (err) => {
       if (settled) return;
       settled = true;
       clearTimeout(timer);
+      detach();
       reject(err);
     };
 

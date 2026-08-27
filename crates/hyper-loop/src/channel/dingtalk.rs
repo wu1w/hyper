@@ -113,14 +113,29 @@ async fn run_once(
                             .map_err(|e| Error::msg(format!("dingtalk ack: {e}")))?;
                         if ty == "CALLBACK" {
                             if let Some(data) = parse_chatbot_data(&payload["data"]) {
-                                if let Some(env) = native_from_chatbot(ep, &data) {
-                                    let mgr = mgr.clone();
-                                    tokio::spawn(async move {
+                                let mgr = mgr.clone();
+                                let ep = ep.clone();
+                                let http = http.clone();
+                                let client_id = client_id.to_string();
+                                let client_secret = client_secret.to_string();
+                                tokio::spawn(async move {
+                                    if let Some(mut env) = native_from_chatbot(&ep, &data) {
+                                        enrich_dingtalk(
+                                            &http,
+                                            &client_id,
+                                            &client_secret,
+                                            &data,
+                                            &mut env,
+                                        )
+                                        .await;
+                                        if env.content_parts.is_empty() {
+                                            return;
+                                        }
                                         if let Err(e) = mgr.ingest(env).await {
                                             eprintln!("hyper dingtalk ingest: {e}");
                                         }
-                                    });
-                                }
+                                    }
+                                });
                             }
                         }
                     }
@@ -275,6 +290,136 @@ fn session_webhook(data: &Value) -> String {
     first_str(data, &["sessionWebhook", "session_webhook"])
 }
 
+fn picture_url(data: &Value) -> Option<String> {
+    let candidates = [
+        first_str(
+            data,
+            &["picURL", "picUrl", "pictureUrl", "imageUrl", "photoURL"],
+        ),
+        first_str(
+            &data["content"],
+            &["picURL", "picUrl", "downloadUrl", "url"],
+        ),
+        first_str(&data["picture"], &["picURL", "picUrl", "url"]),
+        first_str(&data["image"], &["picURL", "picUrl", "url"]),
+    ];
+    candidates.into_iter().find_map(|s| {
+        let t = s.trim();
+        if t.starts_with("http://") || t.starts_with("https://") {
+            Some(t.to_string())
+        } else {
+            None
+        }
+    })
+}
+
+fn download_code(data: &Value) -> String {
+    let nested = parse_content_obj(&data["content"]);
+    for s in [
+        first_str(
+            data,
+            &["downloadCode", "download_code", "pictureDownloadCode"],
+        ),
+        first_str(&nested, &["downloadCode", "download_code"]),
+        first_str(&data["picture"], &["downloadCode", "download_code"]),
+        first_str(&data["video"], &["downloadCode", "download_code"]),
+    ] {
+        if !s.is_empty() {
+            return s;
+        }
+    }
+    String::new()
+}
+
+fn parse_content_obj(content: &Value) -> Value {
+    match content {
+        Value::String(s) => serde_json::from_str(s).unwrap_or(Value::Null),
+        Value::Object(_) => content.clone(),
+        _ => Value::Null,
+    }
+}
+
+async fn enrich_dingtalk(
+    http: &reqwest::Client,
+    client_id: &str,
+    client_secret: &str,
+    data: &Value,
+    env: &mut NativePayload,
+) {
+    super::xfer::hydrate_http_parts(&mut env.content_parts).await;
+    let has_bytes = env.content_parts.iter().any(|p| {
+        super::xfer::part_src(p)
+            .is_some_and(|s| s.starts_with("data:") || std::path::Path::new(s).is_file())
+    });
+    if !has_bytes {
+        let code = download_code(data);
+        if !code.is_empty() {
+            match robot_download(http, client_id, client_secret, &code).await {
+                Ok(bytes) => {
+                    let name = first_str(data, &["fileName", "filename", "file_name"]);
+                    let name = if name.is_empty() {
+                        "image.jpg".to_string()
+                    } else {
+                        name
+                    };
+                    let kind = super::xfer::kind_from_name(&name);
+                    let mime = super::xfer::guess_mime(&name, kind).to_string();
+                    let blob = super::xfer::Blob {
+                        kind,
+                        mime,
+                        name,
+                        bytes,
+                    };
+                    if let Ok(part) = super::xfer::blob_to_inbound_part(blob) {
+                        super::xfer::splice_media(&mut env.content_parts, part);
+                    }
+                }
+                Err(e) => eprintln!("hyper dingtalk media: {e}"),
+            }
+        }
+    }
+    env.text = super::xfer::query_text_of(&env.content_parts);
+}
+
+async fn robot_download(
+    http: &reqwest::Client,
+    client_id: &str,
+    client_secret: &str,
+    download_code: &str,
+) -> Result<Vec<u8>> {
+    let tok: Value = http
+        .post("https://api.dingtalk.com/v1.0/oauth2/accessToken")
+        .json(&json!({"appKey": client_id, "appSecret": client_secret}))
+        .send()
+        .await?
+        .json()
+        .await?;
+    let token = js_str(&tok["accessToken"]);
+    if token.is_empty() {
+        return Err(Error::msg(format!("dingtalk token: {tok}")));
+    }
+    let data: Value = http
+        .post("https://api.dingtalk.com/v1.0/robot/messageFiles/download")
+        .header("x-acs-dingtalk-access-token", &token)
+        .json(&json!({
+            "downloadCode": download_code,
+            "robotCode": client_id,
+        }))
+        .send()
+        .await?
+        .json()
+        .await?;
+    let url = first_str(&data, &["downloadUrl", "download_url"]);
+    if url.is_empty() {
+        return Err(Error::msg(format!("dingtalk download: {data}")));
+    }
+    let bytes = http.get(&url).send().await?.bytes().await?;
+    if bytes.len() > super::xfer::FETCH_CAP {
+        return Err(Error::msg("dingtalk media over cap"));
+    }
+    Ok(bytes.to_vec())
+}
+
 fn native_from_chatbot(ep: &ChannelEndpoint, data: &Value) -> Option<NativePayload> {
     let sender = first_str(
         data,
@@ -298,6 +443,14 @@ fn native_from_chatbot(ep: &ChannelEndpoint, data: &Value) -> Option<NativePaylo
     } else {
         conversation_id.clone()
     };
+    let mut parts = vec![ContentPart::text(&text)];
+    if let Some(url) = picture_url(data) {
+        parts.push(ContentPart::Image {
+            image_url: url,
+            url: String::new(),
+            mime: "image/jpeg".into(),
+        });
+    }
     let mut env = NativePayload {
         channel: if ep.kind.is_empty() {
             "dingtalk".into()
@@ -306,7 +459,7 @@ fn native_from_chatbot(ep: &ChannelEndpoint, data: &Value) -> Option<NativePaylo
         },
         sender_id: sender,
         sender_name: first_str(data, &["senderNick", "sender_nick"]),
-        content_parts: vec![ContentPart::text(&text)],
+        content_parts: parts,
         text,
         ..NativePayload::default()
     };
@@ -332,22 +485,69 @@ pub async fn send(
     parts: &[ContentPart],
 ) -> Result<()> {
     let _ = ep;
-    let text = super::outbound::parts_to_text(parts);
-    if text.trim().is_empty() {
-        return Ok(());
-    }
     let Some(url) = webhook_from_env(env) else {
         return Err(Error::msg("dingtalk send: missing session_webhook"));
     };
-    let clipped: String = text.chars().take(MAX_MARKDOWN).collect();
-    let body = json!({
-        "msgtype": "markdown",
-        "markdown": {"title": "hyper", "text": clipped},
-    });
     let http = reqwest::Client::builder()
         .timeout(Duration::from_secs(15))
         .build()?;
-    let resp = http.post(&url).json(&body).send().await?;
+    let spoken = super::xfer::spoken_text(parts);
+    let mut notes = Vec::new();
+    let mut image_urls = Vec::new();
+    for part in parts {
+        if matches!(part, ContentPart::Text { .. }) {
+            continue;
+        }
+        if let Some(u) = super::xfer::http_src(part) {
+            if matches!(part, ContentPart::Image { .. }) {
+                image_urls.push(u.to_string());
+            } else if let Some(line) = part.fallback_line() {
+                notes.push(line);
+            }
+        } else if let Some(line) = part.fallback_line() {
+            notes.push(line);
+        }
+    }
+    let mut caption = spoken;
+    if !notes.is_empty() {
+        if !caption.is_empty() {
+            caption.push('\n');
+        }
+        caption.push_str(&notes.join("\n"));
+    }
+    if !caption.trim().is_empty() {
+        post_webhook(
+            &http,
+            &url,
+            &json!({
+                "msgtype": "markdown",
+                "markdown": {
+                    "title": "hyper",
+                    "text": caption.chars().take(MAX_MARKDOWN).collect::<String>(),
+                },
+            }),
+        )
+        .await?;
+    }
+    for pic in image_urls {
+        if let Err(e) = post_webhook(
+            &http,
+            &url,
+            &json!({
+                "msgtype": "image",
+                "image": { "picURL": pic },
+            }),
+        )
+        .await
+        {
+            eprintln!("hyper dingtalk image: {e}");
+        }
+    }
+    Ok(())
+}
+
+async fn post_webhook(http: &reqwest::Client, url: &str, body: &Value) -> Result<()> {
+    let resp = http.post(url).json(body).send().await?;
     let status = resp.status();
     let t = resp.text().await.unwrap_or_default();
     if !status.is_success() {
@@ -478,6 +678,28 @@ mod tests {
         });
         let env = native_from_chatbot(&ep(), &data).unwrap();
         assert_eq!(env.text, "[图片]");
+    }
+
+    #[test]
+    fn picture_url_and_download_code() {
+        let data = json!({
+            "msgtype": "picture",
+            "picURL": "https://cdn.example/p.jpg",
+            "content": {"downloadCode": "dc-1"},
+            "senderId": "u1",
+            "conversationId": "c1",
+            "conversationType": 1
+        });
+        assert_eq!(
+            picture_url(&data).as_deref(),
+            Some("https://cdn.example/p.jpg")
+        );
+        assert_eq!(download_code(&data), "dc-1");
+        let env = native_from_chatbot(&ep(), &data).unwrap();
+        assert!(env
+            .content_parts
+            .iter()
+            .any(|p| matches!(p, ContentPart::Image { .. })));
     }
 
     #[test]

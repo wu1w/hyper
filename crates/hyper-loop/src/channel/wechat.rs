@@ -83,19 +83,41 @@ pub async fn send(
     if to.is_empty() {
         return Err(Error::msg("wechat send: missing to_user_id"));
     }
-    let text = clip(&super::outbound::parts_to_text(parts), TEXT_CLIP);
-    if text.trim().is_empty() {
-        return Ok(());
-    }
     let context_token = meta_str(env, "context_token");
     let http = reqwest::Client::builder()
-        .timeout(Duration::from_secs(20))
+        .timeout(Duration::from_secs(30))
         .build()?;
+    let mut items: Vec<Value> = Vec::new();
+    let text = clip(&super::xfer::spoken_text(parts), TEXT_CLIP);
+    if !text.trim().is_empty() {
+        items.push(json!({"type": 1, "text_item": {"text": text}}));
+    }
+    for part in parts {
+        if matches!(part, ContentPart::Text { .. }) {
+            continue;
+        }
+        match send_cdn_item(&http, &token, &base, &to, part).await {
+            Ok(item) => items.push(item),
+            Err(e) => {
+                eprintln!("hyper wechat media: {e}");
+                let line = part.fallback_line().unwrap_or_else(|| "[文件]".into());
+                items.push(json!({"type": 1, "text_item": {"text": clip(&line, TEXT_CLIP)}}));
+            }
+        }
+    }
+    if items.is_empty() {
+        return Ok(());
+    }
     let url = format!("{base}/ilink/bot/sendmessage");
-    let mut data = post_json(&http, &url, &token, &send_body(&to, &text, &context_token)).await?;
+    let mut data = post_json(
+        &http,
+        &url,
+        &token,
+        &send_body(&to, items.clone(), &context_token),
+    )
+    .await?;
     if !api_ok(&data) && !context_token.is_empty() {
-        // Hermes: session expired — retry once without context_token.
-        data = post_json(&http, &url, &token, &send_body(&to, &text, "")).await?;
+        data = post_json(&http, &url, &token, &send_body(&to, items, "")).await?;
     }
     if !api_ok(&data) {
         return Err(Error::msg(format!(
@@ -105,6 +127,42 @@ pub async fn send(
         )));
     }
     Ok(())
+}
+
+async fn send_cdn_item(
+    http: &reqwest::Client,
+    token: &str,
+    base: &str,
+    to: &str,
+    part: &ContentPart,
+) -> Result<Value> {
+    let blob = super::xfer::load_part(part, None).await?;
+    let http_u = http.clone();
+    let token_u = token.to_string();
+    let base_u = base.to_string();
+    let media = super::ilink_cdn::upload_with(
+        http,
+        move |body| {
+            let http = http_u.clone();
+            let token = token_u.clone();
+            let base = base_u.clone();
+            async move {
+                post_json(
+                    &http,
+                    &format!("{base}/ilink/bot/getuploadurl"),
+                    &token,
+                    &body,
+                )
+                .await
+            }
+        },
+        to,
+        blob.kind,
+        &blob.name,
+        &blob.bytes,
+    )
+    .await?;
+    Ok(super::ilink_cdn::item_from_cdn(&media))
 }
 
 async fn poll_once(
@@ -139,9 +197,18 @@ async fn poll_once(
         if seen.insert(&ctx) {
             continue;
         }
-        let Some(env) = native_from_msg(ep, msg) else {
+        let Some(mut env) = native_from_msg(ep, msg) else {
             continue;
         };
+        env.content_parts = live_parts(http, &msg["item_list"]).await;
+        env.text = NativePayload {
+            content_parts: env.content_parts.clone(),
+            ..NativePayload::default()
+        }
+        .query_text();
+        if env.content_parts.is_empty() {
+            continue;
+        }
         if let Err(e) = mgr.ingest(env).await {
             eprintln!("hyper wechat ingest: {e}");
         }
@@ -188,14 +255,14 @@ fn headers(bot_token: &str) -> Result<HeaderMap> {
     Ok(h)
 }
 
-fn send_body(to: &str, text: &str, context_token: &str) -> Value {
+fn send_body(to: &str, items: Vec<Value>, context_token: &str) -> Value {
     let mut msg = json!({
         "from_user_id": "",
         "to_user_id": to,
         "client_id": uuid::Uuid::new_v4().to_string(),
         "message_type": 2,
         "message_state": 2,
-        "item_list": [{"type": 1, "text_item": {"text": text}}],
+        "item_list": items,
     });
     if !context_token.is_empty() {
         msg["context_token"] = json!(context_token);
@@ -310,6 +377,97 @@ fn parts_from_items(item_list: &Value) -> Vec<ContentPart> {
                 }
             }
             5 => parts.push(ContentPart::text("[视频]")),
+            _ => {}
+        }
+    }
+    parts
+}
+
+async fn live_parts(http: &reqwest::Client, item_list: &Value) -> Vec<ContentPart> {
+    let Some(arr) = item_list.as_array() else {
+        return Vec::new();
+    };
+    let mut parts = Vec::new();
+    for item in arr {
+        match json_i64(&item["type"]) {
+            1 => {
+                let t = js_str(&item["text_item"]["text"]);
+                let t = t.trim();
+                if !t.is_empty() {
+                    parts.push(ContentPart::text(t));
+                }
+            }
+            2 | 3 | 4 | 5 => {
+                if json_i64(&item["type"]) == 3 {
+                    let t = js_str(&item["voice_item"]["text"]);
+                    let t = t.trim();
+                    if !t.is_empty() {
+                        parts.push(ContentPart::text(t));
+                    }
+                }
+                if let Some(url) = first_http_url(&[
+                    js_str(&item["image_item"]["url"]),
+                    js_str(&item["image_item"]["image_url"]),
+                    js_str(&item["image_item"]["media"]["url"]),
+                    js_str(&item["file_item"]["url"]),
+                    js_str(&item["video_item"]["url"]),
+                ]) {
+                    let kind = match json_i64(&item["type"]) {
+                        2 => super::xfer::Kind::Image,
+                        3 => super::xfer::Kind::Audio,
+                        5 => super::xfer::Kind::Video,
+                        _ => super::xfer::Kind::File,
+                    };
+                    match super::xfer::load_src(&url, None).await {
+                        Ok(blob) => {
+                            if let Ok(p) = super::xfer::blob_to_inbound_part(blob) {
+                                parts.push(p);
+                                continue;
+                            }
+                        }
+                        Err(_) => {}
+                    }
+                    parts.push(match kind {
+                        super::xfer::Kind::Image => ContentPart::Image {
+                            image_url: url,
+                            url: String::new(),
+                            mime: "image/jpeg".into(),
+                        },
+                        _ => ContentPart::text("[文件]"),
+                    });
+                    continue;
+                }
+                if let Some(refer) = super::ilink_cdn::cdn_ref_from_item(item) {
+                    match super::ilink_cdn::download(http, &refer).await {
+                        Ok(bytes) => {
+                            let kind = refer.kind;
+                            let mime = super::xfer::guess_mime(&refer.name, kind).to_string();
+                            let blob = super::xfer::Blob {
+                                kind,
+                                mime,
+                                name: refer.name,
+                                bytes,
+                            };
+                            match super::xfer::blob_to_inbound_part(blob) {
+                                Ok(p) => {
+                                    parts.push(p);
+                                    continue;
+                                }
+                                Err(_) => {}
+                            }
+                        }
+                        Err(e) => eprintln!("hyper wechat cdn: {e}"),
+                    }
+                }
+                for s in parts_from_items(&json!([item])) {
+                    if let Some(t) = s.as_text() {
+                        if parts.iter().any(|p| p.as_text() == Some(t)) {
+                            continue;
+                        }
+                    }
+                    parts.push(s);
+                }
+            }
             _ => {}
         }
     }

@@ -7,7 +7,6 @@ use std::time::Duration;
 use serde_json::{json, Value};
 
 use crate::error::{Error, Result};
-use crate::media::{data_uri, MAX_INLINE_MEDIA_BYTES};
 
 use super::envelope::{ContentPart, NativePayload};
 use super::manager::ChannelManager;
@@ -114,42 +113,80 @@ pub async fn send(
         return Err(Error::msg("telegram send: missing chat_id"));
     }
     let client = reqwest::Client::new();
-    let text = super::outbound::parts_to_text(parts);
+    let text = super::xfer::spoken_text(parts);
     if !text.trim().is_empty() {
-        let url = format!("{API}/bot{token}/sendMessage");
-        let resp = client
-            .post(&url)
-            .json(&json!({
-                "chat_id": chat_id,
-                "text": clip(&text, 3900),
-            }))
-            .send()
-            .await?;
-        let status = resp.status();
-        let t = resp.text().await.unwrap_or_default();
-        if status.as_u16() == 429 {
-            let secs = serde_json::from_str::<Value>(&t)
-                .ok()
-                .and_then(|v| retry_after_secs(&v, &t, 429))
-                .unwrap_or(3);
-            tokio::time::sleep(Duration::from_secs(secs)).await;
-            let retry = client
-                .post(&url)
-                .json(&json!({
-                    "chat_id": chat_id,
-                    "text": clip(&text, 3900),
-                }))
-                .send()
-                .await?;
-            if !retry.status().is_success() {
-                let t = retry.text().await.unwrap_or_default();
-                return Err(Error::msg(format!("telegram sendMessage: {t}")));
-            }
-            return Ok(());
+        send_message(&client, &token, &chat_id, &text).await?;
+    }
+    for part in parts {
+        if matches!(part, ContentPart::Text { .. }) {
+            continue;
         }
-        if !status.is_success() {
+        if let Err(e) = send_media(&client, &token, &chat_id, part).await {
+            eprintln!("hyper telegram media: {e}");
+            let fallback = part.fallback_line().unwrap_or_else(|| "[文件]".into());
+            let _ = send_message(&client, &token, &chat_id, &fallback).await;
+        }
+    }
+    Ok(())
+}
+
+async fn send_message(
+    client: &reqwest::Client,
+    token: &str,
+    chat_id: &str,
+    text: &str,
+) -> Result<()> {
+    let url = format!("{API}/bot{token}/sendMessage");
+    let body = json!({
+        "chat_id": chat_id,
+        "text": clip(text, 3900),
+    });
+    let resp = client.post(&url).json(&body).send().await?;
+    let status = resp.status();
+    let t = resp.text().await.unwrap_or_default();
+    if status.as_u16() == 429 {
+        let secs = serde_json::from_str::<Value>(&t)
+            .ok()
+            .and_then(|v| retry_after_secs(&v, &t, 429))
+            .unwrap_or(3);
+        tokio::time::sleep(Duration::from_secs(secs)).await;
+        let retry = client.post(&url).json(&body).send().await?;
+        if !retry.status().is_success() {
+            let t = retry.text().await.unwrap_or_default();
             return Err(Error::msg(format!("telegram sendMessage: {t}")));
         }
+        return Ok(());
+    }
+    if !status.is_success() {
+        return Err(Error::msg(format!("telegram sendMessage: {t}")));
+    }
+    Ok(())
+}
+
+async fn send_media(
+    client: &reqwest::Client,
+    token: &str,
+    chat_id: &str,
+    part: &ContentPart,
+) -> Result<()> {
+    let blob = super::xfer::load_part(part, None).await?;
+    let (method, field) = match blob.kind {
+        super::xfer::Kind::Image => ("sendPhoto", "photo"),
+        super::xfer::Kind::Audio => ("sendAudio", "audio"),
+        super::xfer::Kind::Video => ("sendVideo", "video"),
+        super::xfer::Kind::File => ("sendDocument", "document"),
+    };
+    let url = format!("{API}/bot{token}/{method}");
+    let file = super::xfer::bytes_part(&blob);
+    let form = reqwest::multipart::Form::new()
+        .text("chat_id", chat_id.to_string())
+        .part(field, file);
+    let resp = client.post(&url).multipart(form).send().await?;
+    if !resp.status().is_success() {
+        return Err(Error::msg(format!(
+            "telegram {method}: {}",
+            resp.text().await.unwrap_or_default()
+        )));
     }
     Ok(())
 }
@@ -184,14 +221,9 @@ async fn native_from_message(
     if let Some(photos) = msg["photo"].as_array() {
         if let Some(best) = photos.last() {
             if let Some(file_id) = best["file_id"].as_str() {
-                if let Ok(url) = download_file(client, token, file_id).await {
-                    parts.push(ContentPart::Image {
-                        image_url: url,
-                        url: String::new(),
-                        mime: "image/jpeg".into(),
-                    });
-                } else {
-                    parts.push(ContentPart::text("[图片]"));
+                match fetch_telegram_file(client, token, file_id, "image.jpg").await {
+                    Ok(p) => parts.push(p),
+                    Err(_) => parts.push(ContentPart::text("[图片]")),
                 }
             }
         }
@@ -199,37 +231,24 @@ async fn native_from_message(
     if let Some(doc) = msg.get("document") {
         if let Some(file_id) = doc["file_id"].as_str() {
             let name = doc["file_name"].as_str().unwrap_or("file").to_string();
-            if let Ok(url) = download_file(client, token, file_id).await {
-                parts.push(ContentPart::File {
-                    file_url: url,
-                    file_id: file_id.into(),
-                    name,
-                });
-            } else {
-                parts.push(ContentPart::text(format!("[文件] {name}")));
+            match fetch_telegram_file(client, token, file_id, &name).await {
+                Ok(p) => parts.push(p),
+                Err(_) => parts.push(ContentPart::text(format!("[文件] {name}"))),
             }
         }
     }
     for key in ["voice", "audio"] {
         if let Some(fid) = msg.get(key).and_then(|v| v["file_id"].as_str()) {
-            match download_file(client, token, fid).await {
-                Ok(url) => parts.push(ContentPart::Audio {
-                    audio_url: url,
-                    url: String::new(),
-                    mime: "audio/ogg".into(),
-                }),
+            match fetch_telegram_file(client, token, fid, "voice.ogg").await {
+                Ok(p) => parts.push(p),
                 Err(_) => parts.push(ContentPart::text("[语音]")),
             }
         }
     }
     for key in ["video", "video_note"] {
         if let Some(fid) = msg.get(key).and_then(|v| v["file_id"].as_str()) {
-            match download_file(client, token, fid).await {
-                Ok(url) => parts.push(ContentPart::Video {
-                    video_url: url,
-                    url: String::new(),
-                    mime: "video/mp4".into(),
-                }),
+            match fetch_telegram_file(client, token, fid, "video.mp4").await {
+                Ok(p) => parts.push(p),
                 Err(_) => parts.push(ContentPart::text("[视频]")),
             }
         }
@@ -261,7 +280,12 @@ async fn native_from_message(
     Ok(Some(env))
 }
 
-async fn download_file(client: &reqwest::Client, token: &str, file_id: &str) -> Result<String> {
+async fn fetch_telegram_file(
+    client: &reqwest::Client,
+    token: &str,
+    file_id: &str,
+    name: &str,
+) -> Result<ContentPart> {
     let meta: Value = client
         .get(format!("{API}/bot{token}/getFile?file_id={file_id}"))
         .send()
@@ -277,21 +301,18 @@ async fn download_file(client: &reqwest::Client, token: &str, file_id: &str) -> 
         .await?
         .bytes()
         .await?;
-    if bytes.len() > MAX_INLINE_MEDIA_BYTES {
-        return Err(Error::msg("telegram file over 2MB inline cap"));
+    if bytes.len() > super::xfer::FETCH_CAP {
+        return Err(Error::msg("telegram file over cap"));
     }
-    let mime = if path.ends_with(".png") {
-        "image/png"
-    } else if path.ends_with(".gif") {
-        "image/gif"
-    } else if path.ends_with(".webp") {
-        "image/webp"
-    } else if path.ends_with(".mp4") {
-        "video/mp4"
-    } else {
-        "image/jpeg"
+    let kind = super::xfer::kind_from_name(name);
+    let mime = super::xfer::guess_mime(name, kind).to_string();
+    let blob = super::xfer::Blob {
+        kind,
+        mime,
+        name: name.to_string(),
+        bytes: bytes.to_vec(),
     };
-    Ok(data_uri(mime, &bytes))
+    super::xfer::blob_to_inbound_part(blob)
 }
 
 fn is_mentioned(text: &str, bot_username: &str) -> bool {

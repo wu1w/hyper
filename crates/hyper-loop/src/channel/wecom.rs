@@ -247,7 +247,12 @@ async fn run_once(
                 let payload: Value = serde_json::from_str(&text).unwrap_or(Value::Null);
                 let cmd = payload.get("cmd").and_then(Value::as_str).unwrap_or("");
                 if cmd == CMD_CALLBACK || cmd == CMD_LEGACY_CALLBACK {
-                    if let Some(env) = native_from_callback(ep, &payload) {
+                    if let Some(mut env) = native_from_callback(ep, &payload) {
+                        super::xfer::hydrate_http_parts(&mut env.content_parts).await;
+                        env.text = super::xfer::query_text_of(&env.content_parts);
+                        if env.content_parts.is_empty() {
+                            continue;
+                        }
                         if let Err(e) = mgr.ingest(env).await {
                             eprintln!("hyper wecom ingest: {e}");
                         }
@@ -271,16 +276,74 @@ pub async fn send(
     let Some((bot_id, _)) = credentials(ep) else {
         return Err(Error::msg("wecom send: missing credentials"));
     };
-    let text = super::outbound::parts_to_text(parts);
-    if text.trim().is_empty() {
-        return Ok(());
-    }
-    let frame = outbound_frame(env, &text)?;
     let tx =
         sender_for(&bot_id).ok_or_else(|| Error::msg("wecom send: websocket not connected"))?;
-    tx.send(frame)
-        .map_err(|_| Error::msg("wecom send: websocket not connected"))?;
+    let spoken = super::xfer::spoken_text(parts);
+    let mut notes = Vec::new();
+    let mut image_urls = Vec::new();
+    for part in parts {
+        if matches!(part, ContentPart::Text { .. }) {
+            continue;
+        }
+        if let Some(url) = super::xfer::http_src(part) {
+            image_urls.push(url.to_string());
+        } else if let Some(line) = part.fallback_line() {
+            notes.push(line);
+        }
+    }
+    let mut caption = spoken;
+    if !notes.is_empty() {
+        if !caption.is_empty() {
+            caption.push('\n');
+        }
+        caption.push_str(&notes.join("\n"));
+    }
+    if !caption.trim().is_empty() {
+        tx.send(outbound_frame(env, &caption)?)
+            .map_err(|_| Error::msg("wecom send: websocket not connected"))?;
+    }
+    for url in image_urls {
+        tx.send(outbound_image_frame(env, &url)?)
+            .map_err(|_| Error::msg("wecom send: websocket not connected"))?;
+    }
     Ok(())
+}
+
+fn outbound_image_frame(env: &NativePayload, url: &str) -> Result<Value> {
+    let reply_req_id = env
+        .meta
+        .get("reply_req_id")
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .trim();
+    let image = json!({
+        "url": url,
+        "picurl": url,
+        "pic_url": url,
+    });
+    if !reply_req_id.is_empty() {
+        return Ok(json!({
+            "cmd": CMD_RESPOND,
+            "headers": {"req_id": reply_req_id},
+            "body": {
+                "msgtype": "image",
+                "image": image,
+            }
+        }));
+    }
+    let chat_id = env.chat_id();
+    if chat_id.is_empty() {
+        return Err(Error::msg("wecom send: missing chat_id"));
+    }
+    Ok(json!({
+        "cmd": CMD_SEND,
+        "headers": {"req_id": uuid::Uuid::new_v4().to_string()},
+        "body": {
+            "chatid": chat_id,
+            "msgtype": "image",
+            "image": image,
+        }
+    }))
 }
 
 fn outbound_frame(env: &NativePayload, text: &str) -> Result<Value> {
@@ -334,13 +397,20 @@ fn native_from_callback(ep: &ChannelEndpoint, payload: &Value) -> Option<NativeP
         .and_then(Value::as_str)
         .unwrap_or("")
         .eq_ignore_ascii_case("group");
-    let mut text = extract_text(body);
+    let mut parts = extract_parts(body);
     if is_group {
-        text = strip_leading_mention(&text);
+        if let Some(ContentPart::Text { text }) = parts.first_mut() {
+            *text = strip_leading_mention(text);
+        }
     }
-    if text.is_empty() {
+    parts.retain(|p| match p.as_text() {
+        Some(t) => !t.trim().is_empty(),
+        None => true,
+    });
+    if parts.is_empty() {
         return None;
     }
+    let text = super::xfer::query_text_of(&parts);
     let msgid = {
         let m = js_str(&body["msgid"]).trim().to_string();
         if m.is_empty() {
@@ -358,7 +428,7 @@ fn native_from_callback(ep: &ChannelEndpoint, payload: &Value) -> Option<NativeP
         },
         sender_id: sender_id.clone(),
         sender_name: sender_id,
-        content_parts: vec![ContentPart::text(&text)],
+        content_parts: parts,
         text,
         ..NativePayload::default()
     };
@@ -374,12 +444,25 @@ fn native_from_callback(ep: &ChannelEndpoint, payload: &Value) -> Option<NativeP
 }
 
 fn extract_text(body: &Value) -> String {
+    extract_parts(body)
+        .iter()
+        .filter_map(|p| {
+            p.as_text()
+                .map(|s| s.to_string())
+                .or_else(|| p.fallback_line())
+        })
+        .filter(|s| !s.is_empty())
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+fn extract_parts(body: &Value) -> Vec<ContentPart> {
     let msgtype = body
         .get("msgtype")
         .and_then(Value::as_str)
         .unwrap_or("")
         .to_ascii_lowercase();
-    let mut parts: Vec<String> = Vec::new();
+    let mut parts: Vec<ContentPart> = Vec::new();
     if msgtype == "mixed" {
         if let Some(items) = body["mixed"]["msg_item"].as_array() {
             for item in items {
@@ -395,10 +478,10 @@ fn extract_text(body: &Value) -> String {
                     let c = js_str(&item["text"]["content"]);
                     let c = c.trim();
                     if !c.is_empty() {
-                        parts.push(c.to_string());
+                        parts.push(ContentPart::text(c));
                     }
                 } else if item_type == "image" {
-                    parts.push("[图片]".into());
+                    parts.push(wecom_image_part(item));
                 }
             }
         }
@@ -406,20 +489,20 @@ fn extract_text(body: &Value) -> String {
         let c = js_str(&body["text"]["content"]);
         let c = c.trim();
         if !c.is_empty() {
-            parts.push(c.to_string());
+            parts.push(ContentPart::text(c));
         }
     }
     if msgtype == "voice" {
         let c = js_str(&body["voice"]["content"]);
         let c = c.trim();
         if !c.is_empty() {
-            parts.push(c.to_string());
+            parts.push(ContentPart::text(c));
         } else {
-            parts.push("[语音]".into());
+            parts.push(ContentPart::text("[语音]"));
         }
     }
     if msgtype == "image" {
-        parts.push("[图片]".into());
+        parts.push(wecom_image_part(body));
     }
     if msgtype == "file" || msgtype == "video" {
         let name = js_str(&body[msgtype.as_str()]["filename"]);
@@ -428,15 +511,62 @@ fn extract_text(body: &Value) -> String {
         } else {
             name
         };
-        if msgtype == "video" {
-            parts.push("[视频]".into());
+        let url = first_http(&[
+            js_str(&body[msgtype.as_str()]["url"]),
+            js_str(&body[msgtype.as_str()]["file_url"]),
+        ]);
+        if let Some(url) = url {
+            if msgtype == "video" {
+                parts.push(ContentPart::Video {
+                    video_url: url,
+                    url: String::new(),
+                    mime: "video/mp4".into(),
+                });
+            } else {
+                parts.push(ContentPart::File {
+                    file_url: url,
+                    file_id: String::new(),
+                    name: if name.is_empty() { "file".into() } else { name },
+                });
+            }
+        } else if msgtype == "video" {
+            parts.push(ContentPart::text("[视频]"));
         } else if name.is_empty() {
-            parts.push("[文件]".into());
+            parts.push(ContentPart::text("[文件]"));
         } else {
-            parts.push(format!("[文件] {name}"));
+            parts.push(ContentPart::text(format!("[文件] {name}")));
         }
     }
-    parts.join("\n")
+    parts
+}
+
+fn wecom_image_part(obj: &Value) -> ContentPart {
+    if let Some(url) = first_http(&[
+        js_str(&obj["image"]["url"]),
+        js_str(&obj["image"]["picurl"]),
+        js_str(&obj["image"]["pic_url"]),
+        js_str(&obj["url"]),
+        js_str(&obj["picurl"]),
+    ]) {
+        ContentPart::Image {
+            image_url: url,
+            url: String::new(),
+            mime: "image/jpeg".into(),
+        }
+    } else {
+        ContentPart::text("[图片]")
+    }
+}
+
+fn first_http(vals: &[String]) -> Option<String> {
+    vals.iter().find_map(|s| {
+        let t = s.trim();
+        if t.starts_with("http://") || t.starts_with("https://") {
+            Some(t.to_string())
+        } else {
+            None
+        }
+    })
 }
 
 fn strip_leading_mention(text: &str) -> String {
@@ -558,6 +688,16 @@ mod tests {
         assert_eq!(extract_text(&img), "[图片]");
         let empty = json!({"msgtype":"text","text":{"content":"  "}});
         assert!(extract_text(&empty).is_empty());
+        let with_url = json!({
+            "msgtype": "image",
+            "image": {"url": "https://cdn.example/a.png"}
+        });
+        let parts = extract_parts(&with_url);
+        assert!(matches!(parts[0], ContentPart::Image { .. }));
+        assert_eq!(
+            super::super::xfer::http_src(&parts[0]),
+            Some("https://cdn.example/a.png")
+        );
     }
 
     #[test]
@@ -629,6 +769,17 @@ mod tests {
         let env = native_from_callback(&ep, &payload).unwrap();
         assert_eq!(env.meta["chat_id"], json!("u2"));
         assert_eq!(env.meta["is_group"], json!(false));
+    }
+
+    #[test]
+    fn outbound_image_frame_respond() {
+        let mut env = NativePayload::default();
+        env.meta.insert("reply_req_id".into(), json!("req-abc"));
+        env.meta.insert("chat_id".into(), json!("wr-group"));
+        let frame = outbound_image_frame(&env, "https://cdn.example/a.png").unwrap();
+        assert_eq!(frame["cmd"], CMD_RESPOND);
+        assert_eq!(frame["body"]["msgtype"], "image");
+        assert_eq!(frame["body"]["image"]["url"], "https://cdn.example/a.png");
     }
 
     #[test]

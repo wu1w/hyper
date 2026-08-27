@@ -160,11 +160,25 @@ impl ContentPart {
     pub fn fallback_line(&self) -> Option<String> {
         match self {
             Self::Text { .. } => None,
-            Self::Image { .. } => self.image_src().map(|u| format!("[Image: {u}]")),
-            Self::Video { video_url, url, .. } => nonempty(video_url)
-                .or_else(|| nonempty(url))
-                .map(|u| format!("[Video: {u}]")),
-            Self::Audio { .. } => Some("[Audio]".into()),
+            Self::Image { .. } => {
+                let u = self.image_src().unwrap_or("");
+                if u.starts_with("data:") || u.len() > 180 {
+                    Some("[图片]".into())
+                } else if u.is_empty() {
+                    Some("[图片]".into())
+                } else {
+                    Some(format!("[Image: {u}]"))
+                }
+            }
+            Self::Video { video_url, url, .. } => {
+                let u = nonempty(video_url).or_else(|| nonempty(url)).unwrap_or("");
+                if u.starts_with("data:") || u.is_empty() {
+                    Some("[视频]".into())
+                } else {
+                    Some(format!("[Video: {u}]"))
+                }
+            }
+            Self::Audio { .. } => Some("[语音]".into()),
             Self::File {
                 file_url,
                 file_id,
@@ -178,7 +192,13 @@ impl ContentPart {
                 } else {
                     nonempty(file_url).unwrap_or("file")
                 };
-                Some(format!("[File: {label}]"))
+                if file_url.starts_with("data:") {
+                    Some(format!("[File: {label}]"))
+                } else if !file_url.trim().is_empty() {
+                    Some(format!("[File: {label}] ({file_url})"))
+                } else {
+                    Some(format!("[File: {label}]"))
+                }
             }
         }
     }

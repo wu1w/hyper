@@ -15,7 +15,6 @@ use crate::session::SessionMode;
 
 use super::envelope::{ContentPart, NativePayload};
 use super::manager::ChannelManager;
-use super::outbound::reply_text;
 use super::router::SessionRouter;
 use super::ChannelEndpoint;
 
@@ -150,6 +149,7 @@ async fn agent_inbound(
     env: NativePayload,
 ) -> Result<Vec<ContentPart>> {
     let policy = SessionMode::Agent.default_policy_with(&cfg.policy);
+    let ws = workspace.clone();
     let mut opts = RunOpts::from_config(cfg, workspace);
     opts.print = false;
     opts.persist_session = true;
@@ -174,11 +174,11 @@ async fn agent_inbound(
     let completer = TransportCompleter::connect(cfg, policy).await?;
     let mut agent = Agent::new(completer, opts)?;
     let out = agent.run_message(env.to_chat_message()).await?;
-    if out.text.trim().is_empty() {
-        Ok(Vec::new())
-    } else {
-        Ok(reply_text(out.text))
-    }
+    Ok(crate::channel::xfer::reply_parts(
+        &out.text,
+        &ws,
+        &out.channel_files,
+    ))
 }
 
 #[cfg(test)]

@@ -77,6 +77,9 @@ impl<C: Completer> Agent<C> {
                 guard_notes.extend(self.edit_guard.observe(&call.name, &call.arguments, prior));
                 if matches!(dispatch_name(&call.name), "edit" | "write") {
                     if let Some(path) = fs_tool_path(&call.name, &call.arguments) {
+                        if crate::channel::xfer::is_sendable_rel(&path) {
+                            self.channel_files.push(path.clone());
+                        }
                         if let Some(idx) = &self.code_index {
                             idx.refresh(&self.workspace, &path);
                             if verify::is_code_path(&path) && !verify::is_test_path(&path) {
@@ -647,15 +650,7 @@ impl<C: Completer> Agent<C> {
 
     pub(crate) fn commit_tool(&mut self, name: &str, response: ToolResponse) {
         self.remember_tool_output(&response.joined_text());
-        let stored: Vec<crate::session::StoredMedia> = response
-            .media
-            .iter()
-            .map(|p| crate::session::StoredMedia {
-                kind: p.kind.as_str().into(),
-                mime: p.mime.clone(),
-                url: p.url.clone(),
-            })
-            .collect();
+        let stored = self.persist_turn_media(&response.media);
         if response.media.is_empty() {
             self.messages
                 .push(ChatMessage::tool(&response.id, response.joined_text()));

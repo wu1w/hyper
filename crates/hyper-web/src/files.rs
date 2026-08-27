@@ -457,6 +457,9 @@ fn walk(
             continue;
         }
         let path = ent.path();
+        if hyper_loop::is_reparse_or_symlink(&path) {
+            continue;
+        }
         let rel = path
             .strip_prefix(root)
             .unwrap_or(&path)

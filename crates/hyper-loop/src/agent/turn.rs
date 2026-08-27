@@ -36,15 +36,7 @@ impl<C: Completer> Agent<C> {
         let mut msg = msg;
         msg.content = Some(text.clone());
         // 用户附带的媒体与 tool 侧同样落盘，否则 resume 重建后丢图。
-        let stored: Vec<crate::session::StoredMedia> = msg
-            .parts
-            .iter()
-            .map(|p| crate::session::StoredMedia {
-                kind: p.kind.as_str().into(),
-                mime: p.mime.clone(),
-                url: p.url.clone(),
-            })
-            .collect();
+        let stored = self.persist_turn_media(&msg.parts);
         let stubbed = sticky::stub_expired_notes(&mut self.messages);
         self.note_stubbed(stubbed);
         self.messages.push(msg);
@@ -73,6 +65,7 @@ impl<C: Completer> Agent<C> {
         self.tool_evidence.clear();
         self.recap_retries = 0;
         self.read_paths.clear();
+        self.channel_files.clear();
         self.observed_paths = observed_from_messages(&self.messages, &self.workspace);
         let user = self.last_real_user().to_string();
         self.edit_guard.reset_turn(&user);
@@ -376,7 +369,7 @@ impl<C: Completer> Agent<C> {
         );
     }
 
-    fn persist_turn_media(
+    pub(crate) fn persist_turn_media(
         &self,
         parts: &[crate::media::MediaPart],
     ) -> Vec<crate::session::StoredMedia> {
@@ -770,6 +763,7 @@ impl<C: Completer> Agent<C> {
             session_id: self.session_id.clone(),
             pending_steer: take_steer(&self.steer),
             streamed_text: self.stdio.text_streamed(),
+            channel_files: std::mem::take(&mut self.channel_files),
         })
     }
     pub(crate) fn note(&self, line: &str) {

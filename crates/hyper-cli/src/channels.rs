@@ -4,7 +4,7 @@ use std::process::ExitCode;
 use std::sync::Arc;
 
 use anyhow::{Context, Result};
-use hyper_loop::channel::{reply_text, run_channels, ContentPart, NativePayload};
+use hyper_loop::channel::{reply_parts, reply_text, run_channels, ContentPart, NativePayload};
 use hyper_loop::config::Config;
 use hyper_loop::session::SessionMode;
 use hyper_loop::slash::{low_precision_text, mcp_text, parse_slash_with_periphery, skills_text};
@@ -153,6 +153,7 @@ async fn handle_inbound(
         }
     }
 
+    let ws = workspace.clone();
     let mut opts = RunOpts::from_config(&cfg, workspace);
     opts.print = false;
     opts.session_id = if env.session_id.is_empty() {
@@ -194,11 +195,7 @@ async fn handle_inbound(
     let completer = TransportCompleter::connect(&cfg, policy).await?;
     let mut agent = Agent::new(completer, opts)?;
     let out = agent.run_message(msg).await?;
-    if out.text.is_empty() {
-        Ok(Vec::new())
-    } else {
-        Ok(reply_text(out.text))
-    }
+    Ok(reply_parts(&out.text, &ws, &out.channel_files))
 }
 
 fn local_slash_text(cmd: &hyper_loop::SlashCmd) -> Option<String> {

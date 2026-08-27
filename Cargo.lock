@@ -1726,6 +1726,7 @@ dependencies = [
 name = "hyper-loop"
 version = "0.1.0"
 dependencies = [
+ "aes",
  "aes-gcm",
  "base64 0.22.1",
  "calamine",
@@ -1735,6 +1736,7 @@ dependencies = [
  "futures",
  "image",
  "libc",
+ "md-5",
  "minijinja",
  "minijinja-contrib",
  "pdf-extract",

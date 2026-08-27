@@ -327,6 +327,9 @@ fn walk_files(dir: &Path, root: &Path, visit: &mut dyn FnMut(&str, &Path) -> boo
                 if SKIP_DIR.contains(&name_s.as_ref()) {
                     continue;
                 }
+                if super::path::is_reparse_or_symlink(&path) {
+                    continue;
+                }
                 stack.push(path);
                 continue;
             }

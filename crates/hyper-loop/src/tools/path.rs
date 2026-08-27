@@ -9,6 +9,27 @@ use std::path::{Component, Path, PathBuf};
 
 use crate::error::Result;
 
+/// True for symlinks and Windows directory junctions. Walkers must skip these
+/// or a junction under the workspace (or a user profile) can recurse into
+/// AppData / the whole volume and freeze the machine.
+pub fn is_reparse_or_symlink(path: &Path) -> bool {
+    let Ok(meta) = std::fs::symlink_metadata(path) else {
+        return false;
+    };
+    if meta.file_type().is_symlink() {
+        return true;
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::MetadataExt;
+        const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x400;
+        if meta.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
+            return true;
+        }
+    }
+    false
+}
+
 #[derive(Clone, Debug)]
 pub struct Workspace {
     root: PathBuf,
@@ -235,5 +256,27 @@ mod tests {
 
         std::fs::remove_dir_all(&d).ok();
         std::fs::remove_dir_all(&outside).ok();
+    }
+
+    #[test]
+    fn reparse_is_false_for_regular_paths() {
+        let d = temp_dir("reparse-reg");
+        let f = d.join("a.txt");
+        std::fs::write(&f, "x").unwrap();
+        assert!(!is_reparse_or_symlink(&f));
+        assert!(!is_reparse_or_symlink(&d));
+        std::fs::remove_dir_all(&d).ok();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn reparse_detects_symlink() {
+        let d = temp_dir("reparse-link");
+        let f = d.join("a.txt");
+        std::fs::write(&f, "x").unwrap();
+        let link = d.join("l");
+        std::os::unix::fs::symlink(&f, &link).unwrap();
+        assert!(is_reparse_or_symlink(&link));
+        std::fs::remove_dir_all(&d).ok();
     }
 }
