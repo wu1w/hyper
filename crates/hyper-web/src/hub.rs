@@ -146,6 +146,9 @@ impl AppState {
             ev_tx,
             bus: bus.clone(),
         }));
+        if let Ok(h) = Config::home_dir() {
+            hyper_loop::subagent::reap_orphans(&h.join("sessions"));
+        }
         let pending_state = inner.clone();
         let bus_p = bus.clone();
         tokio::spawn(async move {
@@ -462,25 +465,59 @@ fn spawn_channel_watch(inner: Arc<Mutex<Inner>>) {
                     eprintln!("hyper {}: starting in-process client ({})", ep.kind, ep.id);
                     jobs.push(tokio::spawn(async move {
                         let id = ep.id.clone();
-                        // serve 正常返回或报错都算停摆,同步进 runtime 状态
-                        let detail =
-                            match hyper_loop::channel::serve_endpoint(cfg, workspace, ep).await {
-                                Ok(()) => "客户端已退出(无错误信息)".to_string(),
-                                Err(e) => {
-                                    eprintln!("hyper channel: {e}");
-                                    e.to_string()
+                        let kind = ep.kind.clone();
+                        // Adapter exit / panic / lock fight: backoff and start again.
+                        // Fingerprint change aborts this task; gen guards stale writes.
+                        hyper_loop::channel::keep_client_watched(
+                            &kind,
+                            &id,
+                            {
+                                let cfg = cfg.clone();
+                                let workspace = workspace.clone();
+                                let ep = ep.clone();
+                                move || {
+                                    hyper_loop::channel::serve_endpoint(
+                                        cfg.clone(),
+                                        workspace.clone(),
+                                        ep.clone(),
+                                    )
                                 }
-                            };
-                        let mut g = inner_ep.lock().await;
-                        if g.channel_gen == gen {
-                            g.channel_runtime.insert(
-                                id,
-                                ChannelRuntime {
-                                    state: "error",
-                                    detail: Some(clip_chars(&detail, 300)),
-                                },
-                            );
-                        }
+                            },
+                            {
+                                let inner_ep = inner_ep.clone();
+                                let id = id.clone();
+                                move |st| {
+                                    let inner_ep = inner_ep.clone();
+                                    let id = id.clone();
+                                    async move {
+                                        let (state, detail) = match st {
+                                            hyper_loop::channel::ClientWatch::Running => {
+                                                ("running", None)
+                                            }
+                                            hyper_loop::channel::ClientWatch::Retry {
+                                                detail,
+                                                wait_secs,
+                                            } => (
+                                                "error",
+                                                Some(clip_chars(
+                                                    &format!("retry in {wait_secs}s: {detail}"),
+                                                    300,
+                                                )),
+                                            ),
+                                            hyper_loop::channel::ClientWatch::Fatal { detail } => {
+                                                ("error", Some(clip_chars(&detail, 300)))
+                                            }
+                                        };
+                                        let mut g = inner_ep.lock().await;
+                                        if g.channel_gen == gen {
+                                            g.channel_runtime
+                                                .insert(id, ChannelRuntime { state, detail });
+                                        }
+                                    }
+                                }
+                            },
+                        )
+                        .await;
                     }));
                 }
             }

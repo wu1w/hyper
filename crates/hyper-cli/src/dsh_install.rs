@@ -97,7 +97,8 @@ fn find_plugin_dir() -> Result<PathBuf> {
             candidates.extend(walk_parents(dir));
         }
     }
-    candidates.push(PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../plugins/dsh-plugin-hyper"));
+    candidates
+        .push(PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../plugins/dsh-plugin-hyper"));
     if let Ok(home) = Config::home_dir() {
         candidates.push(home.join(PLUGIN_PACKAGE));
     }
@@ -148,7 +149,9 @@ fn resolve_hyper_bin(dry_run: bool) -> Result<PathBuf> {
         bail!("hyper not on PATH");
     }
     let Some(root) = repo else {
-        bail!("hyper not on PATH and no checkout Cargo.toml found; cargo install -p hyper-cli first");
+        bail!(
+            "hyper not on PATH and no checkout Cargo.toml found; cargo install -p hyper-cli first"
+        );
     };
     eprintln!("building hyper (cargo build -p hyper-cli --release)…");
     let status = Command::new("cargo")

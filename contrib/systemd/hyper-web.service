@@ -1,0 +1,27 @@
+# Headless Hyper on a home server.
+# Copy, fill User / ExecStart / WorkingDirectory, then:
+#   sudo cp contrib/systemd/hyper-web.service /etc/systemd/system/
+#   sudo systemctl daemon-reload
+#   sudo systemctl enable --now hyper-web
+#
+# User unit (no root): copy to ~/.config/systemd/user/ and use %h paths.
+# Do not also run `hyper --channels` — this process already long-polls.
+
+[Unit]
+Description=Hyper web console
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+# User=william
+# WorkingDirectory=/home/william
+ExecStart=/usr/local/bin/hyper web --no-open
+# cargo install: ExecStart=%h/.cargo/bin/hyper web --no-open
+# LAN console:   ExecStart=... web --bind 0.0.0.0:3848 --allow-lan --no-open
+Restart=always
+RestartSec=5
+# EnvironmentFile=-%h/.grok-hyper/hyper.env
+
+[Install]
+WantedBy=multi-user.target

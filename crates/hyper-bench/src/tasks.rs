@@ -333,7 +333,8 @@ mod tests {
 
     #[test]
     fn copy_to_temp_stays_independent() {
-        let tmp = std::env::temp_dir().join(format!("hyper-bench-copy-test-{}", std::process::id()));
+        let tmp =
+            std::env::temp_dir().join(format!("hyper-bench-copy-test-{}", std::process::id()));
         copy_task(&TASKS[0], &tmp).unwrap();
         let main = tmp.join("src/main.rs");
         fs::write(&main, "fn main() { println!(\"new\"); }\n").unwrap();

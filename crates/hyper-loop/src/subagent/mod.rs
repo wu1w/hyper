@@ -25,7 +25,7 @@ mod worktree;
 
 pub use policy::{deny_child_tool, CapabilityMode, SubagentType};
 pub use registry::{
-    get, list_for_parent, running_count, snapshot_json, ChildRecord, MAX_CONCURRENT,
+    get, list_for_parent, reap_orphans, running_count, snapshot_json, ChildRecord, MAX_CONCURRENT,
 };
 pub use spawn::{register_live_runner, ChildOutcome, SpawnReq};
 pub use worktree::Isolation;
@@ -109,7 +109,7 @@ pub fn filter_tool(call: &ToolCall, child: Option<&ChildCtx>) -> Option<ToolResp
 pub async fn dispatch(call: &ToolCall, ctx: &DispatchCtx) -> ToolResponse {
     match crate::tools_schema::dispatch_name(&call.name) {
         "task" => dispatch_task(call, ctx).await,
-        "awaitshell" => dispatch_await(call).await,
+        "awaitshell" => dispatch_await(call, ctx).await,
         _ => match call.name.as_str() {
             "wait_commands_or_subagents" => dispatch_wait_many(call).await,
             "kill_command_or_subagent" => dispatch_kill(call),
@@ -186,6 +186,15 @@ async fn dispatch_task(call: &ToolCall, ctx: &DispatchCtx) -> ToolResponse {
     };
     let id = format!("{parent_id}-{child_short}");
 
+    let persist_dir = if ctx.persist {
+        ctx.session_dir.clone().or_else(|| {
+            crate::config::Config::home_dir()
+                .ok()
+                .map(|h| h.join("sessions"))
+        })
+    } else {
+        None
+    };
     let handle = match registry::insert_running(
         id.clone(),
         parent_id.clone(),
@@ -193,6 +202,7 @@ async fn dispatch_task(call: &ToolCall, ctx: &DispatchCtx) -> ToolResponse {
         kind,
         cap,
         isolation,
+        persist_dir,
     ) {
         Ok(h) => h,
         Err(e) => return ToolResponse::text(&call.id, e, ToolState::Error),
@@ -223,7 +233,16 @@ async fn resume_child(
     model: Option<String>,
     cwd: PathBuf,
 ) -> ToolResponse {
-    let Some(prev) = registry::get(resume) else {
+    let persist_dir = if ctx.persist {
+        ctx.session_dir.clone().or_else(|| {
+            crate::config::Config::home_dir()
+                .ok()
+                .map(|h| h.join("sessions"))
+        })
+    } else {
+        None
+    };
+    let Some(prev) = registry::get_or_load(resume, persist_dir.as_deref()) else {
         return ToolResponse::text(
             &call.id,
             format!("Error: no subagent `{resume}` to resume."),
@@ -246,6 +265,7 @@ async fn resume_child(
         prev.kind,
         prev.capability,
         prev.isolation,
+        persist_dir,
     ) {
         Ok(h) => h,
         Err(e) => return ToolResponse::text(&call.id, e, ToolState::Error),
@@ -374,7 +394,7 @@ fn child_transcript_exists(ctx: &DispatchCtx, id: &str) -> bool {
     Path::new(&dir.join(format!("{id}.jsonl"))).is_file()
 }
 
-async fn dispatch_await(call: &ToolCall) -> ToolResponse {
+async fn dispatch_await(call: &ToolCall, ctx: &DispatchCtx) -> ToolResponse {
     let id = arg_str(&call.arguments, "task_id")
         .or_else(|| arg_str(&call.arguments, "shell_id"))
         .or_else(|| arg_str(&call.arguments, "id"))
@@ -389,6 +409,14 @@ async fn dispatch_await(call: &ToolCall) -> ToolResponse {
     let timeout = arg_u64(&call.arguments, "timeout_ms")
         .or_else(|| arg_u64(&call.arguments, "block_until_ms"))
         .map(Duration::from_millis);
+    if registry::get(&id).is_none() {
+        let dir = ctx.session_dir.clone().or_else(|| {
+            crate::config::Config::home_dir()
+                .ok()
+                .map(|h| h.join("sessions"))
+        });
+        let _ = registry::get_or_load(&id, dir.as_deref());
+    }
     let rec = registry::wait(&id, timeout).await;
     if rec.is_some() {
         return format_record(&call.id, rec);
@@ -948,6 +976,52 @@ mod tests {
             registry::get(&id).map(|r| r.status),
             Some(registry::ChildStatus::Done)
         );
+    }
+
+    #[tokio::test]
+    async fn resume_after_process_restart_loads_disk() {
+        let _g = lock_registry_for_test().await;
+        registry::clear();
+        let dir = tmp();
+        let sess = dir.join("sessions");
+        std::fs::create_dir_all(&sess).unwrap();
+        let mut ctx = parent_ctx(dir.clone());
+        ctx.persist = true;
+        ctx.session_dir = Some(sess.clone());
+        let first = dispatch(
+            &call(
+                "Task",
+                json!({
+                    "prompt": "first pass",
+                    "description": "scan",
+                    "subagent_type": "explore"
+                }),
+            ),
+            &ctx,
+        )
+        .await;
+        assert_eq!(first.state, ToolState::Success, "{}", first.joined_text());
+        let id = extract_id(&first.joined_text());
+        assert!(!id.is_empty(), "{}", first.joined_text());
+        registry::clear();
+        assert!(registry::get(&id).is_none());
+        let second = dispatch(
+            &call(
+                "Task",
+                json!({
+                    "prompt": "follow up",
+                    "description": "scan",
+                    "subagent_type": "explore",
+                    "resume": id,
+                }),
+            ),
+            &ctx,
+        )
+        .await;
+        let text = second.joined_text();
+        assert_eq!(second.state, ToolState::Success, "{text}");
+        assert!(text.contains(&id), "{text}");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[tokio::test]

@@ -198,7 +198,7 @@ pub struct RunOpts {
     pub clarify_mode: bool,
     /// TUI permission bridge. None = YOLO (`--print`, tests).
     pub permit: Option<crate::permit::PermitHub>,
-    /// Blocking ask overlay. None = error unless `--print` / YOLO.
+    /// Blocking ask overlay. None = error unless `--print` / YOLO / IM Skip.
     pub clarify: Option<crate::clarify::ClarifyHub>,
     /// Parent Config snapshot for child Task (no `apply_env` in the child).
     pub config: Config,
@@ -276,8 +276,19 @@ impl RunOpts {
 
 /// Console-facing channels where a human watches progress live. IM bridges
 /// deliver per-message and would surface narration as chat spam.
-fn interactive_channel(channel: &str) -> bool {
+pub(crate) fn interactive_channel(channel: &str) -> bool {
     matches!(channel, "" | "cli" | "tui" | "web" | "console")
+}
+
+/// Hermes-shaped unattended caps: gateway `max_turns` 500, no hard wall while working.
+pub fn apply_unattended_policy(opts: &mut RunOpts, cfg: &crate::config::Config) {
+    if interactive_channel(&opts.channel) {
+        return;
+    }
+    if cfg.policy.max_steps_unattended > 0 {
+        opts.max_steps = cfg.policy.max_steps_unattended;
+    }
+    opts.max_wall = Duration::from_secs(cfg.policy.max_wall_unattended_seconds);
 }
 
 const DEFAULT_COMPACT_RATIO: f64 = 0.80;
@@ -403,6 +414,8 @@ pub struct Agent<C> {
     edit_guard: guard::EditGuard,
     /// Interactive channels get a one-line narration style card.
     narrate: bool,
+    /// Empty / cli / tui / web / console are interactive; IM skips AskQuestion.
+    channel: String,
     /// Workspace FTS for `search`. Built at session start; refreshed on write/edit.
     code_index: Option<CodeIndex>,
     /// Lossy stutter already received one hidden observation this user turn.

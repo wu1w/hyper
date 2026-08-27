@@ -310,7 +310,9 @@ mod tests {
         assert!(deny_child_tool(SubagentType::Explore, CapabilityMode::All, &desk).is_some());
         assert!(deny_child_tool(SubagentType::Plan, CapabilityMode::All, &desk).is_some());
         assert!(deny_child_tool(SubagentType::Office, CapabilityMode::All, &desk).is_some());
-        assert!(deny_child_tool(SubagentType::GeneralPurpose, CapabilityMode::All, &desk).is_some());
+        assert!(
+            deny_child_tool(SubagentType::GeneralPurpose, CapabilityMode::All, &desk).is_some()
+        );
         assert!(deny_child_tool(
             SubagentType::GeneralPurpose,
             CapabilityMode::ReadOnly,

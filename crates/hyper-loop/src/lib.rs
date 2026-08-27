@@ -64,7 +64,8 @@ mod live_native_think;
 mod live_scenes;
 
 pub use agent::{
-    Agent, AgentOutcome, HttpCompleter, ResponsesCompleter, RunOpts, ToolSet, TransportCompleter,
+    apply_unattended_policy, Agent, AgentOutcome, HttpCompleter, ResponsesCompleter, RunOpts,
+    ToolSet, TransportCompleter,
 };
 pub use transport::{GrokTransport, PublicAuth, ResolvedTransport, WireFormat};
 

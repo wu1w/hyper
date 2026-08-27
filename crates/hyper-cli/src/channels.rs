@@ -124,7 +124,8 @@ async fn handle_inbound(
                                 parts.push(ContentPart::text(out.caption));
                             }
                             for m in out.stored {
-                                let url = if m.url.starts_with("http") || m.url.starts_with("data:") {
+                                let url = if m.url.starts_with("http") || m.url.starts_with("data:")
+                                {
                                     m.url
                                 } else {
                                     workspace.join(&m.url).display().to_string()
@@ -160,6 +161,11 @@ async fn handle_inbound(
         env.session_id.clone()
     };
     opts.persist_session = true;
+    opts.channel = if env.channel.trim().is_empty() {
+        "im".into()
+    } else {
+        env.channel.clone()
+    };
     opts.session_mode = mode;
     opts.agents_md = agents_md;
     opts.agents_md_head = agents_md_head;
@@ -183,6 +189,7 @@ async fn handle_inbound(
             opts.tool_set = ToolSet::Agent;
         }
     }
+    hyper_loop::agent::apply_unattended_policy(&mut opts, &cfg);
 
     let completer = TransportCompleter::connect(&cfg, policy).await?;
     let mut agent = Agent::new(completer, opts)?;

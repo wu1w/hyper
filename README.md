@@ -34,7 +34,7 @@ hyper web
 
 浏览器会打开 `http://127.0.0.1:3848/`。也可在控制台 **模型** 页选接入方式（`grok login` 会话 / API key / 自定义 OpenAI 端点），模型名默认 `grok-4.6`。
 
-`hyper web --bind 127.0.0.1:3848 --no-open` 只起服务、不弹浏览器。
+`hyper web --bind 127.0.0.1:3848 --no-open` 只起服务、不弹浏览器。无头常驻用 `contrib/systemd/hyper-web.service`（`Restart=always`）。`hyper web` 已经带频道 poll，不要再叠一层 `hyper --channels`。
 
 确实要在可信局域网访问控制台时，显式使用 `hyper web --bind 0.0.0.0:3848 --allow-lan`。
 

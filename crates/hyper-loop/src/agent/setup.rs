@@ -32,6 +32,13 @@ use crate::tools_schema::{
 impl<C: Completer> Agent<C> {
     pub fn new(completer: C, opts: RunOpts) -> Result<Self> {
         crate::subagent::ensure_live_runner();
+        if opts.persist_session {
+            if let Some(dir) = &opts.session_dir {
+                crate::subagent::reap_orphans(dir);
+            } else if let Ok(h) = crate::config::Config::home_dir() {
+                crate::subagent::reap_orphans(&h.join("sessions"));
+            }
+        }
         let workspace = Workspace::open(&opts.workspace, opts.confined)?;
         let tool_set = if !opts.with_tools {
             ToolSet::None
@@ -207,6 +214,7 @@ impl<C: Completer> Agent<C> {
             window_overlay: opts.working_window_overlay,
             edit_guard: guard::EditGuard::new(),
             narrate: opts.narrate && !opts.print && interactive_channel(&opts.channel),
+            channel: opts.channel,
             code_index,
             stutter_nudged: false,
             dump_nudged: false,

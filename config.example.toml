@@ -35,9 +35,11 @@ default_effort = "auto"        # grok-4.6 → high; Qwen still medium. /think st
 max_think_tokens_low = 512
 max_think_tokens_medium = 2048
 max_think_tokens_xhigh = 4096
-max_steps = 80
+max_steps = 80                 # TUI / web console
 max_steps_think = 100
-max_wall_seconds = 1800
+max_wall_seconds = 1800        # interactive hard cap from turn start; 0 = off
+max_steps_unattended = 500     # IM / --channels (Hermes max_turns)
+max_wall_unattended_seconds = 0  # IM wall; 0 = none. Hermes times out on idle, not total runtime.
 low_precision = false        # on: tighter doom/parse/repeat guards for IQ4/Q3. Model does not see this.
 
 [features]

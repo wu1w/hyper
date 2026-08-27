@@ -473,11 +473,10 @@ mod tests {
                 .map(|b| (&b.kind, b.text.as_str()))
                 .collect::<Vec<_>>()
         );
-        assert!(
-            t.blocks()
-                .iter()
-                .any(|b| b.kind == Kind::Tool && b.text.contains("I'll read"))
-        );
+        assert!(t
+            .blocks()
+            .iter()
+            .any(|b| b.kind == Kind::Tool && b.text.contains("I'll read")));
     }
 
     #[test]

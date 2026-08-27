@@ -200,12 +200,9 @@ mod tests {
     }
 
     #[test]
-    fn timeout_zero_stops() {
-        let handler = StopHandler::with_gates(vec![Gate::timeout(Duration::ZERO)]);
-        match handler.run(&ctx("s")) {
-            GateDecision::Stop { reason } => assert!(reason.contains("time limit")),
-            other => panic!("{other:?}"),
-        }
+    fn timeout_zero_is_unlimited() {
+        let gate = TimeoutGate::new(Duration::ZERO);
+        assert!(matches!(gate.check(&ctx("s")), GateDecision::Bypass));
     }
 
     #[test]

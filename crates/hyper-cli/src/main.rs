@@ -656,7 +656,10 @@ async fn login_cmd(device_auth: bool) -> Result<ExitCode> {
 
     if device_auth {
         let device = request_device().await.context("device code")?;
-        eprintln!("Open {} and enter code {}", device.verification_uri, device.user_code);
+        eprintln!(
+            "Open {} and enter code {}",
+            device.verification_uri, device.user_code
+        );
         if !device.verification_uri_complete.is_empty() {
             eprintln!("or open {}", device.verification_uri_complete);
             open_system_browser(&device.verification_uri_complete);

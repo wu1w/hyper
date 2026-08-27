@@ -474,7 +474,10 @@ impl<C: Completer> Agent<C> {
             .as_ref()
             .map(|p| p.mode() == crate::permit::ApprovalMode::Yolo)
             .unwrap_or(false);
-        let decision = if self.print || yolo_permit {
+        // IM has no ClarifyHub. Skip (first option) so a hop does not stall;
+        // children without a hub still error (they should inherit the parent's).
+        let im_skip = self.child.is_none() && !super::interactive_channel(&self.channel);
+        let decision = if self.print || yolo_permit || im_skip {
             crate::clarify::ClarifyDecision::Skip
         } else if let Some(hub) = &self.clarify {
             hub.ask(ask.clone(), &self.cancel).await

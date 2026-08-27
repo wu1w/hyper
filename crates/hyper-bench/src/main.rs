@@ -633,7 +633,8 @@ mod tests {
     #[tokio::test]
     #[ignore = "live OpenAI-compat endpoint"]
     async fn live_quality_gate() {
-        let tmp = std::env::temp_dir().join(format!("hyper-bench-live-test-{}", std::process::id()));
+        let tmp =
+            std::env::temp_dir().join(format!("hyper-bench-live-test-{}", std::process::id()));
         fs::create_dir_all(&tmp).unwrap();
         let report = run_live(&tmp, false, load_probe())
             .await

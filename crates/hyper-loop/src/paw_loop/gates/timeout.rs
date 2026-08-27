@@ -1,4 +1,5 @@
 //! Wall-clock cap. QwenPaw `gates/limits.py` TimeoutGate.
+//! `Duration::ZERO` disables the cap (Hermes `gateway_timeout: 0`).
 
 use std::time::{Duration, Instant};
 
@@ -19,6 +20,9 @@ impl TimeoutGate {
     }
 
     pub fn check(&self, ctx: &GateCtx<'_>) -> GateDecision {
+        if self.max.is_zero() {
+            return GateDecision::Bypass;
+        }
         self.sessions
             .get_or_insert_with(ctx.session_id, Instant::now, |started| {
                 if started.elapsed() < self.max {

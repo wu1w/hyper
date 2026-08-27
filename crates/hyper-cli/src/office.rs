@@ -6,8 +6,8 @@ use std::process::ExitCode;
 use anyhow::{Context, Result};
 use hyper_loop::config::Config;
 use hyper_web::{
-    container_running, docker_cli_ok, docs_ready, ensure_office, persist_office_secret, stop_office,
-    EnsureOpts, CONTAINER,
+    container_running, docker_cli_ok, docs_ready, ensure_office, persist_office_secret,
+    stop_office, EnsureOpts, CONTAINER,
 };
 
 #[derive(Debug, clap::Subcommand)]
@@ -68,7 +68,10 @@ async fn status(office: &hyper_loop::config::OfficeConfig) -> Result<ExitCode> {
         if running { CONTAINER } else { "not running" }
     );
     eprintln!("docs_url      {}", office.docs_origin());
-    eprintln!("healthcheck   {}", if ready { "ready" } else { "not ready" });
+    eprintln!(
+        "healthcheck   {}",
+        if ready { "ready" } else { "not ready" }
+    );
     if !docker_ok {
         eprintln!("install Docker: https://docs.docker.com/get-docker/");
     } else if !running && !ready {

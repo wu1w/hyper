@@ -3495,6 +3495,59 @@ async fn child_ask_without_clarify_hub_errors() {
 }
 
 #[tokio::test]
+async fn im_ask_without_clarify_hub_skips() {
+    let dir = std::env::temp_dir().join(format!("grok-hyper-{}", uuid::Uuid::new_v4().simple()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let scripted = Scripted {
+        turns: Mutex::new(VecDeque::from([
+            turn_tool(
+                "AskQuestion",
+                json!({
+                    "prompt": "which?",
+                    "options": [
+                        {"id": "a", "label": "A"},
+                        {"id": "b", "label": "B"}
+                    ]
+                }),
+            ),
+            turn_text("done"),
+        ])),
+        meter: false,
+    };
+    let mut o = opts(&dir);
+    o.channel = "wechat".into();
+    let mut agent = Agent::new(scripted, o).unwrap();
+    let out = agent.run("ask").await.unwrap();
+    assert_eq!(out.text, "done");
+    let joined = agent
+        .messages()
+        .iter()
+        .filter_map(|m| m.content.clone())
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(joined.contains("skipped: using A"), "{joined}");
+    assert!(!joined.contains("interactive channel"), "{joined}");
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+#[test]
+fn unattended_im_uses_hermes_caps() {
+    let dir = std::env::temp_dir().join(format!("grok-hyper-{}", uuid::Uuid::new_v4().simple()));
+    let mut o = opts(&dir);
+    o.channel = "wechat".into();
+    crate::agent::apply_unattended_policy(&mut o, &Config::default());
+    assert_eq!(o.max_steps, 500);
+    assert!(o.max_wall.is_zero());
+    o.channel = "web".into();
+    o.max_steps = 80;
+    o.max_wall = std::time::Duration::from_secs(1800);
+    crate::agent::apply_unattended_policy(&mut o, &Config::default());
+    assert_eq!(o.max_steps, 80);
+    assert_eq!(o.max_wall, std::time::Duration::from_secs(1800));
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+#[tokio::test]
 async fn token_deltas_reach_sink_before_assistant_and_skip_jsonl() {
     let dir = std::env::temp_dir().join(format!("grok-hyper-{}", uuid::Uuid::new_v4().simple()));
     let sess = dir.join("sessions");
