@@ -11,7 +11,6 @@ use hyper_loop::session::{catalog, SessionLog};
 use hyper_loop::sidecar::{Dispatch, PolicyCaps, RpcRequest, SidecarOpts, SidecarSession};
 use hyper_loop::skills::SkillCatalog;
 use hyper_loop::slash::parse_slash_with_periphery;
-use hyper_loop::vendor;
 use hyper_loop::{
     new_session_id, Agent, ApprovalMode, CancelFlag, RunOpts, SessionMode, SlashCmd, ToolSet,
     TransportCompleter,
@@ -172,7 +171,6 @@ async fn real_main() -> Result<ExitCode> {
             profile,
             family,
         }) => {
-            vendor::verify_qwen38().context("qwen38 vendor set")?;
             let (mut cfg, cfg_path) = Config::load_or_init().context("load config")?;
             let overridden =
                 base_url.is_some() || model.is_some() || profile.is_some() || family.is_some();
@@ -271,7 +269,6 @@ async fn real_main() -> Result<ExitCode> {
                 prompt = stdin;
             }
 
-            vendor::verify_qwen38().ok();
             let (cfg, _) = Config::load_or_init().context("load config")?;
             let workspace = cli
                 .workspace

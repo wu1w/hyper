@@ -35,10 +35,10 @@ use crate::template::{is_hidden_user_text, wrap_tool_response, ChatMessage};
 #[path = "xai_compact.rs"]
 mod xai_compact;
 pub use xai_compact::{
-    chat_to_input_items, compact_for_transport, compact_url, is_xai_transport,
-    messages_to_responses_input, parse_official_compact_json, responses_input_after,
-    run_official_compact, should_official_compact, unwrap_qwen_hidden, OfficialCompaction,
-    TransportCompact, PRICE_CLIFF_TOKENS,
+    chat_to_input_items, compact_for_transport, compact_url, hoist_hidden_notes_before_query,
+    is_xai_transport, messages_to_responses_input, parse_official_compact_json,
+    responses_input_after, run_official_compact, should_official_compact, unwrap_qwen_hidden,
+    OfficialCompaction, TransportCompact, PRICE_CLIFF_TOKENS,
 };
 
 const INDEX_LINES: usize = 80;

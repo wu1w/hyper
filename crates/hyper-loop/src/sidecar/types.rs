@@ -178,7 +178,7 @@ impl Default for SidecarOpts {
             persist: false,
             effort_locked: false,
             model: String::new(),
-            family: Family::Qwen38,
+            family: Family::Grok46,
             window: CODING_CTX_TOKENS,
             busy: BusyPolicy::Interrupt,
             channels: ChannelsConfig::default(),

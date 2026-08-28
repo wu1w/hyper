@@ -129,7 +129,45 @@ pub fn compact_url(base_url: &str) -> String {
 /// `instructions` already carry grok-hyper) and wash platform prefix text
 /// out of other roles. Do not parse `encrypted_content`.
 pub fn messages_to_responses_input(messages: &[ChatMessage]) -> Vec<Value> {
-    messages.iter().flat_map(chat_to_input_items).collect()
+    hoist_hidden_notes_before_query(messages)
+        .iter()
+        .flat_map(chat_to_input_items)
+        .collect()
+}
+
+/// Qwen Jinja skipped `<tool_response>` wraps, so skill/plan/mcp cards were
+/// stored *after* the live user and still left `last_query_index` on the
+/// request. Grok Responses unwraps those cards into real user items, which
+/// made the card the last user turn. Move trailing hidden notes back in
+/// front of the query they belong to. Noise cards are still dropped later.
+pub fn hoist_hidden_notes_before_query(messages: &[ChatMessage]) -> Vec<ChatMessage> {
+    let mut out = Vec::with_capacity(messages.len());
+    let mut i = 0;
+    while i < messages.len() {
+        let m = &messages[i];
+        let real_user = m.role == "user"
+            && !crate::template::is_hidden_user_text(m.content.as_deref().unwrap_or(""));
+        if !real_user {
+            out.push(m.clone());
+            i += 1;
+            continue;
+        }
+        let mut j = i + 1;
+        while j < messages.len() {
+            let n = &messages[j];
+            if n.role == "user"
+                && crate::template::is_hidden_user_text(n.content.as_deref().unwrap_or(""))
+            {
+                out.push(n.clone());
+                j += 1;
+            } else {
+                break;
+            }
+        }
+        out.push(m.clone());
+        i = j;
+    }
+    out
 }
 
 /// One ChatMessage → zero or more Responses input items (`function_call`,
@@ -579,6 +617,14 @@ mod tests {
         assert!(blob.contains("Done."), "{blob}");
     }
 
+    fn last_user_content(input: &[Value]) -> Option<&str> {
+        input
+            .iter()
+            .rev()
+            .find(|v| v["role"] == "user")
+            .and_then(|v| v["content"].as_str())
+    }
+
     #[test]
     fn hidden_user_is_unwrapped_without_qwen_tags() {
         let msgs = vec![
@@ -590,6 +636,51 @@ mod tests {
         assert_eq!(input.len(), 2, "{blob}");
         assert!(!blob.contains("<tool_response>"), "{blob}");
         assert!(blob.contains("Steer: keep going."), "{blob}");
+        assert_eq!(last_user_content(&input), Some("task"));
+    }
+
+    #[test]
+    fn skill_and_plan_cards_are_not_the_last_user_turn() {
+        let msgs = vec![
+            ChatMessage::user("fix auth in src/login.rs"),
+            ChatMessage::hidden_user("[skill: testhook]\nAlways rewrite the whole crate."),
+            ChatMessage::hidden_user("PLAN MODE. Allowed: Read. Do not implement yet."),
+        ];
+        let input = messages_to_responses_input(&msgs);
+        let blob = serde_json::to_string(&input).unwrap();
+        assert_eq!(input.len(), 3, "{blob}");
+        assert_eq!(
+            last_user_content(&input),
+            Some("fix auth in src/login.rs"),
+            "{blob}"
+        );
+        assert!(
+            input[0]["content"].as_str().unwrap().contains("[skill:"),
+            "{blob}"
+        );
+        assert!(blob.contains("PLAN MODE"), "{blob}");
+    }
+
+    #[test]
+    fn hidden_notes_do_not_cross_an_assistant_turn() {
+        let msgs = vec![
+            ChatMessage::user("first"),
+            ChatMessage::assistant("ok"),
+            ChatMessage::user("second"),
+            ChatMessage::hidden_user("[skill: later]\nbody"),
+        ];
+        let input = messages_to_responses_input(&msgs);
+        assert_eq!(input.len(), 4, "{input:?}");
+        assert_eq!(input[0]["content"], json!("first"));
+        assert_eq!(input[1]["content"], json!("ok"));
+        assert!(
+            input[2]["content"]
+                .as_str()
+                .unwrap()
+                .contains("[skill: later]"),
+            "{input:?}"
+        );
+        assert_eq!(last_user_content(&input), Some("second"));
     }
 
     #[test]

@@ -11,9 +11,7 @@ use crate::policy::ThinkPolicy;
 use crate::prompt::{coding_prompt, periphery_section, session_prompt};
 use crate::session::{tools_hash, SessionMode, SessionStart, SlashCmd};
 use crate::skills::SkillCatalog;
-use crate::tools_schema::{
-    agent_tools, code_tools, computer_use_tool, mcp_tool, memory_search_tool, view_tool,
-};
+use crate::tools_schema::{agent_tools, code_tools, computer_use_tool, mcp_tool, view_tool};
 
 use super::types::{PolicyCaps, RpcError};
 
@@ -125,10 +123,6 @@ pub(crate) fn sidecar_agent_surface(
     home: Option<&std::path::Path>,
 ) -> (String, Vec<serde_json::Value>) {
     let mut tools = agent_tools();
-    let memory_ok = home.map(|h| h.is_dir()).unwrap_or(false);
-    if memory_ok {
-        tools.push(memory_search_tool());
-    }
     let cfg = Config::load_file_or_default();
     let mcp = McpRegistry::load(home, workspace, &cfg.mcp);
     if !mcp.servers.is_empty() {

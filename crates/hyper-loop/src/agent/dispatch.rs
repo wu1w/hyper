@@ -1,4 +1,4 @@
-//! Tool execution: gates, AskQuestion, parallel dispatch, oracle, search fold.
+//! Tool execution: gates, AskQuestion, parallel dispatch.
 
 use std::collections::{HashMap, HashSet};
 use std::time::Duration;
@@ -21,16 +21,19 @@ use crate::session::{run_recall, OpenAiToolCall, PolicyReason, SessionEvent, Sto
 use crate::skills::run_skill;
 use crate::template::ChatMessage;
 use crate::tool_calls::{CancelFlag, TextBlock, ToolCall, ToolResponse, ToolState};
-use crate::tools::{bash_search_query, run_search, run_tool, search_dump_too_big, view, Workspace};
+use crate::tools::{run_search, run_tool, view, CodeIndex, Workspace};
 use crate::tools_schema::{dispatch_name, is_parallel_safe};
 
 impl<C: Completer> Agent<C> {
     pub(crate) async fn execute_tools(&mut self, calls: Vec<ToolCall>) {
+        if self.code_index.is_none() && calls.iter().any(|c| dispatch_name(&c.name) == "search") {
+            self.code_index = Some(CodeIndex::build(self.workspace.root()));
+        }
         for call in &calls {
             self.note(&format!("[{}] {}", call.name, preview_args(call)));
         }
         let write_priors = self.snapshot_write_priors(&calls);
-        let mut responses = if parallel_safe_batch(&calls) {
+        let responses = if parallel_safe_batch(&calls) {
             self.dispatch_parallel(&calls).await
         } else {
             let mut out = Vec::with_capacity(calls.len());
@@ -39,14 +42,6 @@ impl<C: Completer> Agent<C> {
             }
             out
         };
-        for (call, response) in calls.iter().zip(responses.iter_mut()) {
-            self.fold_bash_search(call, response);
-        }
-        let fail_blob: String = responses
-            .iter()
-            .map(|r| r.joined_text())
-            .collect::<Vec<_>>()
-            .join("\n");
         let mut harness = false;
         let mut test_red = false;
         let mut saw_test_output = false;
@@ -132,122 +127,21 @@ impl<C: Completer> Agent<C> {
         if thrash && self.effort.note_thrash() {
             self.sync_effort(PolicyReason::Upgrade);
         }
-        self.inject_skill_from_tools(&fail_blob);
-        let mut doc_hay = fail_blob;
-        for call in &calls {
-            if let Some(p) = fs_tool_path(&call.name, &call.arguments) {
-                doc_hay.push('\n');
-                doc_hay.push_str(&p);
-            }
-            for key in ["command", "glob_pattern", "path"] {
-                if let Some(v) = call.arguments.get(key).and_then(|x| x.as_str()) {
-                    doc_hay.push('\n');
-                    doc_hay.push_str(v);
-                }
-            }
-        }
-        self.inject_doc_read(&doc_hay);
-    }
-
-    pub(crate) fn defer_divergent_tools(&mut self, calls: Vec<ToolCall>) {
-        for call in calls {
-            self.note(&format!("[{}] deferred low-information batch", call.name));
-            self.commit_tool(
-                &call.name,
-                ToolResponse::text(
-                    &call.id,
-                    "Deferred: this batch repeated the visible answer or only staged/cleaned a scratch copy. Reassess using the trajectory observation, then choose the next step.",
-                    ToolState::Error,
-                ),
-            );
-        }
     }
 
     pub(crate) fn apply_guard_note(&mut self, note: guard::GuardNote) {
         self.note(&format!("[guard] {}", note.label()));
-        if self.cursor_wire() {
-            return;
-        }
-        self.push_hidden_user(note.text());
     }
 
-    /// Sample a cheap suite before edits in `--print` only, so a later red run
-    /// can be told apart from a tree that was already red. Interactive turns
-    /// skip this and only run the post-edit scoped oracle.
+    /// Cursor does not auto-run a test suite before the model acts.
     pub(crate) async fn snapshot_test_baseline(&mut self) {
-        if self.cursor_wire() || !self.print || self.plan_mode || self.oracle_cmd.is_some() {
-            return;
-        }
-        if !verify::workspace_has_tests(self.workspace.root()) {
-            return;
-        }
-        let Some(cmd) = verify::workspace_default_test_cmd(self.workspace.root()) else {
-            return;
-        };
-        let started = std::time::Instant::now();
-        let out = self.run_oracle(&cmd).await;
-        if !guard::is_test_output("bash", &out) {
-            return;
-        }
-        if started.elapsed() > ORACLE_MAX_SUITE {
-            self.note("[oracle] suite too slow; baseline only");
-        } else {
-            self.oracle_cmd = Some(cmd);
-        }
-        let red = guard::is_test_fail("bash", &out);
-        self.edit_guard.set_baseline(red);
-        self.push_hidden_user(format!(
-            "[baseline] Pre-change tests are {}.\n{}",
-            if red { "already failing" } else { "all green" },
-            tail_chars(&out, ORACLE_TAIL_CHARS)
-        ));
+        let _ = self;
     }
 
-    /// After a successful code edit, run a scoped test command and feed the
-    /// tail back. Not gated on user keywords. Skips office docs, plan mode,
-    /// and turns where the model already ran tests.
-    /// Returns `None` if the oracle did not run, `Some(failed)` if it did.
+    /// Cursor does not inject a hidden oracle card after edits.
     pub(crate) async fn oracle_tests_if_needed(&mut self) -> Option<bool> {
-        if self.cursor_wire() {
-            self.edit_guard.mark_oracle_ran();
-            return None;
-        }
-        if self.plan_mode || self.pending_stop.is_some() || !self.edit_guard.wants_oracle() {
-            return None;
-        }
-        let cmd = verify::scoped_test_cmd(self.workspace.root(), self.edit_guard.code_paths())
-            .or_else(|| self.oracle_cmd.clone());
-        let Some(cmd) = cmd else {
-            self.edit_guard.mark_oracle_ran();
-            return None;
-        };
-        let out = self.run_oracle(&cmd).await;
-        if let Some(note) = self.edit_guard.observe_oracle_output(&out) {
-            self.apply_guard_note(note);
-        }
-        let red = guard::is_test_fail("bash", &out);
-        if red && self.effort.note_test_fail() {
-            self.sync_effort(PolicyReason::Upgrade);
-        }
-        self.push_hidden_user(format!("[oracle]\n{}", tail_chars(&out, ORACLE_TAIL_CHARS)));
-        if guard::is_test_output("bash", &out) {
-            self.oracle_cmd = Some(cmd);
-        }
-        Some(red)
-    }
-
-    /// The oracle uses Python's portable `-B` switch. Avoiding bytecode is both
-    /// cheaper than managing a throwaway cache and works unchanged in Bash on
-    /// macOS/Linux/Git Bash and in the PowerShell fallback.
-    pub(crate) async fn run_oracle(&mut self, cmd: &str) -> String {
-        self.note(&format!("[oracle] {cmd}"));
-        let call = ToolCall {
-            id: format!("oracle-{}", self.oracle_runs),
-            name: "bash".into(),
-            arguments: json!({"command": cmd}),
-        };
-        self.oracle_runs += 1;
-        self.dispatch_one(&call).await.joined_text()
+        self.edit_guard.mark_oracle_ran();
+        None
     }
 
     pub(crate) fn snapshot_write_priors(&self, calls: &[ToolCall]) -> HashMap<String, String> {
@@ -269,39 +163,6 @@ impl<C: Completer> Agent<C> {
         out
     }
 
-    pub(crate) fn fold_bash_search(&self, call: &ToolCall, response: &mut ToolResponse) {
-        if dispatch_name(&call.name) != "bash" {
-            return;
-        }
-        let Some(query) = bash_search_query(bash_cmd(call)) else {
-            return;
-        };
-        if !search_dump_too_big(&response.joined_text()) {
-            return;
-        }
-        let Some(idx) = &self.code_index else {
-            return;
-        };
-        let Some(spans) = idx.render_query(&query, None) else {
-            return;
-        };
-        let full = response.joined_text();
-        if !search_fold_shrinks(&full, &spans) {
-            return;
-        }
-        let blob = response
-            .blob
-            .clone()
-            .or_else(|| self.blobs.put(full.as_bytes()).ok());
-        let mut folded = ToolResponse::text(
-            call.id.clone(),
-            search_fold_text(&full, &query, &spans, blob.as_deref()),
-            response.state.clone(),
-        );
-        folded.blob = blob;
-        folded.original_chars = full.chars().count();
-        *response = folded;
-    }
     pub(crate) fn dispatch_ctx(&self) -> crate::subagent::DispatchCtx {
         crate::subagent::DispatchCtx {
             depth: if self.child.is_some() { 1 } else { 0 },
@@ -353,35 +214,6 @@ impl<C: Completer> Agent<C> {
                 ToolState::Error,
             )),
         }
-    }
-
-    /// dsh `FS_NOT_OBSERVED`, narrowed to the one destructive case: `write`
-    /// replaces the whole file, so overwriting one the transcript never saw
-    /// destroys content the model cannot know. `edit` needs no version guard —
-    /// its exact `old_string` match is already a content CAS. Costs one `read`
-    /// only when it actually fires.
-    pub(crate) fn refuse_blind_overwrite(&self, call: &ToolCall) -> Option<ToolResponse> {
-        if dispatch_name(&call.name) != "write" {
-            return None;
-        }
-        let raw = fs_tool_path("write", &call.arguments)?;
-        if self
-            .observed_paths
-            .contains(&canon_ws_path(&self.workspace, &raw))
-        {
-            return None;
-        }
-        let abs = self.workspace.resolve(&raw).ok()?;
-        if !abs.is_file() {
-            return None;
-        }
-        Some(ToolResponse::text(
-            &call.id,
-            format!(
-                "Error: {raw} already exists and has not been Read this session. Write overwrites the whole file. Read(path=\"{raw}\") first; use StrReplace for a local change."
-            ),
-            ToolState::Error,
-        ))
     }
 
     pub(crate) async fn complete_or_abort(
@@ -530,9 +362,6 @@ impl<C: Completer> Agent<C> {
         }
         if crate::subagent::handles(&call.name) {
             return crate::subagent::dispatch(call, &self.dispatch_ctx()).await;
-        }
-        if let Some(refused) = self.refuse_blind_overwrite(call) {
-            return refused;
         }
         match dispatch_name(&call.name) {
             "ask" => self.run_ask(call).await,
@@ -802,7 +631,7 @@ fn tool_text_failed(text: &str) -> bool {
 
 /// Paths whose content the live transcript shows: read/view/write/edit calls
 /// whose tool result is not an error. Rebuilt each turn so sidecar re-hydration
-/// (new Agent, old transcript) keeps the same `refuse_blind_overwrite` view.
+/// (new Agent, old transcript) keeps the same observed-path set.
 pub(crate) fn observed_from_messages(messages: &[ChatMessage], ws: &Workspace) -> HashSet<String> {
     let mut ok: HashMap<String, bool> = HashMap::new();
     for m in messages {
@@ -844,33 +673,9 @@ pub(crate) fn observed_from_messages(messages: &[ChatMessage], ws: &Workspace) -
     out
 }
 
-pub(crate) fn write_path_body(call: &ToolCall) -> (&str, &str) {
-    let path = call
-        .arguments
-        .get("path")
-        .and_then(|v| v.as_str())
-        .or_else(|| call.arguments.get("file_path").and_then(|v| v.as_str()))
-        .unwrap_or("");
-    let body = call
-        .arguments
-        .get("contents")
-        .and_then(|v| v.as_str())
-        .or_else(|| call.arguments.get("content").and_then(|v| v.as_str()))
-        .unwrap_or("");
-    (path, body)
-}
-
-pub(crate) fn bash_cmd(call: &ToolCall) -> &str {
-    call.arguments
-        .get("command")
-        .and_then(|v| v.as_str())
-        .unwrap_or("")
-}
-
 fn preview_args(call: &ToolCall) -> String {
     call.arguments
         .get("path")
-        .or_else(|| call.arguments.get("file_path"))
         .or_else(|| call.arguments.get("command"))
         .or_else(|| call.arguments.get("code"))
         .or_else(|| call.arguments.get("query"))
@@ -938,30 +743,6 @@ fn search_head(full: &str) -> String {
 /// matching one whole file) would cost KV instead of saving it.
 pub(crate) fn search_fold_shrinks(full: &str, spans: &str) -> bool {
     search_head(full).len() + spans.len() < full.len()
-}
-
-/// Spans supplement the dump, they do not replace it: the model asked ripgrep a
-/// precise question, so its own hits stay live and the rest stays recallable.
-fn search_fold_text(full: &str, query: &str, spans: &str, blob: Option<&str>) -> String {
-    format!(
-        "{}\n[{} lines total; head kept{}]\n\n[index spans for `{query}`]\n{spans}",
-        search_head(full),
-        full.lines().count(),
-        blob.map(|b| format!("; full output in blob {b} — recall(blob=…)"))
-            .unwrap_or_default(),
-    )
-}
-
-/// Per-round oracle runs are only worth it on a suite this fast.
-const ORACLE_MAX_SUITE: Duration = Duration::from_secs(45);
-const ORACLE_TAIL_CHARS: usize = 2000;
-
-fn tail_chars(s: &str, n: usize) -> String {
-    let count = s.chars().count();
-    if count <= n {
-        return s.to_string();
-    }
-    s.chars().skip(count - n).collect()
 }
 
 fn edit_snippet(call: &ToolCall) -> String {

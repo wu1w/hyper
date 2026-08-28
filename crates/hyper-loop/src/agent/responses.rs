@@ -14,7 +14,7 @@ use crate::config::Config;
 use crate::error::{Error, Result};
 use crate::family::{EndpointCaps, EngineProfile, Family};
 use crate::policy::{Effort, ThinkPolicy};
-use crate::session::{chat_to_input_items, OfficialCompaction};
+use crate::session::{messages_to_responses_input, OfficialCompaction};
 use crate::template::ChatMessage;
 use crate::tool_calls::ToolCall;
 use crate::transport::{GrokTransport, ResolvedTransport, WireFormat};
@@ -357,7 +357,7 @@ fn split_instructions(
     skip: usize,
 ) -> (Option<String>, Vec<Value>) {
     let mut systems = Vec::new();
-    let rest: Vec<&ChatMessage> = messages
+    let rest: Vec<ChatMessage> = messages
         .iter()
         .filter(|m| {
             if m.role == "system" {
@@ -373,8 +373,9 @@ fn split_instructions(
                 true
             }
         })
+        .cloned()
         .collect();
-    let rest: Vec<&ChatMessage> = if compaction.is_some() {
+    let rest: Vec<ChatMessage> = if compaction.is_some() {
         rest.into_iter().skip(skip).collect()
     } else {
         rest
@@ -388,9 +389,7 @@ fn split_instructions(
     if let Some(c) = compaction {
         input.push(c.as_input_item());
     }
-    for m in rest {
-        input.extend(chat_to_input_items(m));
-    }
+    input.extend(messages_to_responses_input(&rest));
     (instructions, input)
 }
 
@@ -1385,6 +1384,38 @@ mod tests {
         assert_eq!(input[1]["name"], json!("Read"));
         assert_eq!(input[2]["type"], json!("function_call_output"));
         assert_eq!(input[2]["call_id"], json!("c1"));
+    }
+
+    #[test]
+    fn skill_card_is_not_the_last_user_on_responses_body() {
+        let msgs = vec![
+            ChatMessage::system("You are grok-hyper."),
+            ChatMessage::user("fix auth"),
+            ChatMessage::hidden_user("[skill: testhook]\nAlways rewrite the crate."),
+        ];
+        let body = build_responses_body(&ResponsesSpec {
+            model: "grok-4.6",
+            messages: &msgs,
+            tools: None,
+            stream: false,
+            policy: &policy_high(),
+            cache_key: None,
+            compaction: None,
+            skip: 0,
+        });
+        let input = body["input"].as_array().unwrap();
+        assert_eq!(input.len(), 2, "{input:?}");
+        let last = input.last().unwrap();
+        assert_eq!(last["role"], json!("user"));
+        assert_eq!(last["content"], json!("fix auth"));
+        assert!(
+            input[0]["content"]
+                .as_str()
+                .unwrap()
+                .contains("[skill: testhook]"),
+            "{input:?}"
+        );
+        assert_eq!(body["instructions"], json!("You are grok-hyper."));
     }
 
     #[test]

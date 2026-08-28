@@ -1,6 +1,8 @@
-//! Hidden user notes after the live query. Not part of the frozen system/tools
-//! prefix. 27B treats these as contracts; attach 0 or 1 skill, at most one
-//! MEMORY card, and at most one MCP card, then stub after two later real user turns.
+//! Hidden user notes stored after the live query so Qwen Jinja
+//! `last_query_index` stays on the request. Grok Responses hoists kept
+//! cards back in front of that user (see `hoist_hidden_notes_before_query`).
+//! Attach 0 or 1 skill, at most one MEMORY card, and at most one MCP card,
+//! then stub after two later real user turns.
 
 use crate::family::Family;
 use crate::template::{is_hidden_user_text, wrap_tool_response, ChatMessage};
@@ -19,7 +21,7 @@ pub const MEMORY_HOT_MAX_LINES: usize = 12;
 pub const MEMORY_FULL_MAX_LINES: usize = 40;
 
 pub fn tokens(text: &str) -> u32 {
-    count_tokens(Family::Qwen38, text)
+    count_tokens(Family::Grok46, text)
         .unwrap_or_else(|_| text.chars().count().div_ceil(2).max(1) as u32)
 }
 

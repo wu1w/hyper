@@ -1,11 +1,4 @@
-//! ReAct agent. Loop shape from QwenPaw `react_agent._reasoning`.
-//!
-//! grok-4.6 / Responses (`cursor_wire`): Cursor tool names and hop geometry.
-//! No QwenPaw trajectory lectures, style/out/locate cards, or auto-oracle.
-//! Tool-hop assistant text is not replayed. Identical tools halt quietly at 6.
-//!
-//! Local Qwen still gets hidden observations (doom / stutter / dump) once,
-//! then silence. Step, time, and context budgets wrap once then finish.
+//! ReAct agent. Cursor hop geometry: empty tool-hop text, no Qwen lectures.
 
 mod delta;
 mod dispatch;
@@ -19,7 +12,6 @@ mod tests;
 mod turn;
 mod verify;
 mod window;
-mod xml_tools;
 
 use std::collections::HashSet;
 use std::future::Future;
@@ -419,44 +411,26 @@ pub struct Agent<C> {
     clarify_mode: bool,
     permit: Option<PermitHub>,
     clarify: Option<crate::clarify::ClarifyHub>,
-    low_precision: bool,
     parse_stop_after: u32,
     /// Last substantial assistant content this user turn. Harness-only.
     last_spoken: Option<String>,
-    /// Last substantial assistant text this user turn, including tool-hop
-    /// essays. Dump detection uses this when `last_spoken` was not locked
-    /// (read-only hops). grok-4.6 often recaps that essay as markdown quotes.
-    last_essay: Option<String>,
     /// Concatenated substantial tool results this user turn (capped).
-    /// grok-4.6 recaps Read/Grep dumps as the "answer"; this is the source.
     tool_evidence: String,
-    /// Silent retry after a no-tool recap with nothing keepable.
-    recap_retries: u32,
     /// Paths successfully `read` this user turn. Re-reads after an answer are not progress.
     read_paths: HashSet<String>,
     /// Paths whose content the live transcript has seen (read/view/write/edit).
-    /// `write` to an existing file outside this set is a blind overwrite and is
-    /// refused with a re-read fact. Rebuilt from the transcript each turn;
-    /// cleared on compact (the content left the window with it).
+    /// Rebuilt from the transcript each turn; cleared on compact.
     observed_paths: HashSet<String>,
     /// Consumed on the first `run_message` so a soak leftover env is visible once.
     window_overlay: Option<WorkingWindowOverlay>,
     /// S1/S2 judgment guards over successful edits.
     edit_guard: guard::EditGuard,
-    /// Interactive channels get a one-line narration style card.
-    narrate: bool,
     /// Empty / cli / tui / web / console are interactive; IM skips AskQuestion.
     channel: String,
-    /// Workspace FTS for `search`. Built at session start; refreshed on write/edit.
+    /// Optional FTS for the legacy `search` tool. Built on first dispatch.
     code_index: Option<CodeIndex>,
-    /// Lossy stutter already received one hidden observation this user turn.
-    stutter_nudged: bool,
-    /// Dump/restate observation already landed this user turn.
-    dump_nudged: bool,
     /// Physics cap (steps / wall / context / tool budget) already got a wrap-up hop.
     physics_nudged: bool,
-    /// Parse-fail cap already got one repair observation.
-    parse_nudged: bool,
     /// Last official xAI compaction item (opaque). Next Responses `input` should
     /// be `[compaction] + new turns`. Never log `encrypted_content` in full.
     official_compaction: Option<crate::session::OfficialCompaction>,

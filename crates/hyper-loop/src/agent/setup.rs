@@ -6,16 +6,13 @@ use serde_json::Value;
 
 use super::delta;
 use super::guard;
-use super::{clamp_generation_reserve, interactive_channel, Agent, Completer, RunOpts, ToolSet};
+use super::{clamp_generation_reserve, Agent, Completer, RunOpts, ToolSet};
 use crate::channel::SteerSlot;
 use crate::config::Config;
 use crate::error::Result;
 use crate::mcp::McpRegistry;
 use crate::memory::MemoryStore;
-use crate::paw_loop::{
-    DoomLoopGate, Gate, IterationGate, NameStreakGate, PathLoopGate, StopHandler, TimeoutGate,
-    ToolCallBudgetGate, LOSSY_TOOL_BUDGET,
-};
+use crate::paw_loop::{DoomLoopGate, Gate, IterationGate, StopHandler, TimeoutGate};
 use crate::policy::{EffortController, ThinkPolicy};
 use crate::prompt::{periphery_section, session_prompt};
 use crate::session::{tools_hash, SessionLog, SessionStart};
@@ -23,10 +20,9 @@ use crate::skills::SkillCatalog;
 use crate::sticky;
 use crate::template::ChatMessage;
 use crate::tool_calls::{CancelFlag, ToolCoordinator, COORDINATOR_OWNED_EXEC_TIMEOUT_SECS};
-use crate::tools::{BlobStore, CodeIndex, Workspace};
+use crate::tools::{BlobStore, Workspace};
 use crate::tools_schema::{
-    agent_tools, code_tools, computer_use_tool, dispatch_name, has_tool, mcp_tool,
-    memory_search_tool, view_tool,
+    agent_tools, code_tools, computer_use_tool, dispatch_name, mcp_tool, view_tool,
 };
 
 impl<C: Completer> Agent<C> {
@@ -71,27 +67,11 @@ impl<C: Completer> Agent<C> {
             crate::platform_prefix::append_xai_product_closer(&mut system);
         }
 
-        let lossy = opts.low_precision;
-        let iter = IterationGate::new(opts.max_steps.max(1));
-        let mut gates = vec![
-            Gate::from(if lossy {
-                DoomLoopGate::lossy()
-            } else if completer.recasts_xai_product() {
-                DoomLoopGate::grok_default()
-            } else {
-                DoomLoopGate::qwen_default()
-            }),
-            Gate::from(iter),
+        let gates = vec![
+            Gate::from(DoomLoopGate::grok_default()),
+            Gate::from(IterationGate::new(opts.max_steps.max(1))),
             Gate::from(TimeoutGate::new(opts.max_wall)),
         ];
-        if lossy {
-            gates.push(Gate::from(NameStreakGate::new(4)));
-            gates.push(Gate::from(PathLoopGate::new(3)));
-            gates.push(Gate::from(ToolCallBudgetGate::new(
-                Some(LOSSY_TOOL_BUDGET),
-                std::collections::HashMap::new(),
-            )));
-        }
         let handler = StopHandler::with_gates(gates);
         handler.reset_turn(&opts.session_id);
 
@@ -122,18 +102,8 @@ impl<C: Completer> Agent<C> {
         } else {
             log.as_ref().and_then(|l| l.policy()).unwrap_or(policy)
         };
-        let policy = if lossy {
-            policy.apply_lossy_think_cap(opts.effort_locked)
-        } else {
-            policy
-        };
         completer.set_policy(policy.clone());
-        completer.set_low_precision(lossy);
-        let effort = if lossy {
-            EffortController::new(policy.clone(), opts.effort_locked).with_parse_upgrade_after(1)
-        } else {
-            EffortController::new(policy.clone(), opts.effort_locked)
-        };
+        let effort = EffortController::new(policy.clone(), opts.effort_locked);
         let media_caps = completer.media_caps();
         let media_max_bytes = opts.media_max_bytes.max(1);
 
@@ -155,11 +125,9 @@ impl<C: Completer> Agent<C> {
                 );
             }
         }
-        let code_index = if has_tool(&tools, "Grep") || has_tool(&tools, "search") {
-            Some(CodeIndex::build(workspace.root()))
-        } else {
-            None
-        };
+        // Cursor: Grep is rg. The optional `search` index is built on first
+        // dispatch, never in Agent::new (Windows home-folder hang).
+        let code_index: Option<crate::tools::CodeIndex> = None;
         let web = opts
             .web
             .enabled
@@ -203,23 +171,16 @@ impl<C: Completer> Agent<C> {
             clarify_mode: opts.clarify_mode,
             permit: opts.permit,
             clarify: opts.clarify,
-            low_precision: lossy,
-            parse_stop_after: if lossy { 2 } else { 3 },
+            parse_stop_after: 3,
             last_spoken: None,
-            last_essay: None,
             tool_evidence: String::new(),
-            recap_retries: 0,
             read_paths: HashSet::new(),
             observed_paths: HashSet::new(),
             window_overlay: opts.working_window_overlay,
             edit_guard: guard::EditGuard::new(),
-            narrate: opts.narrate && !opts.print && interactive_channel(&opts.channel),
             channel: opts.channel,
             code_index,
-            stutter_nudged: false,
-            dump_nudged: false,
             physics_nudged: false,
-            parse_nudged: false,
             official_compaction: None,
             xai_compact: opts.xai_compact,
             config: opts.config,
@@ -359,13 +320,8 @@ pub(crate) fn bind_periphery(
         ToolSet::Agent => agent_tools(),
         ToolSet::Code => code_tools(),
     };
-    if extra_tools {
-        if memory.is_some() {
-            tools.push(memory_search_tool());
-        }
-        if !mcp.servers.is_empty() {
-            tools.push(mcp_tool());
-        }
+    if extra_tools && !mcp.servers.is_empty() {
+        tools.push(mcp_tool());
     }
     if opts.media && matches!(tool_set, ToolSet::Agent) {
         tools.push(view_tool());

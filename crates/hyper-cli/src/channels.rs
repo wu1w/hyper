@@ -1,4 +1,4 @@
-//! `hyper --channels`: QwenPaw-form inbound (webhook + telegram) → Agent → reply.
+//! `hyper --channels`: inbound (webhook + telegram) → Agent → reply.
 
 use std::process::ExitCode;
 use std::sync::Arc;
@@ -8,14 +8,12 @@ use hyper_loop::channel::{reply_parts, reply_text, run_channels, ContentPart, Na
 use hyper_loop::config::Config;
 use hyper_loop::session::SessionMode;
 use hyper_loop::slash::{low_precision_text, mcp_text, parse_slash_with_periphery, skills_text};
-use hyper_loop::vendor;
 use hyper_loop::{Agent, RunOpts, ToolSet, TransportCompleter};
 
 use super::Cli;
 
 pub async fn run(cli: Cli) -> Result<ExitCode> {
     let (cfg, path) = Config::load_or_init().context("load config")?;
-    vendor::verify_qwen38().ok();
     eprintln!("config: {}", path.display());
 
     let workspace = cli

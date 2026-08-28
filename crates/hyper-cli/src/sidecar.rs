@@ -6,7 +6,6 @@ use anyhow::{Context, Result};
 use hyper_loop::config::Config;
 use hyper_loop::session::SessionMode;
 use hyper_loop::sidecar::{execute_turn, serve_rpc, PolicyCaps, SidecarOpts, SidecarSession};
-use hyper_loop::vendor;
 use hyper_loop::ApprovalMode;
 use tokio::io::BufReader;
 
@@ -14,7 +13,6 @@ use super::Cli;
 
 pub async fn run(cli: Cli) -> Result<ExitCode> {
     let (cfg, _) = Config::load_or_init().context("load config")?;
-    vendor::verify_qwen38().ok();
 
     let workspace = cli
         .workspace

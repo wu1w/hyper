@@ -1,5 +1,6 @@
 //! Workspace tools. Frozen OpenAI names are Cursor-shaped (`Read` / `Write` /
-//! `StrReplace` / `Shell` / …). Executors still accept the Qwen four-pack aliases.
+//! `StrReplace` / `Shell` / …). Executors accept the same names plus a few
+//! transcript aliases (`read` / `bash`).
 //!
 //! Paths resolve from the workspace; writes stay inside it when confined.
 
@@ -190,18 +191,18 @@ pub(crate) fn arg_str(args: &Value, key: &str) -> Option<String> {
     }
 }
 
-/// Frozen schema is `path`; QwenPaw `file_io.py` uses `file_path`.
+/// Frozen schema is `path`.
 pub(crate) fn arg_path(args: &Value) -> Option<String> {
-    arg_str(args, "path").or_else(|| arg_str(args, "file_path"))
+    arg_str(args, "path")
 }
 
-/// Frozen schema is `old_string` / `new_string`; QwenPaw uses `old_text` / `new_text`.
+/// Frozen schema is `old_string` / `new_string`.
 pub(crate) fn arg_old_string(args: &Value) -> Option<String> {
-    arg_str(args, "old_string").or_else(|| arg_str(args, "old_text"))
+    arg_str(args, "old_string")
 }
 
 pub(crate) fn arg_new_string(args: &Value) -> Option<String> {
-    arg_str(args, "new_string").or_else(|| arg_str(args, "new_text"))
+    arg_str(args, "new_string")
 }
 
 pub(crate) fn arg_u32(args: &Value, key: &str) -> Option<u32> {
@@ -277,40 +278,13 @@ mod tests {
     }
 
     #[test]
-    fn qwenpaw_file_io_aliases() {
+    fn write_requires_path_not_file_path() {
         let (ws, dir) = scratch();
-        fs::write_file(
+        let w = fs::write_file(
             &ws,
-            &call(
-                "write",
-                json!({"file_path": "n.txt", "content": "one\ntwo\nthree\n"}),
-            ),
+            &call("write", json!({"file_path": "n.txt", "content": "one\n"})),
         );
-        let r = fs::read_file(
-            &ws,
-            &call(
-                "read",
-                json!({"file_path": "n.txt", "start_line": 2, "end_line": 3}),
-            ),
-            ToolLimits::default(),
-            None,
-        );
-        let text = r.joined_text();
-        assert!(text.contains("two"), "{text}");
-        assert!(text.contains("three"), "{text}");
-        assert!(!text.contains("one\n"), "{text}");
-        let e = fs::edit_file(
-            &ws,
-            &call(
-                "edit",
-                json!({
-                    "file_path": "n.txt",
-                    "old_text": "two",
-                    "new_text": "TWO"
-                }),
-            ),
-        );
-        assert_eq!(e.state, ToolState::Success);
+        assert_eq!(w.state, ToolState::Error, "{}", w.joined_text());
         let _ = std::fs::remove_dir_all(dir);
     }
 

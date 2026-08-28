@@ -12,7 +12,7 @@ members = [
 version = "0.1.0"
 edition = "2021"
 license = "Apache-2.0"
-description = "grok-hyper: local coding-agent product shell (forked from Qwenthin/q-harness; still OpenAI-compat / Qwen3.8)"
+description = "grok-hyper: grok-4.6 coding agent with Cursor-shaped tools and hop geometry"
 
 [workspace.dependencies]
 anyhow = "1"

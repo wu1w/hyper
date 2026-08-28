@@ -263,18 +263,6 @@ impl<C: Completer> Agent<C> {
     pub(crate) fn after_compact(&mut self) {
         self.handler.reset_repeat(&self.session_id);
         self.observed_paths.clear();
-        if self.read_paths.is_empty() {
-            return;
-        }
-        let mut paths: Vec<String> = self.read_paths.iter().cloned().collect();
-        paths.sort();
-        paths.truncate(16);
-        let body = paths.join("\n");
-        if !self.cursor_wire() {
-            self.push_hidden_user(format!(
-                "[compact] prior reads left the live window. Files still on disk — page with read(path, offset, limit); do not repeat the same unpaged read:\n{body}"
-            ));
-        }
         self.read_paths.clear();
     }
 

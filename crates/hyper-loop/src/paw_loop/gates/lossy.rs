@@ -273,7 +273,6 @@ pub fn fs_tool_path(name: &str, args: &Value) -> Option<String> {
         "read" | "edit" | "write" | "delete" => args
             .get("path")
             .and_then(|v| v.as_str())
-            .or_else(|| args.get("file_path").and_then(|v| v.as_str()))
             .filter(|s| !s.is_empty())
             .map(str::to_string),
         _ => None,
@@ -444,21 +443,12 @@ mod tests {
     }
 
     #[test]
-    fn fs_tool_path_sees_file_path_alias() {
+    fn fs_tool_path_uses_path_only() {
         let via_alias = serde_json::json!({"file_path": "a.rs"});
-        assert_eq!(fs_tool_path("read", &via_alias).as_deref(), Some("a.rs"));
-        assert_eq!(fs_tool_path("Read", &via_alias).as_deref(), Some("a.rs"));
-        assert_eq!(fs_tool_path("edit", &via_alias).as_deref(), Some("a.rs"));
-        assert_eq!(
-            fs_tool_path("StrReplace", &via_alias).as_deref(),
-            Some("a.rs")
-        );
-        assert_eq!(fs_tool_path("write", &via_alias).as_deref(), Some("a.rs"));
+        assert_eq!(fs_tool_path("read", &via_alias), None);
         let via_path = serde_json::json!({"path": "b.rs"});
         assert_eq!(fs_tool_path("Write", &via_path).as_deref(), Some("b.rs"));
         assert_eq!(fs_tool_path("read", &via_path).as_deref(), Some("b.rs"));
-        let both = serde_json::json!({"path": "a.rs", "file_path": "b.rs"});
-        assert_eq!(fs_tool_path("read", &both).as_deref(), Some("a.rs"));
-        assert_eq!(fs_tool_path("bash", &via_alias), None);
+        assert_eq!(fs_tool_path("bash", &via_path), None);
     }
 }

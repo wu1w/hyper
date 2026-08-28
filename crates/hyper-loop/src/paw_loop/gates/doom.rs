@@ -67,11 +67,10 @@ impl DoomLoopGate {
         Self::new(2, 1.0, vec![DoomStage::warn(6, REPEAT_NOTE)])
     }
 
-    /// grok-4.6 already knows not to spin. No trajectory lecture — that is a
-    /// new user turn on Responses and makes it restate. Quiet halt at the
-    /// sixth identical call so the 80-step budget cannot burn on one Read.
+    /// Cursor: no repetition lecture and no halt-at-6. Iteration/timeout
+    /// gates are the hard edge.
     pub fn grok_default() -> Self {
-        Self::new(2, 1.0, vec![DoomStage::halt(6, "budget:repeat")])
+        Self::new(2, 1.0, vec![])
     }
 
     /// Low-precision overlay: one nudge at the second identical call.
@@ -265,18 +264,14 @@ mod tests {
     }
 
     #[test]
-    fn grok_sixth_repeat_halts_without_lecture() {
+    fn grok_default_never_lectures_or_halts() {
         let gate = DoomLoopGate::grok_default();
         let a = ToolFingerprint::new("read", r#"{"path":"a.rs"}"#);
-        for iter in 1..=5 {
+        for iter in 1..=12 {
             assert!(
                 matches!(hop(&gate, iter, &[a.clone()]), GateDecision::Bypass),
                 "iter={iter}"
             );
-        }
-        match hop(&gate, 6, &[a]) {
-            GateDecision::Stop { reason } => assert_eq!(reason, "budget:repeat"),
-            other => panic!("expected quiet halt at 6th repeat: {other:?}"),
         }
         assert_eq!(gate.continuation("s"), "");
     }

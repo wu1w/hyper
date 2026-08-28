@@ -3,7 +3,7 @@ name = "hyper-web"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
-description = "Local Web console host for hyper (QwenPaw-shaped UI, in-process loop)"
+description = "Local Web console host for hyper"
 
 [dependencies]
 anyhow.workspace = true

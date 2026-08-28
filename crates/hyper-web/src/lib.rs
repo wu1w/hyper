@@ -16,7 +16,6 @@ use anyhow::{Context, Result};
 use hyper_loop::config::Config;
 use hyper_loop::session::{catalog, new_session_id, SessionLog, SessionMode};
 use hyper_loop::sidecar::{PolicyCaps, SidecarOpts, SidecarSession};
-use hyper_loop::vendor;
 use hyper_loop::ApprovalMode;
 
 use crate::hub::AppState;
@@ -42,7 +41,6 @@ pub async fn run(opts: WebOpts) -> Result<std::process::ExitCode> {
     if let Ok(office) = crate::office::persist_office_secret(&cfg_path) {
         cfg.office = office;
     }
-    vendor::verify_qwen38().ok();
     let ignored = routes::env_ignored_names();
     if !ignored.is_empty() {
         eprintln!(

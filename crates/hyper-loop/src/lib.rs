@@ -1,9 +1,7 @@
-//! hyper-loop: grok-4.6 Responses agent with Cursor-shaped tools.
+//! hyper-loop: grok-4.6 Responses agent with Cursor-shaped tools and hop geometry.
 //!
-//! The live path is grok-4.6 over `/v1/responses` (or Chat Completions for
-//! Qwen-like models). `paw_loop` is leftover gate/fingerprint machinery from
-//! the QwenPaw port — not the primary model adapter. Model-facing tools are
-//! Cursor PascalCase (`Read`, `Shell`, `Task`, …).
+//! The live path is grok-4.6 over `/v1/responses`. Tool hops keep visible text
+//! empty. Model-facing tools are Cursor PascalCase (`Read`, `Shell`, `Task`, …).
 
 pub mod adapter;
 pub mod agent;
@@ -13,6 +11,7 @@ pub mod clarify;
 pub mod config;
 pub mod cron;
 pub mod doc_read;
+#[cfg(test)]
 pub mod echo;
 pub mod error;
 pub mod family;

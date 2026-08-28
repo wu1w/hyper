@@ -2,10 +2,7 @@
 //!
 //! Streams when a token sink is armed (TUI/CLI) or when thinking is on and
 //! `max_think_tokens > 0` so the watchdog can drop the body at the think cap.
-//! XML `<tool_call>` is merged with OpenAI `tool_calls` after think-split.
-//! When the native `tool_calls` array is empty, complete XML blocks are also
-//! recovered from `reasoning_content` (QwenPaw `tag_parser` path for local Qwen
-//! that leaks tools into think).
+//! Tool calls come from the native OpenAI `tool_calls` array only — no Qwen XML.
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Mutex;
@@ -15,7 +12,6 @@ use reqwest::Client;
 use serde_json::{json, Value};
 
 use super::delta::StreamPaint;
-use super::xml_tools::{extract_xml_tools, text_before_first};
 use super::{Completer, ModelTurn, TokenSink};
 use crate::adapter::{build_chat_body, ChatRequestSpec};
 use crate::config::Config;
@@ -418,7 +414,7 @@ fn parse_turn_opts(v: &Value, truncated: bool) -> Result<ParseOutcome> {
     }
 
     let raw_openai = msg["tool_calls"].as_array().cloned();
-    let openai_calls: Vec<ToolCall> = raw_openai
+    let tool_calls: Vec<ToolCall> = raw_openai
         .as_ref()
         .map(|arr| {
             arr.iter()
@@ -426,41 +422,7 @@ fn parse_turn_opts(v: &Value, truncated: bool) -> Result<ParseOutcome> {
                 .collect()
         })
         .unwrap_or_default();
-
-    let native = !openai_calls.is_empty();
-    let xml = extract_xml_tools(&content);
-    let xml_unclosed = xml.unclosed;
-    let had_xml = xml.had_tag();
-    let xml_ranges = xml.ranges.clone();
-    let mut parse_fail = xml.parse_fail(truncated) && !native;
-
-    let mut tool_calls = if parse_fail {
-        Vec::new()
-    } else if truncated && xml_unclosed {
-        // Incomplete cancelled XML is discarded; keep complete OpenAI calls.
-        openai_calls
-    } else {
-        merge_calls(openai_calls, xml.calls)
-    };
-
-    // QwenPaw: with no native tool_use, recover complete <tool_call> blocks from
-    // thinking. Incomplete/malformed think XML is skipped, not a parse_fail.
-    if !native {
-        let from_think = extract_xml_tools(&reasoning);
-        if !from_think.calls.is_empty() {
-            if parse_fail {
-                parse_fail = false;
-                tool_calls = from_think.calls;
-            } else {
-                tool_calls = merge_calls(from_think.calls, tool_calls);
-            }
-            reasoning = text_before_first(&reasoning, &from_think.ranges);
-        }
-    }
-
-    if !parse_fail && had_xml {
-        content = text_before_first(&content, &xml_ranges);
-    }
+    let parse_fail = false;
 
     let raw_tool_calls = if tool_calls.is_empty() {
         None
@@ -563,19 +525,6 @@ pub fn parse_cached_tokens(v: &Value) -> Option<u64> {
         .or_else(|| pointer_u64(v, "/timings/cache_n"));
     let prompt = parse_prompt_tokens(v);
     n.map(|c| if prompt > 0 { c.min(prompt) } else { c })
-}
-
-fn merge_calls(openai: Vec<ToolCall>, xml: Vec<ToolCall>) -> Vec<ToolCall> {
-    let mut seen: std::collections::HashSet<String> = openai.iter().map(|c| c.id.clone()).collect();
-    let mut out = openai;
-    for call in xml {
-        if seen.contains(&call.id) {
-            continue;
-        }
-        seen.insert(call.id.clone());
-        out.push(call);
-    }
-    out
 }
 
 fn parse_tool_call(v: &Value, truncated: bool) -> Option<ToolCall> {
@@ -982,7 +931,7 @@ mod tests {
     }
 
     #[test]
-    fn parses_xml_tool_call() {
+    fn parses_xml_tool_call_as_prose() {
         let v = json!({
             "choices": [{
                 "message": {
@@ -993,14 +942,12 @@ mod tests {
         });
         let o = parse_turn(&v).unwrap();
         assert!(!o.parse_fail);
-        assert_eq!(o.turn.tool_calls.len(), 1);
-        assert_eq!(o.turn.tool_calls[0].name, "read");
-        assert_eq!(o.turn.tool_calls[0].arguments["path"], "note.txt");
-        assert!(!o.turn.content.contains("tool_call"));
+        assert!(o.turn.tool_calls.is_empty());
+        assert!(o.turn.content.contains("tool_call"));
     }
 
     #[test]
-    fn parses_json_inside_xml() {
+    fn xml_inside_content_is_not_a_tool_call() {
         let v = json!({
             "choices": [{
                 "message": {
@@ -1009,12 +956,12 @@ mod tests {
             }]
         });
         let o = parse_turn(&v).unwrap();
-        assert_eq!(o.turn.tool_calls[0].name, "bash");
-        assert_eq!(o.turn.tool_calls[0].arguments["command"], "ls");
+        assert!(o.turn.tool_calls.is_empty());
+        assert!(o.turn.content.contains("tool_call"));
     }
 
     #[test]
-    fn merges_openai_and_xml() {
+    fn native_tool_calls_ignore_xml_in_content() {
         let v = json!({
             "choices": [{
                 "message": {
@@ -1029,12 +976,10 @@ mod tests {
         });
         let o = parse_turn(&v).unwrap();
         assert!(!o.parse_fail);
-        assert_eq!(o.turn.tool_calls.len(), 2);
+        assert_eq!(o.turn.tool_calls.len(), 1);
         assert_eq!(o.turn.tool_calls[0].id, "c1");
         assert_eq!(o.turn.tool_calls[0].name, "read");
-        assert_eq!(o.turn.tool_calls[1].id, "c2");
-        assert_eq!(o.turn.tool_calls[1].name, "bash");
-        assert!(!o.turn.content.contains("tool_call"));
+        assert!(o.turn.content.contains("tool_call"));
         assert!(o.turn.content.contains("note"));
     }
 
@@ -1057,7 +1002,7 @@ mod tests {
     }
 
     #[test]
-    fn malformed_xml_is_parse_fail() {
+    fn malformed_xml_is_prose() {
         let v = json!({
             "choices": [{
                 "message": {
@@ -1066,8 +1011,7 @@ mod tests {
             }]
         });
         let o = parse_turn(&v).unwrap();
-        assert!(o.parse_fail);
-        assert!(o.turn.parse_fail);
+        assert!(!o.parse_fail);
         assert!(o.turn.tool_calls.is_empty());
         assert!(o.turn.content.contains("tool_call"));
     }
@@ -1120,7 +1064,7 @@ mod tests {
     }
 
     #[test]
-    fn recovers_tool_calls_from_think_and_content() {
+    fn xml_in_think_or_content_is_not_recovered() {
         let v = json!({
             "choices": [{
                 "message": {
@@ -1130,17 +1074,13 @@ mod tests {
         });
         let o = parse_turn(&v).unwrap();
         assert!(!o.parse_fail);
-        assert_eq!(o.turn.tool_calls.len(), 2);
-        assert_eq!(o.turn.tool_calls[0].arguments["path"], "secret.rs");
-        assert_eq!(o.turn.tool_calls[1].arguments["path"], "note.txt");
+        assert!(o.turn.tool_calls.is_empty());
         assert!(o.turn.reasoning.contains("no"));
-        assert!(!o.turn.reasoning.contains("tool_call"));
         assert!(o.turn.content.contains("I'll read it"));
-        assert!(!o.turn.content.contains("tool_call"));
     }
 
     #[test]
-    fn recovers_complete_tool_call_from_unclosed_think() {
+    fn unclosed_think_xml_is_not_a_tool_call() {
         let v = json!({
             "choices": [{
                 "message": {
@@ -1150,14 +1090,12 @@ mod tests {
         });
         let o = parse_turn(&v).unwrap();
         assert!(!o.parse_fail);
-        assert_eq!(o.turn.tool_calls.len(), 1);
-        assert_eq!(o.turn.tool_calls[0].arguments["path"], "a.rs");
+        assert!(o.turn.tool_calls.is_empty());
         assert!(o.turn.reasoning.contains("plan"));
-        assert!(!o.turn.reasoning.contains("tool_call"));
     }
 
     #[test]
-    fn recovers_from_reasoning_content_channel() {
+    fn reasoning_content_xml_is_not_a_tool_call() {
         let v = json!({
             "choices": [{
                 "message": {
@@ -1167,9 +1105,8 @@ mod tests {
             }]
         });
         let o = parse_turn(&v).unwrap();
-        assert_eq!(o.turn.tool_calls.len(), 1);
-        assert_eq!(o.turn.tool_calls[0].arguments["path"], "a.rs");
-        assert_eq!(o.turn.reasoning, "plan");
+        assert!(o.turn.tool_calls.is_empty());
+        assert!(o.turn.reasoning.contains("tool_call"));
         assert_eq!(o.turn.content, "I'll read it");
     }
 
@@ -1203,9 +1140,9 @@ mod tests {
             }]
         });
         let o = parse_turn(&v).unwrap();
-        assert_eq!(o.turn.tool_calls.len(), 1);
+        assert!(o.turn.tool_calls.is_empty());
         assert!(o.turn.content.contains("I'll read the note first."));
-        assert!(!o.turn.content.contains("tool_call"));
+        assert!(o.turn.content.contains("tool_call"));
     }
 
     #[test]
@@ -1218,9 +1155,9 @@ mod tests {
             }]
         });
         let o = parse_turn(&v).unwrap();
-        assert_eq!(o.turn.tool_calls.len(), 1);
-        assert_eq!(o.turn.content, "I'll read it.");
-        assert!(!o.turn.content.contains("oops"));
+        assert!(o.turn.tool_calls.is_empty());
+        assert!(o.turn.content.contains("I'll read it."));
+        assert!(o.turn.content.contains("oops"));
     }
 
     #[test]
