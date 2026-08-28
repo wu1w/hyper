@@ -1,5 +1,6 @@
 import { useEffect, useRef, useState, type ReactNode } from "react";
 import { api, connectEvents, rpc, type Clarify, type Permit, type SessionEvent, type Snap } from "./api";
+import { applyHistoryIncoming, CONNECT_HINT, nextLive, preferFresherHistory } from "./chat-live";
 
 type LiveBuf = { think: string; content: string };
 type Transcript = { events: SessionEvent[]; live: LiveBuf };
@@ -214,6 +215,7 @@ export function App() {
   const sessionRef = useRef(snap.session);
   sessionRef.current = snap.session;
   const transcriptsRef = useRef<Record<string, Transcript>>({});
+  const [pendingTurn, setPendingTurn] = useState(false);
 
   const go = (id: PageId) => {
     setPage(id);
@@ -221,18 +223,55 @@ export function App() {
   };
 
   const onReload = async () => {
+    const prevSess = sessionRef.current;
     const st = await api<Snap>("/state");
     setSnap(st);
     setPermit(modalForFocus(st.permit ?? null, st.session));
     setClarify(modalForFocus(st.clarify ?? null, st.session));
     const h = await api<{ events: SessionEvent[] }>("/history");
-    const next = h.events || [];
+    const incoming = h.events || [];
+    const switched = !!st.session && !!prevSess && st.session !== prevSess;
+    const parked = st.session ? transcriptsRef.current[st.session] : undefined;
+    const next = applyHistoryIncoming(parked?.events || incoming, incoming, switched);
     setEvents(next);
-    setLive(emptyLive());
-    if (st.session) transcriptsRef.current[st.session] = { events: next, live: emptyLive() };
+    setLive((l) => {
+      const liveNext = switched ? emptyLive() : nextLive(next, parked?.live || l);
+      if (st.session) transcriptsRef.current[st.session] = { events: next, live: liveNext };
+      return liveNext;
+    });
   };
 
-  const busy = !!snap.turn_in_flight;
+  const busy = !!snap.turn_in_flight || pendingTurn;
+
+  useEffect(() => {
+    if (snap.turn_in_flight) setPendingTurn(false);
+  }, [snap.turn_in_flight]);
+
+  const beginTurn = () => {
+    setPendingTurn(true);
+    setLive((l) => {
+      const next = l.think || l.content ? l : { think: CONNECT_HINT, content: "" };
+      const id = sessionRef.current;
+      if (id) {
+        const t = transcriptsRef.current[id] || { events: [], live: emptyLive() };
+        transcriptsRef.current[id] = { ...t, live: next };
+      }
+      return next;
+    });
+  };
+
+  const failTurn = () => {
+    setPendingTurn(false);
+    setLive((l) => {
+      const next = l.think === CONNECT_HINT ? emptyLive() : l;
+      const id = sessionRef.current;
+      if (id) {
+        const t = transcriptsRef.current[id];
+        if (t) transcriptsRef.current[id] = { ...t, live: next };
+      }
+      return next;
+    });
+  };
 
   const goChat = () => {
     const fromOther = page !== "chat";
@@ -257,21 +296,21 @@ export function App() {
 
   useEffect(() => {
     let histTimer: number | undefined;
-    const pullHistory = (clearLive: boolean) => {
+    const pullHistory = () => {
       window.clearTimeout(histTimer);
       histTimer = window.setTimeout(() => {
         void api<{ events: SessionEvent[] }>("/history")
           .then((h) => {
-            const next = h.events || [];
-            setEvents(next);
-            if (clearLive) setLive(emptyLive());
+            const incoming = h.events || [];
             const id = sessionRef.current;
-            if (id) {
-              transcriptsRef.current[id] = {
-                events: next,
-                live: clearLive ? emptyLive() : transcriptsRef.current[id]?.live || emptyLive(),
-              };
-            }
+            const parked = id ? transcriptsRef.current[id] : undefined;
+            const next = preferFresherHistory(parked?.events || incoming, incoming);
+            setEvents(next);
+            setLive((l) => {
+              const liveNext = nextLive(next, parked?.live || l);
+              if (id) transcriptsRef.current[id] = { events: next, live: liveNext };
+              return liveNext;
+            });
           })
           .catch(() => {
             /* keep the live transcript if history is briefly unavailable */
@@ -293,6 +332,7 @@ export function App() {
           setPermit(modalForFocus(p.permit ?? null, st.session));
           setClarify(modalForFocus(p.clarify ?? null, st.session));
           setLive(emptyLive());
+          setPendingTurn(false);
           if (st.session) {
             transcriptsRef.current[st.session] = { events: p.events || [], live: emptyLive() };
           }
@@ -302,18 +342,36 @@ export function App() {
           const focused = p.state?.session || sessionRef.current;
           setPermit(modalForFocus(p.permit ?? null, focused));
           setClarify(modalForFocus(p.clarify ?? null, focused));
-          pullHistory(false);
+          pullHistory();
         } else if (msg.method === "history.replace") {
-          const p = msg.params as { events?: SessionEvent[]; refetch?: boolean; session?: string };
+          const p = msg.params as {
+            events?: SessionEvent[];
+            refetch?: boolean;
+            session?: string;
+            reset?: boolean;
+          };
           const focused = sessionRef.current;
-          if (p.session && focused && p.session !== focused && !p.events) return;
-          if (p.refetch || !p.events) pullHistory(true);
+          if (p.session && focused && p.session !== focused && !p.events && !p.reset) return;
+          if (p.reset) {
+            const incoming = p.events || [];
+            const sid = p.session || focused || "";
+            if (sid) transcriptsRef.current[sid] = { events: incoming, live: emptyLive() };
+            setEvents(incoming);
+            setLive(emptyLive());
+            setPendingTurn(false);
+            return;
+          }
+          if (p.refetch || !p.events) pullHistory();
           else {
             const sid = p.session || focused || "";
-            const keep = transcriptsRef.current[sid]?.live || emptyLive();
-            if (sid) transcriptsRef.current[sid] = { events: p.events, live: keep };
-            setEvents(p.events);
-            setLive(keep.think || keep.content ? keep : emptyLive());
+            const parked = sid ? transcriptsRef.current[sid] : undefined;
+            const next = preferFresherHistory(parked?.events || p.events, p.events);
+            const keep = parked?.live || emptyLive();
+            const liveNext = nextLive(next, keep);
+            if (sid) transcriptsRef.current[sid] = { events: next, live: liveNext };
+            if (p.session && focused && p.session !== focused) return;
+            setEvents(next);
+            setLive(liveNext);
           }
         } else if (msg.method === "event.append") {
           const e = msg.params as SessionEvent;
@@ -326,11 +384,39 @@ export function App() {
             if (!e.session || !focused || e.session === focused) setLive(t.live);
             return;
           }
-          if (e.type === "assistant" || e.type === "stop") t.live = emptyLive();
+          if (e.type === "assistant") {
+            const body = (e.content || "").trim();
+            let dup = false;
+            for (let i = t.events.length - 1; i >= 0; i--) {
+              if (t.events[i].type !== "assistant") continue;
+              if ((t.events[i].content || "") === (e.content || "") && body) dup = true;
+              break;
+            }
+            if (!dup) t.events = [...t.events, e];
+            // Empty assistant hops must not wipe the overlay: history may
+            // still be catching up, and stop arrives before the body lands.
+            if (body) t.live = emptyLive();
+            transcriptsRef.current[sid] = t;
+            if (e.session && focused && e.session !== focused) return;
+            if (body) setLive(emptyLive());
+            if (!dup) {
+              setEvents((xs) => {
+                for (let i = xs.length - 1; i >= 0; i--) {
+                  if (xs[i].type !== "assistant") continue;
+                  if ((xs[i].content || "") === (e.content || "") && body) return xs;
+                  break;
+                }
+                return [...xs, e];
+              });
+            }
+            return;
+          }
           t.events = [...t.events, e];
           transcriptsRef.current[sid] = t;
           if (e.session && focused && e.session !== focused) return;
-          if (e.type === "assistant" || e.type === "stop") setLive(emptyLive());
+          if (e.type === "stop") setPendingTurn(false);
+          // stop 只收束转盘，不清 live：assistant / history.replace 还没带上正文时
+          // 清掉缓冲会让回复从页面上消失，要切页再回来才看得到。
           setEvents((xs) => [...xs, e]);
         } else if (msg.method === "permit.ask") {
           const p = msg.params as Permit;
@@ -540,6 +626,8 @@ export function App() {
                 detailsOpen={details}
                 onToggleDetails={toggleDetails}
                 onReload={onReload}
+                onTurnBegin={beginTurn}
+                onTurnFailed={failTurn}
               />
             </KeepPane>
             <KeepPane id="inbox" page={page} seen={seen}>

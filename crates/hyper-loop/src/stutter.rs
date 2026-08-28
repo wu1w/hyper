@@ -21,8 +21,11 @@ pub fn is_stutter(content: &str, reasoning: &str) -> bool {
 }
 
 /// Long enough to be a user-visible answer, not a one-line status.
+/// Units are English-equivalent: CJK counts 2.5, Latin 1. A ~70-character
+/// Chinese wrap-up matches a 160-character English essay. Sub-40-character
+/// 边做边说 stays below the line.
 pub fn is_substantial_reply(s: &str) -> bool {
-    normalize_reply(s).chars().count() >= MIN_RESTATE_CHARS
+    reply_units(s) >= MIN_RESTATE_CHARS
 }
 
 /// Same essay restated on a later hop (pi-style answer stagnation).
@@ -30,8 +33,8 @@ pub fn is_substantial_reply(s: &str) -> bool {
 pub fn is_restated_reply(prev: &str, next: &str) -> bool {
     let a = normalize_reply(prev);
     let b = normalize_reply(next);
-    let na = a.chars().count();
-    let nb = b.chars().count();
+    let na = a.chars().map(char_units).sum::<usize>() / 2;
+    let nb = b.chars().map(char_units).sum::<usize>() / 2;
     if na < MIN_RESTATE_CHARS || nb < MIN_RESTATE_CHARS {
         return false;
     }
@@ -71,8 +74,7 @@ pub fn is_source_recap(source: &str, answer: &str) -> bool {
     if !is_substantial_reply(answer) {
         return false;
     }
-    let src = normalize_reply(source);
-    if src.chars().count() < MIN_RESTATE_CHARS {
+    if reply_units(source) < MIN_RESTATE_CHARS {
         return false;
     }
     is_restated_reply(source, answer) || source_coverage(answer, source) >= SOURCE_COVERAGE
@@ -190,7 +192,35 @@ fn command_head(p: &str) -> &str {
     t.split_whitespace().next().unwrap_or("")
 }
 
+/// English-equivalent units. CJK counts 2.5 (integer 5/2), Latin 1.
+/// A ~70-character Chinese wrap-up matches a 160-character English essay.
+/// Live 边做边说 stays ~20–35 CJK and remains below the line.
 const MIN_RESTATE_CHARS: usize = 160;
+
+fn reply_units(s: &str) -> usize {
+    normalize_reply(s).chars().map(char_units).sum::<usize>() / 2
+}
+
+fn char_units(c: char) -> usize {
+    if is_cjk(c) {
+        5
+    } else {
+        2
+    }
+}
+
+fn is_cjk(c: char) -> bool {
+    matches!(
+        c,
+        '\u{4e00}'..='\u{9fff}'
+            | '\u{3400}'..='\u{4dbf}'
+            | '\u{f900}'..='\u{faff}'
+            | '\u{3040}'..='\u{30ff}'
+            | '\u{ac00}'..='\u{d7af}'
+            | '\u{3000}'..='\u{303f}'
+            | '\u{ff00}'..='\u{ffef}'
+    )
+}
 const RESTATE_JACCARD: f32 = 0.82;
 /// Fraction of answer trigrams that already appear in tool/user source.
 const SOURCE_COVERAGE: f32 = 0.62;
@@ -369,6 +399,8 @@ is byte-stable and tools stay frozen.";
     fn short_status_is_not_a_restate() {
         assert!(!is_restated_reply("好的，我继续读。", "好的，我继续读。"));
         assert!(!is_substantial_reply("好的，我继续读。"));
+        let wrap = "已经把登录页标题改好并核对路由配置。".repeat(4);
+        assert!(is_substantial_reply(&wrap));
     }
 
     #[test]

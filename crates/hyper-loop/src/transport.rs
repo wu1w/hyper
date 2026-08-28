@@ -182,10 +182,15 @@ fn grok_like_forwarding(cfg: &Config) -> bool {
 }
 
 /// Live choice for [`crate::agent::TransportCompleter`]. Grok-like endpoints
-/// skip the probe. Unknown custom URLs POST `/responses` once: 404 → Chat.
+/// skip the probe. Qwen forwarding stays on Chat Completions without probing
+/// `/responses` (llama.cpp 404s slowly). Unknown custom URLs POST `/responses`
+/// once: 404 → Chat.
 pub async fn detect_wire(cfg: &Config, resolved: &ResolvedTransport) -> WireFormat {
     if prefers_responses_for(cfg, resolved) {
         return WireFormat::Responses;
+    }
+    if forwarding_is_qwen(cfg) {
+        return WireFormat::ChatCompletions;
     }
     if resolved.mode != GrokTransport::OpenAiCompat {
         return WireFormat::Responses;
@@ -200,12 +205,7 @@ pub async fn detect_wire(cfg: &Config, resolved: &ResolvedTransport) -> WireForm
 /// True when POST `/v1/responses` exists (400/401/422 count). 404 does not.
 pub async fn probe_responses_path(resolved: &ResolvedTransport) -> bool {
     let url = format!("{}/responses", resolved.base_url.trim_end_matches('/'));
-    let client = match reqwest::Client::builder()
-        .connect_timeout(std::time::Duration::from_secs(10))
-        .timeout(std::time::Duration::from_secs(15))
-        .tcp_nodelay(true)
-        .build()
-    {
+    let client = match crate::llm_http::build_client_for(2, 8, &resolved.base_url) {
         Ok(c) => c,
         Err(_) => return false,
     };
@@ -474,6 +474,16 @@ mod tests {
         let r = resolve(&c).unwrap();
         assert!(!prefers_responses_for(&c, &r));
         assert!(compact_creds(&c).is_none());
+        assert_eq!(public_auth(&c).wire, "chat_completions");
+    }
+
+    #[test]
+    fn qwenthin_alias_stays_on_chat() {
+        let mut c = cfg("http://127.0.0.1:8080/v1", "local");
+        c.server.model = "QwenThin".into();
+        c.server.family = Family::Qwen38;
+        let r = resolve(&c).unwrap();
+        assert!(!prefers_responses_for(&c, &r));
         assert_eq!(public_auth(&c).wire, "chat_completions");
     }
 

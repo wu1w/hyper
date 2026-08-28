@@ -83,11 +83,15 @@ pub async fn generate(
         return Err("image endpoint is empty; set 生图端点 or the chat base_url".into());
     }
     let url = generations_url(&image_base);
-    let model = cfg.server.resolved_image_model();
+    let model =
+        crate::family::Family::wire_model_id(&cfg.server.resolved_image_model()).to_string();
     let timeout_s = cfg.server.read_timeout_s.clamp(60, 180);
-    let client =
-        crate::llm_http::build_client(crate::llm_http::effective_connect_timeout_s(cfg), timeout_s)
-            .map_err(|e| e.to_string())?;
+    let client = crate::llm_http::build_client_for(
+        crate::llm_http::effective_connect_timeout_s_for(cfg.server.connect_timeout_s, &image_base),
+        timeout_s,
+        &image_base,
+    )
+    .map_err(|e| e.to_string())?;
     let body = json!({
         "model": model,
         "prompt": prompt,

@@ -456,6 +456,11 @@ impl<C: Completer> Agent<C> {
         }
         let reason = stop_reason.clone().unwrap_or_else(|| "stop".into());
         self.log_event(SessionEvent::stop(reason));
+        let text = if stop_reason.as_deref() == Some("aborted") || !text.trim().is_empty() {
+            text
+        } else {
+            self.last_spoken.clone().unwrap_or_default()
+        };
         Ok(AgentOutcome {
             text,
             stop_reason,

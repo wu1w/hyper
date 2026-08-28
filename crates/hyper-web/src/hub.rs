@@ -350,10 +350,7 @@ impl AppState {
                     push_state(&g);
                     let _ = g.bus.send(notify(
                         "history.replace",
-                        json!({
-                            "events": console_events(g.session.events()),
-                            "session": g.session.session_id(),
-                        }),
+                        history_replace_params(g.session.events(), g.session.session_id(), true),
                     ));
                     return v;
                 }
@@ -376,10 +373,7 @@ impl AppState {
             push_focused_modals(&g);
             let _ = g.bus.send(notify(
                 "history.replace",
-                json!({
-                    "events": console_events(g.session.events()),
-                    "session": g.session.session_id(),
-                }),
+                history_replace_params(g.session.events(), g.session.session_id(), true),
             ));
         }
         out
@@ -609,6 +603,17 @@ fn spawn_channel_watch(inner: Arc<Mutex<Inner>>) {
 
 pub fn notify(method: &str, params: Value) -> Value {
     json!({"jsonrpc": "2.0", "method": method, "params": params})
+}
+
+/// Focused-session transcript. `reset: true` means the console must drop the
+/// on-screen events (session.new / resume), not keep a "fresher" transcript
+/// from the previous chat.
+fn history_replace_params(events: &[SessionEvent], session: &str, reset: bool) -> Value {
+    json!({
+        "events": console_events(events),
+        "session": session,
+        "reset": reset,
+    })
 }
 
 fn should_park_switch(method: &str, params: Option<&Value>) -> bool {
@@ -1158,8 +1163,8 @@ pub fn redact_key(key: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        channels_fingerprint, console_events, endpoint_static_runtime, event_payload, redact_key,
-        session_matches,
+        channels_fingerprint, console_events, endpoint_static_runtime, event_payload,
+        history_replace_params, redact_key, session_matches,
     };
     use hyper_loop::config::Config;
     use hyper_loop::session::{SessionEvent, StoredMedia};
@@ -1223,6 +1228,17 @@ mod tests {
         assert_eq!(endpoint_static_runtime(&ep).state, "running");
         ep.kind = "discord".into(); // 不在进程内的平台
         assert_eq!(endpoint_static_runtime(&ep).state, "off");
+    }
+
+    #[test]
+    fn session_switch_history_replace_sets_reset() {
+        let ev = SessionEvent::user("hi");
+        let reset = history_replace_params(&[ev.clone()], "sess-new", true);
+        assert_eq!(reset["reset"], true);
+        assert_eq!(reset["session"], "sess-new");
+        assert_eq!(reset["events"][0]["type"], "user");
+        let keep = history_replace_params(&[ev], "sess-new", false);
+        assert_eq!(keep["reset"], false);
     }
 
     #[test]

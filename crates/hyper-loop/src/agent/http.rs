@@ -45,7 +45,11 @@ impl HttpCompleter {
             Some(model) => (model, None),
             None => {
                 // GET /models must not inherit the 30-minute stream timeout.
-                let probe = crate::llm_http::probe_client(cfg.server.connect_timeout_s.min(5), 15)?;
+                let probe = crate::llm_http::probe_client_for(
+                    cfg.server.connect_timeout_s.min(5),
+                    15,
+                    &cfg.server.base_url,
+                )?;
                 fetch_model(&probe, cfg).await?
             }
         };

@@ -59,36 +59,63 @@ pub fn is_loopback_base(base_url: &str) -> bool {
 
 /// Completions / Responses client: keepalive + connect floor for remote hosts.
 pub fn stream_client(cfg: &Config) -> Result<Client> {
-    build_client(
+    build_client_for(
         effective_connect_timeout_s(cfg),
         cfg.server.read_timeout_s.max(5),
+        &cfg.server.base_url,
     )
 }
 
 /// Short probes (`GET /models`) should not inherit the stream connect floor.
 pub fn probe_client(connect_s: u64, timeout_s: u64) -> Result<Client> {
-    build_client(connect_s.max(1), timeout_s.max(5))
+    probe_client_for(connect_s, timeout_s, "")
+}
+
+pub fn probe_client_for(connect_s: u64, timeout_s: u64, base_url: &str) -> Result<Client> {
+    build_client_for(connect_s.max(1), timeout_s.max(5), base_url)
+}
+
+/// Custom / loopback (and all Windows) stay on HTTP/1.1. Official xAI / cli-chat-proxy
+/// keep HTTP/2 on Unix. Grok-proxy and many reverse proxies buffer H2 SSE.
+pub fn wants_http1(base_url: &str) -> bool {
+    if cfg!(windows) {
+        return true;
+    }
+    if is_loopback_base(base_url) {
+        return true;
+    }
+    let u = base_url.trim();
+    if u.is_empty() {
+        return false;
+    }
+    let l = u.to_ascii_lowercase();
+    !(l.contains("api.x.ai") || l.contains("cli-chat-proxy"))
 }
 
 pub fn build_client(connect_s: u64, timeout_s: u64) -> Result<Client> {
+    build_client_for(connect_s, timeout_s, "")
+}
+
+pub fn build_client_for(connect_s: u64, timeout_s: u64, base_url: &str) -> Result<Client> {
     let mut b = Client::builder()
         .connect_timeout(Duration::from_secs(connect_s.max(1)))
         .timeout(Duration::from_secs(timeout_s.max(5)))
         .tcp_nodelay(true)
         .tcp_keepalive(Duration::from_secs(TCP_KEEPALIVE_S));
     // rustls + HTTP/2 on Windows can sit on an established socket with no
-    // headers until read_timeout (default 30 min). HTTP/1.1 fails fast and
-    // the transient retry paints "正在重连" instead of a silent wait.
-    #[cfg(windows)]
-    {
+    // headers until read_timeout (default 30 min). Custom forwarding proxies
+    // often buffer H2 SSE ("taking longer than expected"). HTTP/1.1 fails
+    // fast and the transient retry paints "正在重连" instead of a silent wait.
+    if wants_http1(base_url) {
         b = b.http1_only();
-    }
-    #[cfg(not(windows))]
-    {
-        b = b
-            .http2_keep_alive_interval(Duration::from_secs(H2_KEEPALIVE_S))
-            .http2_keep_alive_timeout(Duration::from_secs(H2_KEEPALIVE_S))
-            .http2_keep_alive_while_idle(true);
+    } else {
+        #[cfg(not(windows))]
+        {
+            b = b
+                .http2_keep_alive_interval(Duration::from_secs(H2_KEEPALIVE_S))
+                .http2_keep_alive_timeout(Duration::from_secs(H2_KEEPALIVE_S))
+                .http2_keep_alive_while_idle(true);
+        }
     }
     b.build().map_err(|e| Error::Http(e.to_string()))
 }
@@ -248,6 +275,24 @@ mod tests {
             effective_connect_timeout_s_for(3, "http://localhost:8080/v1"),
             3
         );
+    }
+
+    #[test]
+    fn custom_and_loopback_want_http1() {
+        assert!(wants_http1("http://127.0.0.1:8080/v1"));
+        assert!(wants_http1("http://localhost:8645/v1"));
+        assert!(wants_http1("https://grok.example.com/v1"));
+        #[cfg(not(windows))]
+        {
+            assert!(!wants_http1(""));
+            assert!(!wants_http1("https://api.x.ai/v1"));
+            assert!(!wants_http1("https://cli-chat-proxy.grok.com/v1"));
+        }
+        #[cfg(windows)]
+        {
+            assert!(wants_http1(""));
+            assert!(wants_http1("https://api.x.ai/v1"));
+        }
     }
 
     #[test]

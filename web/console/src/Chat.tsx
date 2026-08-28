@@ -19,6 +19,7 @@ import {
   type SubagentSnap,
   type Uploaded,
 } from "./api";
+import { isPrepareHint, stripLeakedToolMarkup, stripThinkRestatement } from "./chat-live";
 import { isJunkPath, lastLiveUserIndex, mergeArtifactLists, siblingStamp, turnArtifacts, turnPreviewPaths, turnTouchedPaths } from "./artifacts";
 import { isOfficeKind, kindFor } from "./preview/kinds";
 import { PreviewDock } from "./preview/PreviewDock";
@@ -388,9 +389,7 @@ export function runPhase(opts: {
   if (!opts.busy && !liveOn) return "idle";
   if (opts.live.content) return "writing";
   if (opts.live.think.includes("网络不稳") || opts.live.think.includes("正在重连")) return "retrying";
-  if (/^(正在整理上下文|正在准备工作区|正在连接模型)…?\s*$/.test(opts.live.think.trim())) {
-    return "preparing";
-  }
+  if (isPrepareHint(opts.live.think)) return "preparing";
   if (opts.live.think) return "thinking";
   const last = opts.events[opts.events.length - 1];
   if (last?.type === "tool") return "tool";
@@ -740,6 +739,8 @@ export function ChatPage({
   detailsOpen,
   onToggleDetails,
   onReload,
+  onTurnBegin,
+  onTurnFailed,
 }: {
   snap: Snap;
   events: SessionEvent[];
@@ -751,6 +752,8 @@ export function ChatPage({
   detailsOpen: boolean;
   onToggleDetails: () => void;
   onReload: () => Promise<void>;
+  onTurnBegin?: () => void;
+  onTurnFailed?: () => void;
 }) {
   const [sessions, setSessions] = useState<SessionInfo[]>([]);
   const [histOpen, setHistOpen] = useState(false);
@@ -807,6 +810,12 @@ export function ChatPage({
       if (turns[i].user !== undefined) return turns[i].key;
     }
     return null;
+  }, [turns]);
+  const lastUserText = useMemo(() => {
+    for (let i = turns.length - 1; i >= 0; i--) {
+      if (turns[i].user) return turns[i].user || "";
+    }
+    return "";
   }, [turns]);
   const userTurnCount = useMemo(() => turns.filter((t) => t.user !== undefined).length, [turns]);
 
@@ -1202,6 +1211,7 @@ export function ChatPage({
       setErr("生图需要文字描述");
       return;
     }
+    onTurnBegin?.();
     try {
       await rpc("turn.start", { prompt, content_parts });
       setText("");
@@ -1210,6 +1220,7 @@ export function ChatPage({
       setMentions([]);
       setSlashOut("");
     } catch (e) {
+      onTurnFailed?.();
       setErr(failMsg(e));
     }
   };
@@ -1386,20 +1397,29 @@ export function ChatPage({
   /** 把流式中的思考/正文合并进最后一轮：思考进轨迹块，正文在下方流式生长。 */
   const withLive = (blocks: Block[]): Block[] => {
     let out = blocks;
-    if (live.think) {
+    const think = stripThinkRestatement(lastUserText, live.think);
+    if (think) {
       const last = out[out.length - 1];
       if (last && last.kind === "activity") {
         out = [
           ...out.slice(0, -1),
-          { kind: "activity", steps: pushThink(last.steps, live.think, !live.content) },
+          { kind: "activity", steps: pushThink(last.steps, think, !live.content) },
         ];
       } else {
-        out = [...out, { kind: "activity", steps: [{ kind: "think", text: live.think, live: !live.content }] }];
+        out = [...out, { kind: "activity", steps: [{ kind: "think", text: think, live: !live.content }] }];
       }
     }
     if (live.content) {
-      out = [...out, { kind: "text", text: live.content, live: true }];
-    } else if (busy && !live.think) {
+      const liveText = stripLeakedToolMarkup(live.content);
+      const last = out[out.length - 1];
+      if (liveText && last && last.kind === "text" && (last.text.includes(liveText) || liveText.startsWith(last.text))) {
+        if (liveText.length > last.text.length) {
+          out = [...out.slice(0, -1), { ...last, text: liveText, live: true }];
+        }
+      } else if (liveText) {
+        out = [...out, { kind: "text", text: liveText, live: true }];
+      }
+    } else if (busy && !think) {
       const last = out[out.length - 1];
       if (!last || last.kind !== "activity") out = [...out, { kind: "activity", steps: [] }];
     }
@@ -1479,7 +1499,13 @@ export function ChatPage({
       const raw = text.trim();
       if (turningOn && !busy && raw && !raw.startsWith("/")) {
         const { prompt, content_parts } = attachPayload(raw, atts);
-        await rpc("turn.start", { prompt, content_parts });
+        onTurnBegin?.();
+        try {
+          await rpc("turn.start", { prompt, content_parts });
+        } catch (e) {
+          onTurnFailed?.();
+          throw e;
+        }
         setText("");
         setAtts([]);
         setSlash([]);
@@ -2399,19 +2425,23 @@ function buildTurns(events: SessionEvent[], rows?: SubagentSnap[]): TurnGroup[] 
       case "assistant": {
         noteDecode(e);
         if (e.reasoning) {
-          const act = activity();
-          act.steps = pushThink(act.steps, e.reasoning);
+          const think = stripThinkRestatement(cur?.user || "", e.reasoning);
+          if (think) {
+            const act = activity();
+            act.steps = pushThink(act.steps, think);
+          }
         }
         const media = parseStoredMedia(e.media);
-        if (e.content || media.length) {
+        const spoken = stripLeakedToolMarkup(e.content || "");
+        if (spoken || media.length) {
           if ((e.tool_calls || []).length > 0 && !media.length) {
             // Tool-hop narration is not the answer. Cursor keeps it in the
             // activity strip; showing it as a bubble is 复读.
-            const t = firstLine(e.content || "");
+            const t = firstLine(spoken);
             if (t) activity().steps.push({ kind: "note", text: clipEnd(t, 160) });
           } else {
             act = undefined;
-            turn().blocks.push({ kind: "text", text: e.content || "", media });
+            turn().blocks.push({ kind: "text", text: spoken, media });
           }
         }
         (e.tool_calls || []).forEach((c, j) => {

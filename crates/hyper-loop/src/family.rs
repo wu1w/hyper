@@ -54,6 +54,31 @@ impl Family {
         matches!(self, Self::Grok46)
     }
 
+    /// Cursor / grok-proxy aliases → official xAI model ids.
+    pub fn wire_model_id(model: &str) -> &str {
+        match model.trim() {
+            "" => "grok-4.6",
+            "g46-xhigh" | "g46-custom" | "xiaoxi-g46" | "grok-4.6-custom" => "grok-4.6",
+            "g45-xhigh" => "grok-4.5",
+            "g43-xhigh" => "grok-4.3",
+            "g420-heavy" => "grok-4.20-multi-agent-0309",
+            "grok-tu" => "grok-imagine-image-2.0",
+            other => other,
+        }
+    }
+
+    /// Effort implied by a Cursor alias. Never used to overwrite an explicit policy.
+    pub fn implied_effort(model: &str) -> Option<&'static str> {
+        let m = model.trim().to_ascii_lowercase();
+        if m.contains("xhigh") || m.contains("heavy") {
+            Some("high")
+        } else if m.contains("fast") || m.ends_with("-low") {
+            Some("low")
+        } else {
+            None
+        }
+    }
+
     /// Best-effort parse of a `/v1/models` id. Unknown Qwen-like ids return `None`
     /// so the builder will not inject 3.8 `xhigh` into a 3.5 template.
     pub fn detect(model_id: &str) -> Option<Self> {
@@ -297,6 +322,22 @@ mod tests {
             Family::Grok46.effort_values(),
             &["low", "medium", "high", "xhigh"]
         );
+        assert_eq!(Family::wire_model_id("g46-xhigh"), "grok-4.6");
+        assert_eq!(Family::wire_model_id("g46-custom"), "grok-4.6");
+        assert_eq!(Family::wire_model_id("xiaoxi-g46"), "grok-4.6");
+        assert_eq!(Family::wire_model_id("grok-4.6-custom"), "grok-4.6");
+        assert_eq!(Family::wire_model_id("g45-xhigh"), "grok-4.5");
+        assert_eq!(Family::wire_model_id("g43-xhigh"), "grok-4.3");
+        assert_eq!(
+            Family::wire_model_id("g420-heavy"),
+            "grok-4.20-multi-agent-0309"
+        );
+        assert_eq!(Family::wire_model_id("grok-tu"), "grok-imagine-image-2.0");
+        assert_eq!(Family::wire_model_id("grok-4.6"), "grok-4.6");
+        assert_eq!(Family::implied_effort("g46-xhigh"), Some("high"));
+        assert_eq!(Family::implied_effort("g420-heavy"), Some("high"));
+        assert_eq!(Family::implied_effort("grok-4.6-fast"), Some("low"));
+        assert_eq!(Family::implied_effort("grok-4.6"), None);
         assert!(Family::Grok46.thinking_always_on());
         assert!(!Family::Grok46.preserve_thinking_kwarg());
     }

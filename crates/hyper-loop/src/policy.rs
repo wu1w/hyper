@@ -50,6 +50,18 @@ impl Effort {
     }
 }
 
+/// Effort on the Grok wire. Honor an explicit policy; Cursor aliases
+/// (`g46-xhigh`) only fill when the client did not set one.
+pub fn grok_forwarding_effort(policy: &ThinkPolicy, configured_model: &str) -> &'static str {
+    if !policy.enabled {
+        return Effort::Low.as_str();
+    }
+    if let Some(e) = policy.effort {
+        return e.as_str();
+    }
+    crate::family::Family::implied_effort(configured_model).unwrap_or(Effort::High.as_str())
+}
+
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct ThinkPolicy {
     pub enabled: bool,
@@ -501,6 +513,21 @@ mod tests {
         assert_eq!(kw.enable_thinking, Some(false));
         assert!(kw.reasoning_effort.is_none());
         assert_eq!(kw.preserve_thinking, Some(true));
+    }
+
+    #[test]
+    fn grok_forwarding_honors_explicit_and_fills_alias() {
+        let mut medium = ThinkPolicy::agent_default();
+        medium.effort = Some(Effort::Medium);
+        assert_eq!(grok_forwarding_effort(&medium, "g46-xhigh"), "medium");
+        let mut unset = ThinkPolicy::agent_default();
+        unset.effort = None;
+        assert_eq!(grok_forwarding_effort(&unset, "g46-xhigh"), "high");
+        assert_eq!(grok_forwarding_effort(&unset, "grok-4.6"), "high");
+        assert_eq!(
+            grok_forwarding_effort(&ThinkPolicy::off(), "g46-xhigh"),
+            "low"
+        );
     }
 
     #[test]

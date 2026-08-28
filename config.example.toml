@@ -1,7 +1,9 @@
 # Copy to ~/.grok-hyper/config.toml (created by `hyper probe` / `hyper web` if missing).
 # Primary shell: `hyper web`. `--print` is oneshot; a TTY with no prompt opens the TUI.
 # Primary target: grok-4.6. Empty base_url → grok login session or XAI_API_KEY (Responses).
-# Custom base_url that is not api.x.ai / cli-chat-proxy → OpenAI Chat Completions.
+# Custom base_url (not api.x.ai / cli-chat-proxy) → OpenAI-compat. Grok-like
+# models use Responses over HTTP/1.1 SSE; Qwen stays on Chat Completions.
+# Effort follows the session; Cursor aliases (g46-xhigh) fill high only when unset.
 # Existing config.toml is not auto-upgraded — copy these numbers if you still have 16k/8-step defaults.
 # Env overlay (HYPER_BASE_URL / HYPER_API_KEY / HYPER_MODEL / XAI_API_KEY) applies to CLI/TUI runs only.
 # `hyper web` ignores HYPER_* on purpose — the console edits this file, and a hidden env

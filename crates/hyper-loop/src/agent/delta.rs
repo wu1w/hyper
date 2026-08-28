@@ -188,12 +188,17 @@ impl StreamPaint {
 
     /// Raw llama.cpp / OpenAI deltas: split `<think>` live; hold back tag prefixes.
     pub(super) fn push_raw(&mut self, reasoning: &str, content: &str, has_tools: bool) {
+        let (think, text) = visible_raw(reasoning, content);
+        // Lifecycle SSE (`response.created` / empty prefill) must not wipe
+        // CONNECT_HINT — that is what made the console look stuck.
+        if think.is_empty() && text.is_empty() && !has_tools {
+            return;
+        }
         self.start();
         if has_tools {
             self.retract_streamed_content();
             self.hide_text = true;
         }
-        let (think, text) = visible_raw(reasoning, content);
         self.emit_think(&think);
         if !self.hide_text {
             self.emit_text(&text);
@@ -380,6 +385,22 @@ mod tests {
         let (a, b) = hold_back_tag_prefix("x<");
         assert_eq!(a, "x");
         assert_eq!(b, "<");
+    }
+
+    #[test]
+    fn empty_lifecycle_does_not_reset() {
+        let events = paint_events(&[("", "", false)]);
+        assert!(events.is_empty(), "{events:?}");
+    }
+
+    #[test]
+    fn first_real_think_resets_after_empty_prefill() {
+        let events = paint_events(&[("", "", false), ("hmm", "", false)]);
+        assert!(
+            matches!(events.first(), Some(SessionEvent::Delta(d)) if d.reset),
+            "{events:?}"
+        );
+        assert_eq!(texts(&events, DeltaChannel::Reasoning), "hmm");
     }
 
     #[test]

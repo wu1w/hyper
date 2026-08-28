@@ -3,8 +3,8 @@
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Map, Value};
 
-use crate::family::{EndpointCaps, EngineProfile};
-use crate::policy::{Sampling, TemplateKwargs, ThinkPolicy};
+use crate::family::{EndpointCaps, EngineProfile, Family};
+use crate::policy::{grok_forwarding_effort, Sampling, TemplateKwargs, ThinkPolicy};
 use crate::template::ChatMessage;
 
 #[derive(Clone, Debug)]
@@ -32,7 +32,11 @@ pub fn build_chat_body(spec: &ChatRequestSpec<'_>) -> Value {
     }
     let mut root = Map::new();
 
-    insert(&mut root, "model", Value::String(spec.model.to_string()));
+    insert(
+        &mut root,
+        "model",
+        Value::String(Family::wire_model_id(spec.model).to_string()),
+    );
     let mut msgs: Vec<Value> = spec
         .messages
         .iter()
@@ -56,12 +60,10 @@ pub fn build_chat_body(spec: &ChatRequestSpec<'_>) -> Value {
     }
 
     if spec.caps.family == crate::family::Family::Grok46 || profile == EngineProfile::Xai {
-        let effort = spec
-            .policy
-            .effort
-            .unwrap_or(crate::policy::Effort::High)
-            .as_str();
+        let effort = grok_forwarding_effort(spec.policy, spec.model);
         insert(&mut root, "reasoning", json!({"effort": effort}));
+        // grok-proxy Chat Completions reads `reasoning_effort`; Responses reads `reasoning`.
+        insert(&mut root, "reasoning_effort", json!(effort));
         // Grok 4.6: thinking cannot be off. Never emit Qwen/llama.cpp keys.
     } else {
         match profile {
@@ -405,8 +407,37 @@ mod tests {
         assert!(body.get("min_p").is_none(), "{body}");
         assert!(body.get("repetition_penalty").is_none(), "{body}");
         assert_eq!(body["reasoning"]["effort"], json!("high"));
+        assert_eq!(body["reasoning_effort"], json!("high"));
         assert!(body.get("max_tokens").is_none(), "{body}");
         assert!(!contains_null(&body), "{body}");
+    }
+
+    #[test]
+    fn grok46_alias_remaps_and_fills_high() {
+        let caps = EndpointCaps::for_family(Family::Grok46, EngineProfile::Xai);
+        let mut policy = ThinkPolicy::agent_default();
+        policy.effort = None;
+        let msgs = vec![ChatMessage::user("hi")];
+        let mut s = spec(&caps, &policy, &msgs, None);
+        s.model = "g46-xhigh";
+        let body = build_chat_body(&s);
+        assert_eq!(body["model"], json!("grok-4.6"));
+        assert_eq!(body["reasoning"]["effort"], json!("high"));
+        assert_eq!(body["reasoning_effort"], json!("high"));
+    }
+
+    #[test]
+    fn grok46_keeps_explicit_medium_on_alias() {
+        let caps = EndpointCaps::for_family(Family::Grok46, EngineProfile::Xai);
+        let mut policy = ThinkPolicy::agent_default();
+        policy.effort = Some(crate::policy::Effort::Medium);
+        let msgs = vec![ChatMessage::user("hi")];
+        let mut s = spec(&caps, &policy, &msgs, None);
+        s.model = "g46-xhigh";
+        let body = build_chat_body(&s);
+        assert_eq!(body["model"], json!("grok-4.6"));
+        assert_eq!(body["reasoning"]["effort"], json!("medium"));
+        assert_eq!(body["reasoning_effort"], json!("medium"));
     }
 
     #[test]

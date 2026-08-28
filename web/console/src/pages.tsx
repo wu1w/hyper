@@ -1685,7 +1685,7 @@ export function SettingsPage({ active = true }: { active?: boolean }) {
               {
                 id: "custom" as const,
                 title: "自定义转发端点",
-                body: "自建 /v1 网关。Grok 转发与 OAuth 同一套 Cursor Responses 体；OAuth 头只加在 grok login 上。",
+                body: "自建 /v1 网关。Grok 转发走 HTTP/1.1 SSE，effort 用会话设置、不强制 high；与 OAuth 同一套 Cursor Responses 体。OAuth 头只加在 grok login 上。",
                 extra: wire === "responses" ? "Responses · Cursor 线" : wire === "chat_completions" ? "Chat Completions" : "自动适配线协议",
               },
             ] as const

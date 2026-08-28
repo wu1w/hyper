@@ -13,7 +13,7 @@ use super::{Completer, HttpCompleter, ModelTurn, TokenSink};
 use crate::config::Config;
 use crate::error::{Error, Result};
 use crate::family::{EndpointCaps, EngineProfile, Family};
-use crate::policy::{Effort, ThinkPolicy};
+use crate::policy::{grok_forwarding_effort, Effort, ThinkPolicy};
 use crate::session::{messages_to_responses_input, OfficialCompaction};
 use crate::template::ChatMessage;
 use crate::tool_calls::ToolCall;
@@ -311,7 +311,7 @@ pub(crate) struct ResponsesSpec<'a> {
 
 pub(crate) fn build_responses_body(spec: &ResponsesSpec<'_>) -> Value {
     let mut root = Map::new();
-    root.insert("model".into(), json!(spec.model));
+    root.insert("model".into(), json!(Family::wire_model_id(spec.model)));
     root.insert("stream".into(), json!(spec.stream));
     root.insert("store".into(), json!(false));
     if spec.policy.max_tokens > 0 {
@@ -321,7 +321,7 @@ pub(crate) fn build_responses_body(spec: &ResponsesSpec<'_>) -> Value {
         );
     }
 
-    let effort = grok_effort(spec.policy);
+    let effort = grok_forwarding_effort(spec.policy, spec.model);
     root.insert("reasoning".into(), json!({ "effort": effort }));
 
     let (instructions, input) = split_instructions(spec.messages, spec.compaction, spec.skip);
@@ -341,14 +341,6 @@ pub(crate) fn build_responses_body(spec: &ResponsesSpec<'_>) -> Value {
         root.insert("prompt_cache_key".into(), json!(key));
     }
     Value::Object(root)
-}
-
-fn grok_effort(policy: &ThinkPolicy) -> &'static str {
-    // Thinking cannot be turned off on grok-4.6. `--fast` maps to low.
-    if !policy.enabled {
-        return Effort::Low.as_str();
-    }
-    policy.effort.unwrap_or(Effort::High).as_str()
 }
 
 fn split_instructions(
@@ -1232,6 +1224,64 @@ mod tests {
     }
 
     #[test]
+    fn grok_alias_remaps_and_fills_high() {
+        let msgs = vec![ChatMessage::user("hi")];
+        let mut policy = ThinkPolicy::agent_default();
+        policy.effort = None;
+        policy.enabled = true;
+        let body = build_responses_body(&ResponsesSpec {
+            model: "g46-xhigh",
+            messages: &msgs,
+            tools: None,
+            stream: false,
+            policy: &policy,
+            cache_key: None,
+            compaction: None,
+            skip: 0,
+        });
+        assert_eq!(body["model"], json!("grok-4.6"));
+        assert_eq!(body["reasoning"]["effort"], json!("high"));
+    }
+
+    #[test]
+    fn grok_keeps_explicit_medium_on_alias() {
+        let msgs = vec![ChatMessage::user("hi")];
+        let mut policy = ThinkPolicy::agent_default();
+        policy.effort = Some(Effort::Medium);
+        let body = build_responses_body(&ResponsesSpec {
+            model: "g46-xhigh",
+            messages: &msgs,
+            tools: None,
+            stream: false,
+            policy: &policy,
+            cache_key: None,
+            compaction: None,
+            skip: 0,
+        });
+        assert_eq!(body["model"], json!("grok-4.6"));
+        assert_eq!(body["reasoning"]["effort"], json!("medium"));
+    }
+
+    #[test]
+    fn grok_does_not_force_high_when_policy_set() {
+        let msgs = vec![ChatMessage::user("hi")];
+        let mut policy = ThinkPolicy::agent_default();
+        policy.effort = Some(Effort::Low);
+        policy.enabled = true;
+        let body = build_responses_body(&ResponsesSpec {
+            model: "grok-4.6",
+            messages: &msgs,
+            tools: None,
+            stream: false,
+            policy: &policy,
+            cache_key: None,
+            compaction: None,
+            skip: 0,
+        });
+        assert_eq!(body["reasoning"]["effort"], json!("low"));
+    }
+
+    #[test]
     fn fast_maps_to_low_effort() {
         let p = ThinkPolicy::off();
         let msgs = vec![ChatMessage::user("hi")];
@@ -1593,6 +1643,12 @@ mod tests {
         let mut acc = ResponsesAcc::default();
         acc.apply_event(&v);
         assert_eq!(acc.content, "Hi");
+    }
+
+    #[test]
+    fn sse_comment_ping_is_ignored() {
+        assert!(parse_sse_event(": ping").is_none());
+        assert!(parse_sse_event(": ping\n\n").is_none());
     }
 
     #[test]
