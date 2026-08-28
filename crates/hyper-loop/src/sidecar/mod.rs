@@ -99,6 +99,39 @@ impl SidecarSession {
         }
     }
 
+    /// Idle copy of surface settings for the console to park this session
+    /// and open another without cancelling a live turn.
+    pub fn idle_twin(&self) -> Self {
+        let mut mailbox = crate::channel::Mailbox::default();
+        mailbox.busy = self.mailbox.busy;
+        Self {
+            opened: self.opened,
+            turn_in_flight: false,
+            session_id: String::new(),
+            workspace: self.workspace.clone(),
+            mode: self.mode,
+            policy: self.policy.clone(),
+            caps: self.caps.clone(),
+            persist: self.persist,
+            effort_locked: self.effort_locked,
+            store: EventStore::Memory(Vec::new()),
+            mailbox,
+            model: self.model.clone(),
+            family: self.family,
+            window: self.window,
+            channels: self.channels.clone(),
+            channel: self.channel.clone(),
+            title: String::new(),
+            tools: self.tools.clone(),
+            plan_mode: self.plan_mode,
+            clarify_mode: self.clarify_mode,
+            imagine_mode: self.imagine_mode,
+            approvals: self.approvals,
+            low_precision: self.low_precision,
+            workspace_confined: self.workspace_confined,
+        }
+    }
+
     pub fn set_model(&mut self, name: impl Into<String>) {
         self.model = name.into();
     }
@@ -381,6 +414,17 @@ mod tests {
         assert_eq!(v["params"]["text"], "ab");
         assert_eq!(v["params"]["delta"], true);
         assert!(v["params"].get("reset").is_none());
+    }
+
+    #[test]
+    fn idle_twin_is_not_in_flight() {
+        let mut session = SidecarSession::new(SidecarOpts::default());
+        session.begin_turn();
+        let twin = session.idle_twin();
+        assert!(!twin.turn_in_flight());
+        assert!(twin.session_id().is_empty());
+        assert_eq!(twin.workspace(), session.workspace());
+        assert!(session.turn_in_flight());
     }
 
     #[test]

@@ -12,11 +12,12 @@ use super::verify;
 use super::{Agent, Completer, ModelTurn, TokenSink};
 use crate::error::Result;
 use crate::mcp::run_mcp;
+use crate::media::{MediaKind, MediaPart};
 use crate::memory::run_memory_search;
 use crate::paw_loop::fs_tool_path;
 use crate::permit::{self, PermitDecision};
 use crate::policy::ThinkPolicy;
-use crate::session::{run_recall, OpenAiToolCall, PolicyReason, SessionEvent};
+use crate::session::{run_recall, OpenAiToolCall, PolicyReason, SessionEvent, StoredMedia};
 use crate::skills::run_skill;
 use crate::template::ChatMessage;
 use crate::tool_calls::{CancelFlag, TextBlock, ToolCall, ToolResponse, ToolState};
@@ -622,6 +623,27 @@ impl<C: Completer> Agent<C> {
                     })
                     .await
             }
+            "computeruse" => {
+                let owned = call.clone();
+                let agent_cancel = self.cancel.clone();
+                let session_id = self.session_id.clone();
+                self.coordinator
+                    .execute(call.clone(), "hyper", None, move |per_call| async move {
+                        let (merged, link) = spawn_cancel_bridge(agent_cancel, per_call);
+                        let res = tokio::select! {
+                            biased;
+                            _ = merged.cancelled() => ToolResponse::text(
+                                &owned.id,
+                                "Error: tool task aborted",
+                                ToolState::Interrupted,
+                            ),
+                            r = crate::tools::computer::computer_use(&owned, merged.clone(), &session_id) => r,
+                        };
+                        link.abort();
+                        res
+                    })
+                    .await
+            }
             _ => {
                 let ws = self.workspace.clone();
                 let limits = self.limits;
@@ -651,14 +673,15 @@ impl<C: Completer> Agent<C> {
     pub(crate) fn commit_tool(&mut self, name: &str, response: ToolResponse) {
         self.remember_tool_output(&response.joined_text());
         let stored = self.persist_turn_media(&response.media);
-        if response.media.is_empty() {
+        let live_parts = stored_to_live_parts(&stored, &response.media);
+        if live_parts.is_empty() {
             self.messages
                 .push(ChatMessage::tool(&response.id, response.joined_text()));
         } else {
             self.messages.push(ChatMessage::tool_media(
                 &response.id,
                 response.joined_text(),
-                response.media.clone(),
+                live_parts,
             ));
         }
         self.log_event(
@@ -674,6 +697,39 @@ impl<C: Completer> Agent<C> {
             )
             .with_media(stored),
         );
+    }
+}
+
+fn stored_to_live_parts(stored: &[StoredMedia], fallback: &[MediaPart]) -> Vec<MediaPart> {
+    if stored.is_empty() {
+        return fallback.to_vec();
+    }
+    stored
+        .iter()
+        .enumerate()
+        .map(|(i, s)| {
+            if s.url.starts_with("data:") {
+                fallback.get(i).cloned().unwrap_or_else(|| MediaPart {
+                    kind: media_kind(&s.kind),
+                    mime: s.mime.clone(),
+                    url: s.url.clone(),
+                })
+            } else {
+                MediaPart {
+                    kind: media_kind(&s.kind),
+                    mime: s.mime.clone(),
+                    url: s.url.clone(),
+                }
+            }
+        })
+        .collect()
+}
+
+fn media_kind(kind: &str) -> MediaKind {
+    match kind {
+        "video" => MediaKind::Video,
+        "audio" => MediaKind::Audio,
+        _ => MediaKind::Image,
     }
 }
 

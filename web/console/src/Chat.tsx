@@ -371,7 +371,7 @@ function compactCount(events: SessionEvent[], snap?: Snap): number {
   return n || usageCompacts(snap?.usage);
 }
 
-export type RunPhase = "idle" | "waiting" | "thinking" | "writing" | "tool" | "permit" | "clarify" | "stopping" | "retrying";
+export type RunPhase = "idle" | "waiting" | "thinking" | "writing" | "tool" | "permit" | "clarify" | "stopping" | "retrying" | "preparing";
 
 export function runPhase(opts: {
   busy: boolean;
@@ -388,6 +388,7 @@ export function runPhase(opts: {
   if (!opts.busy && !liveOn) return "idle";
   if (opts.live.content) return "writing";
   if (opts.live.think.includes("网络不稳") || opts.live.think.includes("正在重连")) return "retrying";
+  if (opts.live.think.includes("正在整理上下文")) return "preparing";
   if (opts.live.think) return "thinking";
   const last = opts.events[opts.events.length - 1];
   if (last?.type === "tool") return "tool";
@@ -406,6 +407,7 @@ export const PHASE_LABEL: Record<RunPhase, string> = {
   clarify: "AskQuestion",
   stopping: "正在停止",
   retrying: "正在重连",
+  preparing: "整理上下文",
 };
 
 export function fmtElapsed(s: number) {
@@ -844,7 +846,7 @@ export function ChatPage({
 
   useEffect(() => {
     refreshSessions();
-  }, [snap.session]);
+  }, [snap.session, (snap.running || []).join("|")]);
 
   useEffect(() => {
     if (histOpen) void refreshSessions();
@@ -1371,7 +1373,7 @@ export function ChatPage({
     phase === "waiting" ? usageLivePrompt(usage) : 0;
   const waitPrefixBit = waitPrefix > 0 ? ` · ${waitPrefix} tokens` : "";
   const callLabel =
-    phase === "stopping" || phase === "permit" || phase === "clarify" || phase === "retrying"
+    phase === "stopping" || phase === "permit" || phase === "clarify" || phase === "retrying" || phase === "preparing"
       ? PHASE_LABEL[phase]
       : snap.imagine_mode && (phase === "waiting" || phase === "writing")
         ? "正在生成图片"
@@ -1987,7 +1989,10 @@ export function ChatPage({
               <div style={{ overflow: "auto", flex: 1 }}>
                 {sessions.length === 0 ? <Empty title="没有会话" body="点新建聊天开始。" /> : null}
                 {sessions.map((s) => (
-                  <div key={s.id} className={`session-row${s.id === snap.session ? " on" : ""}`}>
+                  <div
+                    key={s.id}
+                    className={`session-row${s.id === snap.session ? " on" : ""}${snap.running?.includes(s.id) ? " run" : ""}`}
+                  >
                     <label className="tick">
                       <input
                         type="checkbox"
@@ -2011,7 +2016,12 @@ export function ChatPage({
                         }
                       }}
                     >
-                      <div className="t">{sessionName(s)}</div>
+                      <div className="t">
+                        {snap.running?.includes(s.id) ? (
+                          <span className="run-dot" title="运行中" aria-label="运行中" />
+                        ) : null}
+                        {sessionName(s)}
+                      </div>
                       {s.id ? <div className="sid">{s.id}</div> : null}
                       <div className="m">
                         {s.mode || "agent"} · {s.channel || "console"} · {s.events ?? 0} events

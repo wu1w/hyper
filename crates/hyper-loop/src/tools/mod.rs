@@ -154,7 +154,7 @@ pub async fn run_tool(
             )
             .await
         }
-        "computeruse" => computer::computer_use(call, cancel).await,
+        "computeruse" => computer::computer_use(call, cancel, "").await,
         other => ToolResponse::text(
             &call.id,
             format!("Error: unknown tool '{other}'."),

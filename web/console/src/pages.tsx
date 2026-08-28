@@ -199,10 +199,12 @@ export { ChannelsPage } from "./channels";
 
 export function SessionsPage({
   current,
+  running,
   onOpen,
   active = true,
 }: {
   current?: string;
+  running?: string[];
   onOpen: () => void;
   active?: boolean;
 }) {
@@ -224,6 +226,7 @@ export function SessionsPage({
   });
   const shownIds = shown.map((s) => s.id);
   const allOn = shownIds.length > 0 && shownIds.every((id) => picked.has(id));
+  const runningSet = new Set(running || []);
   const togglePick = (id: string, on: boolean) => {
     setPicked((cur) => {
       const next = new Set(cur);
@@ -301,7 +304,12 @@ export function SessionsPage({
                       />
                     </td>
                     <td>
-                      <b>{sessionName(s)}</b>
+                      <b className="session-name">
+                        {runningSet.has(s.id) ? (
+                          <span className="run-dot" title="运行中" aria-label="运行中" />
+                        ) : null}
+                        {sessionName(s)}
+                      </b>
                       <div className="sub mono">{s.id}</div>
                     </td>
                     <td>{s.channel || "console"}</td>
@@ -694,6 +702,17 @@ export function FilesPage({
     setErr("");
     setPicking(true);
     try {
+      const desktopPick = window.grokHyperDesktop?.pickFolder;
+      if (desktopPick) {
+        try {
+          const r = await desktopPick();
+          if (r?.cancelled || !r?.path) return;
+          await applyPath(r.path);
+          return;
+        } catch {
+          /* sidecar picker below */
+        }
+      }
       const j = await api<{ ok?: boolean; cancelled?: boolean; workspace?: string }>("/workspace/pick", {
         method: "POST",
       });
@@ -845,7 +864,7 @@ export function FilesPage({
                 onClick={() => void openFile(e)}
               >
                 <Icon name={e.dir ? "folder" : "file"} />
-                {e.path.split("/").pop()}
+                {basename(e.path)}
               </button>
             ))}
           </div>

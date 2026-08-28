@@ -5,7 +5,9 @@
 //! (screenshot) and Accessibility (input). Windows needs an interactive
 //! desktop session. Linux returns a clear error: not supported.
 
-use std::sync::Mutex;
+use std::cell::RefCell;
+use std::collections::HashMap;
+use std::sync::{Mutex, OnceLock};
 use std::time::Duration;
 
 use image::{DynamicImage, GenericImageView, RgbaImage};
@@ -22,7 +24,23 @@ const MAX_TYPE_CHARS: usize = 4_000;
 #[allow(dead_code)]
 const SETTLE_MS: u64 = 40;
 
-static LAST_SHOT: Mutex<Option<ShotMeta>> = Mutex::new(None);
+static LAST_SHOT: OnceLock<Mutex<HashMap<String, ShotMeta>>> = OnceLock::new();
+
+thread_local! {
+    static SHOT_SESSION: RefCell<String> = const { RefCell::new(String::new()) };
+}
+
+fn shot_map() -> &'static Mutex<HashMap<String, ShotMeta>> {
+    LAST_SHOT.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+fn set_shot_session(id: &str) {
+    SHOT_SESSION.with(|s| s.borrow_mut().clone_from(&id.to_string()));
+}
+
+fn shot_session() -> String {
+    SHOT_SESSION.with(|s| s.borrow().clone())
+}
 
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct ShotMeta {
@@ -125,13 +143,17 @@ fn aborted(id: &str) -> ToolResponse {
     ToolResponse::text(id, "Error: tool task aborted", ToolState::Interrupted)
 }
 
-pub async fn computer_use(call: &ToolCall, cancel: CancelFlag) -> ToolResponse {
+pub async fn computer_use(call: &ToolCall, cancel: CancelFlag, session_id: &str) -> ToolResponse {
     if cancel.is_cancelled() {
         return aborted(&call.id);
     }
     let owned = call.clone();
     let flag = cancel.clone();
-    let mut join = tokio::task::spawn_blocking(move || execute_sync_cancel(&owned, &flag));
+    let sid = session_id.to_string();
+    let mut join = tokio::task::spawn_blocking(move || {
+        set_shot_session(&sid);
+        execute_sync_cancel(&owned, &flag)
+    });
     tokio::select! {
         biased;
         _ = cancel.cancelled() => {
@@ -228,12 +250,14 @@ fn arg_str<'a>(args: &'a Value, key: &str) -> Option<&'a str> {
 
 #[allow(dead_code)]
 fn remember(meta: ShotMeta) {
-    *crate::lock_unpoison(&LAST_SHOT) = Some(meta);
+    crate::lock_unpoison(shot_map()).insert(shot_session(), meta);
 }
 
 #[allow(dead_code)]
 fn last_shot() -> Option<ShotMeta> {
-    crate::lock_unpoison(&LAST_SHOT).clone()
+    crate::lock_unpoison(shot_map())
+        .get(&shot_session())
+        .copied()
 }
 
 #[allow(dead_code)]
@@ -751,7 +775,7 @@ mod tests {
         let cancel = crate::tool_calls::CancelFlag::new();
         cancel.cancel();
         let started = std::time::Instant::now();
-        let r = computer_use(&call(json!({"action": "screenshot"})), cancel).await;
+        let r = computer_use(&call(json!({"action": "screenshot"})), cancel, "t").await;
         assert_eq!(r.state, ToolState::Interrupted);
         assert!(r.joined_text().contains("aborted"));
         assert!(started.elapsed() < std::time::Duration::from_secs(1));
@@ -763,7 +787,7 @@ mod tests {
         let task = {
             let cancel = cancel.clone();
             tokio::spawn(async move {
-                computer_use(&call(json!({"action": "wait", "ms": 8000})), cancel).await
+                computer_use(&call(json!({"action": "wait", "ms": 8000})), cancel, "t").await
             })
         };
         tokio::time::sleep(std::time::Duration::from_millis(30)).await;
@@ -796,5 +820,31 @@ mod tests {
         let r = execute_sync(&call(json!({"action": "screenshot"})));
         assert_eq!(r.state, ToolState::Error);
         assert!(r.joined_text().contains("Windows"));
+    }
+
+    #[test]
+    fn last_shot_is_keyed_by_session() {
+        set_shot_session("cu-a");
+        remember(ShotMeta {
+            origin_x: 1,
+            origin_y: 2,
+            screen_w: 3,
+            screen_h: 4,
+            img_w: 5,
+            img_h: 6,
+        });
+        set_shot_session("cu-b");
+        remember(ShotMeta {
+            origin_x: 10,
+            origin_y: 20,
+            screen_w: 30,
+            screen_h: 40,
+            img_w: 50,
+            img_h: 60,
+        });
+        set_shot_session("cu-a");
+        assert_eq!(last_shot().unwrap().origin_x, 1);
+        set_shot_session("cu-b");
+        assert_eq!(last_shot().unwrap().origin_x, 10);
     }
 }

@@ -1,5 +1,26 @@
-import { useEffect, useState, type ReactNode } from "react";
+import { useEffect, useRef, useState, type ReactNode } from "react";
 import { api, connectEvents, rpc, type Clarify, type Permit, type SessionEvent, type Snap } from "./api";
+
+type LiveBuf = { think: string; content: string };
+type Transcript = { events: SessionEvent[]; live: LiveBuf };
+
+function emptyLive(): LiveBuf {
+  return { think: "", content: "" };
+}
+
+function applyDelta(live: LiveBuf, e: SessionEvent): LiveBuf {
+  if (e.reset) {
+    if (e.content_only) return { ...live, content: "" };
+    return emptyLive();
+  }
+  if (e.channel === "reasoning") return { ...live, think: live.think + (e.text || "") };
+  return { ...live, content: live.content + (e.text || "") };
+}
+
+function modalForFocus<T extends { session?: string } | null>(item: T, focused?: string): T | null {
+  if (!item || !item.session || !focused || item.session === focused) return item;
+  return null;
+}
 import { ChatPage, ClarifyModal, PermitModal, RunChip, runPhase } from "./Chat";
 import {
   ChannelsPage,
@@ -190,6 +211,9 @@ export function App() {
     ok: null,
     model: "",
   });
+  const sessionRef = useRef(snap.session);
+  sessionRef.current = snap.session;
+  const transcriptsRef = useRef<Record<string, Transcript>>({});
 
   const go = (id: PageId) => {
     setPage(id);
@@ -199,11 +223,13 @@ export function App() {
   const onReload = async () => {
     const st = await api<Snap>("/state");
     setSnap(st);
-    setPermit(st.permit ?? null);
-    setClarify(st.clarify ?? null);
+    setPermit(modalForFocus(st.permit ?? null, st.session));
+    setClarify(modalForFocus(st.clarify ?? null, st.session));
     const h = await api<{ events: SessionEvent[] }>("/history");
-    setEvents(h.events || []);
-    setLive({ think: "", content: "" });
+    const next = h.events || [];
+    setEvents(next);
+    setLive(emptyLive());
+    if (st.session) transcriptsRef.current[st.session] = { events: next, live: emptyLive() };
   };
 
   const busy = !!snap.turn_in_flight;
@@ -230,7 +256,29 @@ export function App() {
   }, [page]);
 
   useEffect(() => {
-    return connectEvents(
+    let histTimer: number | undefined;
+    const pullHistory = (clearLive: boolean) => {
+      window.clearTimeout(histTimer);
+      histTimer = window.setTimeout(() => {
+        void api<{ events: SessionEvent[] }>("/history")
+          .then((h) => {
+            const next = h.events || [];
+            setEvents(next);
+            if (clearLive) setLive(emptyLive());
+            const id = sessionRef.current;
+            if (id) {
+              transcriptsRef.current[id] = {
+                events: next,
+                live: clearLive ? emptyLive() : transcriptsRef.current[id]?.live || emptyLive(),
+              };
+            }
+          })
+          .catch(() => {
+            /* keep the live transcript if history is briefly unavailable */
+          });
+      }, 80);
+    };
+    const stop = connectEvents(
       (msg) => {
         if (msg.method === "hello") {
           const p = msg.params as {
@@ -239,38 +287,63 @@ export function App() {
             permit?: Permit;
             clarify?: Clarify;
           };
-          setSnap(p.state || {});
-          setEvents(p.events || []);
-          setPermit(p.permit ?? null);
-          setClarify(p.clarify ?? null);
-          // 重连后的基线里没有断线前的旧增量，清掉避免流式文本重复。
-          setLive({ think: "", content: "" });
+          const st = p.state || {};
+          setSnap(st);
+          if (p.events) setEvents(p.events);
+          setPermit(modalForFocus(p.permit ?? null, st.session));
+          setClarify(modalForFocus(p.clarify ?? null, st.session));
+          setLive(emptyLive());
+          if (st.session) {
+            transcriptsRef.current[st.session] = { events: p.events || [], live: emptyLive() };
+          }
+        } else if (msg.method === "resync") {
+          const p = msg.params as { state?: Snap; permit?: Permit; clarify?: Clarify };
+          if (p.state) setSnap(p.state);
+          const focused = p.state?.session || sessionRef.current;
+          setPermit(modalForFocus(p.permit ?? null, focused));
+          setClarify(modalForFocus(p.clarify ?? null, focused));
+          pullHistory(false);
         } else if (msg.method === "history.replace") {
-          const p = msg.params as { events?: SessionEvent[] };
-          setEvents(p.events || []);
-          setLive({ think: "", content: "" });
+          const p = msg.params as { events?: SessionEvent[]; refetch?: boolean; session?: string };
+          const focused = sessionRef.current;
+          if (p.session && focused && p.session !== focused && !p.events) return;
+          if (p.refetch || !p.events) pullHistory(true);
+          else {
+            const sid = p.session || focused || "";
+            const keep = transcriptsRef.current[sid]?.live || emptyLive();
+            if (sid) transcriptsRef.current[sid] = { events: p.events, live: keep };
+            setEvents(p.events);
+            setLive(keep.think || keep.content ? keep : emptyLive());
+          }
         } else if (msg.method === "event.append") {
           const e = msg.params as SessionEvent;
-            if (e.type === "delta") {
-            setLive((l) => {
-              if (e.reset) {
-                if (e.content_only) return { ...l, content: "" };
-                return { think: "", content: "" };
-              }
-              if (e.channel === "reasoning") return { ...l, think: l.think + (e.text || "") };
-              return { ...l, content: l.content + (e.text || "") };
-            });
+          const focused = sessionRef.current;
+          const sid = e.session || focused || "";
+          const t = transcriptsRef.current[sid] || { events: [], live: emptyLive() };
+          if (e.type === "delta") {
+            t.live = applyDelta(t.live, e);
+            transcriptsRef.current[sid] = t;
+            if (!e.session || !focused || e.session === focused) setLive(t.live);
             return;
           }
-          // assistant 事件带来完整正文；stop 表示本轮已收束（含 abort），残留的流式缓冲都该清。
-          if (e.type === "assistant" || e.type === "stop") setLive({ think: "", content: "" });
+          if (e.type === "assistant" || e.type === "stop") t.live = emptyLive();
+          t.events = [...t.events, e];
+          transcriptsRef.current[sid] = t;
+          if (e.session && focused && e.session !== focused) return;
+          if (e.type === "assistant" || e.type === "stop") setLive(emptyLive());
           setEvents((xs) => [...xs, e]);
         } else if (msg.method === "permit.ask") {
-          setPermit(msg.params as Permit);
+          const p = msg.params as Permit;
+          const focused = sessionRef.current;
+          if (p && p.session && focused && p.session !== focused) return;
+          setPermit(p);
         } else if (msg.method === "permit.clear") {
           setPermit(null);
         } else if (msg.method === "clarify.ask") {
-          setClarify(msg.params as Clarify);
+          const p = msg.params as Clarify;
+          const focused = sessionRef.current;
+          if (p && p.session && focused && p.session !== focused) return;
+          setClarify(p);
         } else if (msg.method === "clarify.clear") {
           setClarify(null);
         } else if (msg.method === "state") {
@@ -279,6 +352,10 @@ export function App() {
       },
       (up) => setWsUp(up),
     );
+    return () => {
+      window.clearTimeout(histTimer);
+      stop();
+    };
   }, []);
 
   const phase = runPhase({ busy, live, events, permit, clarify });
@@ -292,14 +369,29 @@ export function App() {
     });
 
   useEffect(() => {
+    const id = snap.session;
+    if (!id) return;
+    const t = transcriptsRef.current[id];
+    if (t) {
+      setEvents(t.events);
+      setLive(t.live);
+    } else {
+      setEvents([]);
+      setLive(emptyLive());
+    }
+  }, [snap.session]);
+
+  useEffect(() => {
     if (!busy) {
       setElapsed(0);
       return;
     }
-    const t0 = Date.now();
-    const id = setInterval(() => setElapsed(Math.floor((Date.now() - t0) / 1000)), 250);
+    const started = snap.running_started?.[snap.session || ""] || Date.now();
+    const tick = () => setElapsed(Math.max(0, Math.floor((Date.now() - started) / 1000)));
+    tick();
+    const id = setInterval(tick, 250);
     return () => clearInterval(id);
-  }, [busy, snap.session]);
+  }, [busy, snap.session, snap.running_started]);
 
   useEffect(() => {
     let stop = false;
@@ -390,9 +482,13 @@ export function App() {
               type="button"
               className="new-session"
               onClick={async () => {
-                await rpc("session.new", {});
-                go("chat");
-                await onReload();
+                try {
+                  await rpc("session.new", {});
+                  go("chat");
+                  await onReload();
+                } catch {
+                  /* keep the current chat if new session fails */
+                }
               }}
             >
               <Icon name="plus" />
@@ -453,7 +549,12 @@ export function App() {
               <ChannelsPage active={page === "channels"} />
             </KeepPane>
             <KeepPane id="sessions" page={page} seen={seen}>
-              <SessionsPage current={snap.session} active={page === "sessions"} onOpen={goChat} />
+              <SessionsPage
+                current={snap.session}
+                running={snap.running}
+                active={page === "sessions"}
+                onOpen={goChat}
+              />
             </KeepPane>
             <KeepPane id="cron" page={page} seen={seen}>
               <CronPage active={page === "cron"} busy={busy} />

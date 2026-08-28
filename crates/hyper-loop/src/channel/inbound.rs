@@ -172,7 +172,9 @@ async fn agent_inbound(
     };
     crate::agent::apply_unattended_policy(&mut opts, cfg);
     let completer = TransportCompleter::connect(cfg, policy).await?;
-    let mut agent = Agent::new(completer, opts)?;
+    let mut agent = tokio::task::spawn_blocking(move || Agent::new(completer, opts))
+        .await
+        .map_err(|e| Error::msg(format!("agent setup: {e}")))??;
     let out = agent.run_message(env.to_chat_message()).await?;
     Ok(crate::channel::xfer::reply_parts(
         &out.text,

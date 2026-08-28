@@ -656,7 +656,7 @@ impl SidecarSession {
         }
     }
 
-    pub(crate) fn reload(&mut self) {
+    pub fn reload(&mut self) {
         if !self.persist || self.session_id.is_empty() {
             return;
         }

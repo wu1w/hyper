@@ -163,16 +163,16 @@ async fn rpc(State(st): State<AppState>, Json(body): Json<RpcBody>) -> Json<Valu
 
 async fn state_get(State(st): State<AppState>) -> Json<Value> {
     let g = st.inner.lock().await;
-    let mut v = g.session.state_json();
-    v["permit"] = json!(g.pending.front().map(|p| p.json()));
-    v["clarify"] = json!(g.pending_clarify.front().map(|p| p.json()));
+    let mut v = g.console_state();
+    v["permit"] = json!(g.focused_permit_json());
+    v["clarify"] = json!(g.focused_clarify_json());
     v["jobs"] = json!(g.cron.jobs.len());
     Json(v)
 }
 
 async fn history_get(State(st): State<AppState>) -> Json<Value> {
     let g = st.inner.lock().await;
-    Json(json!({"ok": true, "events": g.session.events()}))
+    Json(json!({"ok": true, "events": crate::hub::console_events(g.session.events())}))
 }
 
 async fn usage_get(State(st): State<AppState>) -> Json<Value> {
@@ -354,10 +354,10 @@ async fn client_ws(mut socket: WebSocket, st: AppState) {
             "jsonrpc": "2.0",
             "method": "hello",
             "params": {
-                "state": g.session.state_json(),
-                "events": g.session.events(),
-                "permit": g.pending.front().map(|p| p.json()),
-                "clarify": g.pending_clarify.front().map(|p| p.json()),
+                "state": g.console_state(),
+                "events": crate::hub::console_events(g.session.events()),
+                "permit": g.focused_permit_json(),
+                "clarify": g.focused_clarify_json(),
             }
         });
         if socket
@@ -378,21 +378,20 @@ async fn client_ws(mut socket: WebSocket, st: AppState) {
                         }
                     }
                     Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {
-                        let hello = {
+                        let resync = {
                             let g = st.inner.lock().await;
                             json!({
                                 "jsonrpc": "2.0",
-                                "method": "hello",
+                                "method": "resync",
                                 "params": {
-                                    "state": g.session.state_json(),
-                                    "events": g.session.events(),
-                                    "permit": g.pending.front().map(|p| p.json()),
-                "clarify": g.pending_clarify.front().map(|p| p.json()),
+                                    "state": g.console_state(),
+                                    "permit": g.focused_permit_json(),
+                                    "clarify": g.focused_clarify_json(),
                                 }
                             })
                         };
                         if socket
-                            .send(Message::Text(hello.to_string().into()))
+                            .send(Message::Text(resync.to_string().into()))
                             .await
                             .is_err()
                         {
@@ -593,14 +592,19 @@ async fn files_put(
 }
 
 async fn tree_get(State(st): State<AppState>) -> Result<Json<Value>, (StatusCode, String)> {
-    let g = st.inner.lock().await;
-    let root = g.session.workspace();
-    let rows =
-        list_tree(root, 2000).map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    let root = {
+        let g = st.inner.lock().await;
+        g.session.workspace().to_path_buf()
+    };
+    let listed = root.clone();
+    let rows = tokio::task::spawn_blocking(move || list_tree(&listed, 2000))
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
     Ok(Json(json!({
         "ok": true,
         "root": root.display().to_string(),
-        "parent": parent_dir(root),
+        "parent": parent_dir(&root),
         "entries": rows,
     })))
 }
@@ -640,7 +644,7 @@ fn workspace_busy_err() -> (StatusCode, String) {
 }
 
 fn apply_workspace(g: &mut Inner, path: PathBuf) -> Result<Value, (StatusCode, String)> {
-    if g.session.turn_in_flight() || g.live.is_some() {
+    if g.session.turn_in_flight() || g.any_live() {
         return Err(workspace_busy_err());
     }
     persist_cfg(g, |cfg| {
@@ -662,7 +666,7 @@ async fn workspace_get(State(st): State<AppState>) -> Json<Value> {
         "ok": true,
         "workspace": g.session.workspace().display().to_string(),
         "parent": parent_dir(g.session.workspace()),
-        "turn_in_flight": g.session.turn_in_flight() || g.live.is_some(),
+        "turn_in_flight": g.session.turn_in_flight() || g.any_live(),
         "saved": g.cfg.console.workspace,
         "shortcuts": workspace_shortcuts(),
     }))
@@ -674,7 +678,7 @@ async fn workspace_post(
 ) -> Result<Json<Value>, (StatusCode, String)> {
     let current = {
         let g = st.inner.lock().await;
-        if g.session.turn_in_flight() || g.live.is_some() {
+        if g.session.turn_in_flight() || g.any_live() {
             return Err(workspace_busy_err());
         }
         g.session.workspace().to_path_buf()
@@ -691,7 +695,7 @@ async fn workspace_post(
 async fn workspace_pick(State(st): State<AppState>) -> Result<Json<Value>, (StatusCode, String)> {
     {
         let g = st.inner.lock().await;
-        if g.session.turn_in_flight() || g.live.is_some() {
+        if g.session.turn_in_flight() || g.any_live() {
             return Err(workspace_busy_err());
         }
     }
@@ -965,7 +969,7 @@ async fn config_post(
         g.session.set_window(window);
     }
     let public = config_public(&g.cfg);
-    let state = g.session.state_json();
+    let state = g.console_state();
     let bus = st.bus.clone();
     drop(g);
     let _ = bus.send(crate::hub::notify("state", state));
@@ -1457,7 +1461,7 @@ async fn channels_post(
             g.session.set_busy(p);
         }
     }
-    let state = g.session.state_json();
+    let state = g.console_state();
     let bus = st.bus.clone();
     drop(g);
     let _ = bus.send(crate::hub::notify("state", state));

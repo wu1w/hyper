@@ -5,4 +5,5 @@ contextBridge.exposeInMainWorld("grokHyperDesktop", {
   close: () => ipcRenderer.send("desktop:close"),
   minimize: () => ipcRenderer.send("desktop:min"),
   toggleMaximize: () => ipcRenderer.send("desktop:max"),
+  pickFolder: () => ipcRenderer.invoke("desktop:pickFolder"),
 });

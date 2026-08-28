@@ -1467,6 +1467,23 @@ fn turn_start_compact_at_120k_or_soft() {
 }
 
 #[test]
+fn follow_up_compacts_tool_heavy_even_under_120k() {
+    assert!(!should_compact_at_user_turn(1_000, 0, 500_000, 0.80));
+    assert!(should_compact_follow_up(1_000, 0, 500_000, 0.80, 8, 0));
+    assert!(!should_compact_follow_up(1_000, 0, 500_000, 0.80, 7, 0));
+    assert!(should_compact_follow_up(1_000, 0, 500_000, 0.80, 0, 5));
+    assert!(!should_compact_follow_up(1_000, 0, 0, 0.80, 8, 5));
+}
+
+#[test]
+fn mid_turn_compacts_computer_use_not_ordinary_reads() {
+    assert!(!should_compact_mid_turn(8, 0));
+    assert!(!should_compact_mid_turn(15, 4));
+    assert!(should_compact_mid_turn(16, 0));
+    assert!(should_compact_mid_turn(0, 5));
+}
+
+#[test]
 fn window_262k_soft_and_hard_use_ratio_and_reserve() {
     let w = 262_144;
     let r = DEFAULT_GENERATION_RESERVE;
@@ -1495,6 +1512,62 @@ async fn prefix_hard_window_still_budgets() {
     assert_eq!(out.stop_reason, None, "{:?}", out.stop_reason);
     assert_eq!(out.text, "should not run");
     assert!(out.steps >= 1);
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+#[tokio::test]
+async fn follow_up_archives_tool_heavy_turn_without_tokenizer() {
+    let dir = std::env::temp_dir().join(format!("hyper-fu-{}", uuid::Uuid::new_v4().simple()));
+    let sess = dir.join("sessions");
+    std::fs::create_dir_all(&sess).unwrap();
+    for i in 0..8 {
+        std::fs::write(dir.join(format!("f{i}.txt")), "x").unwrap();
+    }
+    let mut o = opts(&dir);
+    o.persist_session = true;
+    o.session_id = "fu1".into();
+    o.session_dir = Some(sess.clone());
+    o.max_steps = 20;
+    let mut turns = VecDeque::new();
+    for i in 0..8 {
+        turns.push_back(turn_tool_id(
+            &format!("c{i}"),
+            "read",
+            json!({"path": format!("f{i}.txt")}),
+        ));
+    }
+    turns.push_back(turn_text("first done"));
+    turns.push_back(turn_text("second done"));
+    let scripted = Scripted {
+        turns: Mutex::new(turns),
+        meter: false,
+    };
+    let mut agent = Agent::new(scripted, o).unwrap();
+    let first = agent.run("read the eight files").await.unwrap();
+    assert_eq!(first.text, "first done", "{:?}", first.stop_reason);
+    let live_tools = agent.messages.iter().filter(|m| m.role == "tool").count();
+    assert!(
+        live_tools >= 8,
+        "first turn should still hold its tools: {live_tools}"
+    );
+    let second = agent.run("what did you find").await.unwrap();
+    assert_eq!(second.text, "second done", "{:?}", second.stop_reason);
+    let live_tools = agent.messages.iter().filter(|m| m.role == "tool").count();
+    assert_eq!(
+        live_tools, 0,
+        "follow-up must archive the previous tool turn, not replay it: {live_tools}"
+    );
+    let log = SessionLog::open_in(&sess, "fu1").unwrap();
+    assert!(
+        log.events()
+            .iter()
+            .any(|e| matches!(e, SessionEvent::Compact(_))),
+        "tool-heavy follow-up should compact without a prefix meter: {:?}",
+        log.events()
+            .iter()
+            .map(|e| e.type_name())
+            .collect::<Vec<_>>()
+    );
     let _ = std::fs::remove_dir_all(dir);
 }
 
@@ -4076,6 +4149,11 @@ async fn view_dispatch_attaches_when_caps_allow() {
         viewed.text()
     );
     assert_eq!(viewed.parts.len(), 1);
-    assert!(viewed.parts[0].url.starts_with("data:image/png;base64,"));
+    assert!(
+        viewed.parts[0].url.contains(".grok-hyper/generated/")
+            || viewed.parts[0].url.starts_with("data:image/png;base64,"),
+        "live window should keep a disk path, not a multi-MB data URI: {}",
+        viewed.parts[0].url
+    );
     let _ = std::fs::remove_dir_all(dir);
 }

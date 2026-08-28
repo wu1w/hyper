@@ -78,13 +78,14 @@ export function usageHitPct(u?: Usage | null): number | null {
   return u?.hit_pct == null ? null : Number(u.hit_pct);
 }
 
-export type Permit = { id: number; tool: string; preview: string } | null;
+export type Permit = { id: number; tool: string; preview: string; session?: string } | null;
 
 export type Clarify = {
   id: number;
   title: string;
   prompt: string;
   options: Array<{ id: string; label: string }>;
+  session?: string;
 } | null;
 
 export type SubagentSnap = {
@@ -117,6 +118,8 @@ export type Snap = {
   queue_preview?: string[];
   steer_preview?: string[];
   turn_in_flight?: boolean;
+  running?: string[];
+  running_started?: Record<string, number>;
   window?: number;
   usage?: Usage;
   permit?: Permit;
@@ -142,6 +145,7 @@ export type SessionEvent = {
   decode_tok_s?: number | null;
   reason?: string;
   session_id?: string;
+  session?: string;
   tool_call_id?: string;
   blob?: string | null;
   original_chars?: number | null;

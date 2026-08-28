@@ -151,6 +151,12 @@ fn http_status_in(s: &str) -> Option<u16> {
             && (i == 0 || !bytes[i - 1].is_ascii_digit())
             && (i + 3 == bytes.len() || !bytes[i + 3].is_ascii_digit())
         {
+            // `:443` in a URL is a port, not HTTP 443. Returning here would
+            // skip NEEDLES and kill retry for every explicit-HTTPS endpoint.
+            if i > 0 && bytes[i - 1] == b':' {
+                i += 3;
+                continue;
+            }
             let n = (bytes[i] - b'0') as u16 * 100
                 + (bytes[i + 1] - b'0') as u16 * 10
                 + (bytes[i + 2] - b'0') as u16;
@@ -264,6 +270,35 @@ mod tests {
             "400 Bad Request: model not found".into()
         )));
         assert!(!is_transient(&Error::Watchdog));
+    }
+
+    #[test]
+    fn explicit_https_port_does_not_look_like_http_status() {
+        assert_eq!(
+            http_status_in("error sending request for url (https://proxy.example.com:443/v1)"),
+            None
+        );
+        assert_eq!(
+            http_status_in("https://proxy.example.com:443/v1 502 Bad Gateway"),
+            Some(502)
+        );
+        assert!(is_transient(&Error::Http(
+            "error sending request for url (https://proxy.example.com:443/v1): connection reset by peer"
+                .into()
+        )));
+        assert!(is_transient(&Error::Http(
+            "error sending request for url (https://api.example.com:443/v1/chat/completions): operation timed out"
+                .into()
+        )));
+        assert!(is_transient(&Error::Http(
+            "https://api.example.com:443/v1 502 Bad Gateway".into()
+        )));
+        assert!(!is_transient(&Error::Http(
+            "https://api.example.com:443/v1 400 Bad Request: model not found".into()
+        )));
+        assert!(is_transient(&Error::Http(
+            "error sending request for url (http://127.0.0.1:8080/v1): connection reset".into()
+        )));
     }
 
     #[test]

@@ -107,9 +107,10 @@ pub async fn execute_turn(
             };
         }
     };
-    let mut agent = match Agent::new(completer, opts) {
-        Ok(a) => a,
-        Err(e) => return TurnResult::fail(e.to_string()),
+    let mut agent = match tokio::task::spawn_blocking(move || Agent::new(completer, opts)).await {
+        Ok(Ok(a)) => a,
+        Ok(Err(e)) => return TurnResult::fail(e.to_string()),
+        Err(e) => return TurnResult::fail(format!("agent setup: {e}")),
     };
     agent.set_cancel(cancel.clone());
     agent.set_steer(steer);

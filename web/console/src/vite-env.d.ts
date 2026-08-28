@@ -5,6 +5,7 @@ interface GrokHyperDesktop {
   close: () => void;
   minimize: () => void;
   toggleMaximize: () => void;
+  pickFolder?: () => Promise<{ cancelled?: boolean; path?: string }>;
 }
 
 interface Window {

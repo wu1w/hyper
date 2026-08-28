@@ -8,7 +8,7 @@ use hyper_loop::clarify::{ClarifyDecision, ClarifyHub, ClarifyRequest};
 use hyper_loop::config::Config;
 use hyper_loop::media::MediaPart;
 use hyper_loop::permit::{PermitDecision, PermitHub, PermitRequest};
-use hyper_loop::session::{SessionEvent, StoredMedia};
+use hyper_loop::session::{DeltaChannel, SessionEvent, StoredMedia};
 use hyper_loop::sidecar::{
     execute_turn, Dispatch, EventSink, RpcRequest, SidecarSession, TurnRequest, TurnResult,
 };
@@ -35,9 +35,12 @@ pub struct AppState {
 
 pub struct Inner {
     pub session: SidecarSession,
+    /// Parked console sessions that still have a live turn (or were switched
+    /// away from). Keyed by session id. Focused session is `session`, not here.
+    pub parked: HashMap<String, SidecarSession>,
     pub cfg: Config,
     pub cfg_path: PathBuf,
-    pub live: Option<LiveTurn>,
+    pub live: HashMap<String, LiveTurn>,
     pub permit: PermitHub,
     pub pending: VecDeque<PendingPermit>,
     pub permit_seq: u64,
@@ -51,8 +54,53 @@ pub struct Inner {
     pub channel_runtime: HashMap<String, ChannelRuntime>,
     /// watcher 代际,防止被 abort 的旧 serve 任务写入过期状态
     channel_gen: u64,
-    ev_tx: mpsc::UnboundedSender<SessionEvent>,
+    ev_tx: mpsc::UnboundedSender<(String, SessionEvent)>,
     bus: Bus,
+}
+
+impl Inner {
+    pub fn any_live(&self) -> bool {
+        !self.live.is_empty()
+    }
+
+    fn session_mut(&mut self, id: &str) -> Option<&mut SidecarSession> {
+        if self.session.session_id() == id {
+            Some(&mut self.session)
+        } else {
+            self.parked.get_mut(id)
+        }
+    }
+
+    pub(crate) fn console_state(&self) -> serde_json::Value {
+        let mut v = self.session.state_json();
+        let mut running: Vec<String> = self.live.keys().cloned().collect();
+        running.sort();
+        v["running"] = json!(running);
+        let mut started = serde_json::Map::new();
+        for (id, live) in &self.live {
+            started.insert(id.clone(), json!(live.started_ms));
+        }
+        v["running_started"] = json!(started);
+        v
+    }
+
+    fn focused_permit(&self) -> Option<&PendingPermit> {
+        modal_for_session(&self.pending, self.session.session_id(), |p| &p.req.session)
+    }
+
+    fn focused_clarify(&self) -> Option<&PendingClarify> {
+        modal_for_session(&self.pending_clarify, self.session.session_id(), |p| {
+            &p.req.session
+        })
+    }
+
+    pub(crate) fn focused_permit_json(&self) -> Option<Value> {
+        self.focused_permit().map(|p| p.json())
+    }
+
+    pub(crate) fn focused_clarify_json(&self) -> Option<Value> {
+        self.focused_clarify().map(|p| p.json())
+    }
 }
 
 /// 单个频道 endpoint 的运行状态,GET /api/channels 的 `runtime` 字段
@@ -72,6 +120,7 @@ pub struct LiveTurn {
     pub cancel: CancelFlag,
     #[allow(dead_code)]
     pub join: JoinHandle<()>,
+    pub started_ms: u64,
 }
 
 pub struct PendingPermit {
@@ -85,6 +134,7 @@ impl PendingPermit {
             "id": self.id,
             "tool": self.req.ask.tool,
             "preview": self.req.ask.preview,
+            "session": self.req.session,
         })
     }
 }
@@ -104,6 +154,7 @@ impl PendingClarify {
                 "id": o.id,
                 "label": o.label,
             })).collect::<Vec<_>>(),
+            "session": self.req.session,
         })
     }
 }
@@ -116,22 +167,25 @@ impl AppState {
         agents_md: bool,
         agents_md_head: bool,
     ) -> Result<Self> {
-        let (ev_tx, mut ev_rx) = mpsc::unbounded_channel::<SessionEvent>();
-        let (bus, _) = broadcast::channel(512);
+        let (ev_tx, ev_rx) = mpsc::unbounded_channel::<(String, SessionEvent)>();
+        // Token deltas are tiny but frequent. 512 filled up around ~30 tool hops
+        // on Windows (slow JSON/React), RecvError::Lagged then pushed the whole
+        // history over WS and froze the UI. Keep a deeper ring; still never put
+        // the transcript on this bus (see resync / history.replace refetch).
+        let (bus, _) = broadcast::channel(8192);
         let bus_fwd = bus.clone();
         tokio::spawn(async move {
-            while let Some(ev) = ev_rx.recv().await {
-                let _ = bus_fwd.send(notify("event.append", json!(ev)));
-            }
+            forward_session_events(ev_rx, bus_fwd).await;
         });
         let approvals = session.approvals();
         let (permit, permit_rx) = PermitHub::pair(approvals);
         let (clarify, clarify_rx) = ClarifyHub::pair();
         let inner = Arc::new(Mutex::new(Inner {
             session,
+            parked: HashMap::new(),
             cfg,
             cfg_path,
-            live: None,
+            live: HashMap::new(),
             permit,
             pending: VecDeque::new(),
             permit_seq: 0,
@@ -157,13 +211,16 @@ impl AppState {
                 let mut g = pending_state.lock().await;
                 g.permit_seq += 1;
                 let id = g.permit_seq;
+                let focused = g.session.session_id().to_string();
+                let for_focus = session_matches(&req.session, &focused);
+                let already = g
+                    .pending
+                    .iter()
+                    .any(|p| session_matches(&p.req.session, &focused));
                 let p = PendingPermit { id, req };
                 let payload = p.json();
-                let was_empty = g.pending.is_empty();
                 g.pending.push_back(p);
-                // Modal is FIFO: only announce a new ask when nothing else is waiting.
-                // Later items surface via decide_permit → permit.ask(front).
-                if was_empty {
+                if for_focus && !already {
                     let _ = bus_p.send(notify("permit.ask", payload));
                 }
             }
@@ -176,11 +233,16 @@ impl AppState {
                 let mut g = pending_clarify.lock().await;
                 g.clarify_seq += 1;
                 let id = g.clarify_seq;
+                let focused = g.session.session_id().to_string();
+                let for_focus = session_matches(&req.session, &focused);
+                let already = g
+                    .pending_clarify
+                    .iter()
+                    .any(|p| session_matches(&p.req.session, &focused));
                 let p = PendingClarify { id, req };
                 let payload = p.json();
-                let was_empty = g.pending_clarify.is_empty();
                 g.pending_clarify.push_back(p);
-                if was_empty {
+                if for_focus && !already {
                     let _ = bus_c.send(notify("clarify.ask", payload));
                 }
             }
@@ -226,7 +288,7 @@ impl AppState {
                 tick.tick().await;
                 let mut g = inner.lock().await;
                 g.cron = CronStore::reload(g.session.workspace(), &g.cron);
-                if g.live.is_some() || g.session.turn_in_flight() {
+                if g.session.turn_in_flight() || g.live.contains_key(g.session.session_id()) {
                     continue;
                 }
                 let now = now_s();
@@ -240,6 +302,7 @@ impl AppState {
                             prompt,
                             Vec::new(),
                             Some(CronRetry::Job { id }),
+                            None,
                         );
                         continue;
                     }
@@ -254,6 +317,7 @@ impl AppState {
                         prompt,
                         Vec::new(),
                         Some(CronRetry::Heartbeat),
+                        None,
                     );
                 }
             }
@@ -276,6 +340,27 @@ impl AppState {
                 g.session.refresh_surface();
             }
         }
+        if method == "session.delete" {
+            abort_deleted_sessions(&mut g, params.as_ref());
+        }
+        if should_park_switch(method, params.as_ref()) {
+            match park_for_switch(&mut g, method, params.as_ref()) {
+                Ok(ParkOutcome::Done(v)) => {
+                    push_focused_modals(&g);
+                    push_state(&g);
+                    let _ = g.bus.send(notify(
+                        "history.replace",
+                        json!({
+                            "events": console_events(g.session.events()),
+                            "session": g.session.session_id(),
+                        }),
+                    ));
+                    return v;
+                }
+                Ok(ParkOutcome::Continue) => {}
+                Err(err) => return json!({"ok": false, "error": err}),
+            }
+        }
         let before = g.session.session_id().to_string();
         let req = RpcRequest {
             jsonrpc: "2.0".into(),
@@ -288,9 +373,13 @@ impl AppState {
         // 聊天 /approvals 只改 session+写盘;这里回读同步 PermitHub,闸门才真正生效
         g.permit.set_mode(g.session.approvals());
         if g.session.session_id() != before {
+            push_focused_modals(&g);
             let _ = g.bus.send(notify(
                 "history.replace",
-                json!({"events": g.session.events()}),
+                json!({
+                    "events": console_events(g.session.events()),
+                    "session": g.session.session_id(),
+                }),
             ));
         }
         out
@@ -308,11 +397,7 @@ impl AppState {
             g.permit.remember(&p.req.ask.tool);
         }
         let _ = p.req.reply.send(decision);
-        if let Some(next) = g.pending.front() {
-            let _ = g.bus.send(notify("permit.ask", next.json()));
-        } else {
-            let _ = g.bus.send(notify("permit.clear", json!(null)));
-        }
+        push_focused_modals(&g);
         Ok(json!({"ok": true, "id": id}))
     }
 
@@ -329,11 +414,7 @@ impl AppState {
             .ok_or_else(|| "no matching clarify".to_string())?;
         let p = g.pending_clarify.remove(idx).expect("idx");
         let _ = p.req.reply.send(decision);
-        if let Some(next) = g.pending_clarify.front() {
-            let _ = g.bus.send(notify("clarify.ask", next.json()));
-        } else {
-            let _ = g.bus.send(notify("clarify.clear", json!(null)));
-        }
+        push_focused_modals(&g);
         Ok(json!({"ok": true, "id": id}))
     }
 }
@@ -530,63 +611,356 @@ pub fn notify(method: &str, params: Value) -> Value {
     json!({"jsonrpc": "2.0", "method": method, "params": params})
 }
 
+fn should_park_switch(method: &str, params: Option<&Value>) -> bool {
+    matches!(method, "session.resume" | "session.new") || is_switch_slash(method, params)
+}
+
+fn is_switch_slash(method: &str, params: Option<&Value>) -> bool {
+    if method != "slash" {
+        return false;
+    }
+    let t = params
+        .and_then(|p| p.get("text"))
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .trim();
+    t == "/new" || t.starts_with("/new ") || t == "/clear"
+}
+
+enum ParkOutcome {
+    Continue,
+    Done(Value),
+}
+
+fn park_for_switch(
+    inner: &mut Inner,
+    method: &str,
+    params: Option<&Value>,
+) -> Result<ParkOutcome, String> {
+    if method == "session.resume" {
+        if let Some(q) = param_session_query(params) {
+            if q == inner.session.session_id() {
+                return Ok(ParkOutcome::Continue);
+            }
+            if inner.parked.contains_key(&q) {
+                focus_parked(inner, &q);
+                return Ok(ParkOutcome::Done(json!({
+                    "ok": true,
+                    "session": inner.session.session_id(),
+                    "title": inner.session.title(),
+                })));
+            }
+        }
+        focus_twin(inner);
+        return Ok(ParkOutcome::Continue);
+    }
+    if method == "session.new" || is_switch_slash(method, params) {
+        focus_twin(inner);
+        return Ok(ParkOutcome::Continue);
+    }
+    Ok(ParkOutcome::Continue)
+}
+
+fn param_session_query(params: Option<&Value>) -> Option<String> {
+    let p = params?;
+    for key in ["session", "search", "text", "prompt"] {
+        if let Some(s) = p
+            .get(key)
+            .and_then(|v| v.as_str())
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+        {
+            return Some(s.to_string());
+        }
+    }
+    None
+}
+
+fn focus_twin(inner: &mut Inner) {
+    let twin = inner.session.idle_twin();
+    park_current(inner, twin);
+}
+
+fn focus_parked(inner: &mut Inner, id: &str) {
+    let Some(mut next) = inner.parked.remove(id) else {
+        return;
+    };
+    next.reload();
+    park_current(inner, next);
+}
+
+fn park_current(inner: &mut Inner, next: SidecarSession) {
+    let old = std::mem::replace(&mut inner.session, next);
+    let id = old.session_id().to_string();
+    if !id.is_empty() && id != inner.session.session_id() {
+        inner.parked.insert(id, old);
+    }
+}
+
+fn abort_deleted_sessions(inner: &mut Inner, params: Option<&Value>) {
+    let focused = inner.session.session_id().to_string();
+    for id in delete_ids(params) {
+        if id == focused {
+            continue;
+        }
+        if let Some(live) = inner.live.get(&id) {
+            live.cancel.cancel();
+        }
+        inner.parked.remove(&id);
+        drop_session_modals(inner, &id);
+    }
+}
+
+fn delete_ids(params: Option<&Value>) -> Vec<String> {
+    let Some(p) = params else {
+        return Vec::new();
+    };
+    let mut ids = Vec::new();
+    if let Some(s) = p
+        .get("session")
+        .and_then(|v| v.as_str())
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+    {
+        ids.push(s.to_string());
+    }
+    if let Some(arr) = p.get("sessions").and_then(|v| v.as_array()) {
+        for v in arr {
+            if let Some(s) = v.as_str().map(str::trim).filter(|s| !s.is_empty()) {
+                ids.push(s.to_string());
+            }
+        }
+    }
+    ids
+}
+
+/// Session events for the console: drop inline `data:` URLs so hello / history
+/// cannot replay ComputerUse screenshots as multi-megabyte JSON.
+pub fn console_events(events: &[SessionEvent]) -> Value {
+    let mut v = serde_json::to_value(events).unwrap_or_else(|_| json!([]));
+    redact_data_uris(&mut v);
+    v
+}
+
+fn redact_data_uris(v: &mut Value) {
+    match v {
+        Value::Object(map) => {
+            if let Some(Value::String(url)) = map.get_mut("url") {
+                if url.starts_with("data:") {
+                    url.clear();
+                }
+            }
+            for child in map.values_mut() {
+                redact_data_uris(child);
+            }
+        }
+        Value::Array(items) => {
+            for child in items {
+                redact_data_uris(child);
+            }
+        }
+        _ => {}
+    }
+}
+
+const DELTA_FLUSH_MS: u64 = 32;
+const DELTA_FLUSH_CHARS: usize = 4096;
+
+struct DeltaBuf {
+    reason: String,
+    content: String,
+}
+
+impl DeltaBuf {
+    fn pending(&self) -> bool {
+        !self.reason.is_empty() || !self.content.is_empty()
+    }
+}
+
+/// Merge consecutive token deltas so one WS frame covers ~32ms of tokens.
+async fn forward_session_events(
+    mut ev_rx: mpsc::UnboundedReceiver<(String, SessionEvent)>,
+    bus: Bus,
+) {
+    let mut bufs: HashMap<String, DeltaBuf> = HashMap::new();
+    loop {
+        let pending = bufs.values().any(DeltaBuf::pending);
+        let next = if pending {
+            tokio::select! {
+                ev = ev_rx.recv() => ev,
+                _ = tokio::time::sleep(Duration::from_millis(DELTA_FLUSH_MS)) => {
+                    flush_all_deltas(&mut bufs, &bus);
+                    continue;
+                }
+            }
+        } else {
+            ev_rx.recv().await
+        };
+        let Some((sid, ev)) = next else {
+            flush_all_deltas(&mut bufs, &bus);
+            break;
+        };
+        match ev {
+            SessionEvent::Delta(d) if d.reset => {
+                flush_session_deltas(&sid, &mut bufs, &bus);
+                let _ = bus.send(notify(
+                    "event.append",
+                    event_payload(&sid, SessionEvent::Delta(d)),
+                ));
+            }
+            SessionEvent::Delta(d) => {
+                let buf = bufs.entry(sid.clone()).or_insert_with(|| DeltaBuf {
+                    reason: String::new(),
+                    content: String::new(),
+                });
+                match d.channel {
+                    DeltaChannel::Reasoning => buf.reason.push_str(&d.text),
+                    DeltaChannel::Content => buf.content.push_str(&d.text),
+                }
+                if buf.reason.len() + buf.content.len() >= DELTA_FLUSH_CHARS {
+                    flush_session_deltas(&sid, &mut bufs, &bus);
+                }
+            }
+            other => {
+                flush_session_deltas(&sid, &mut bufs, &bus);
+                let _ = bus.send(notify("event.append", event_payload(&sid, other)));
+            }
+        }
+    }
+}
+
+fn flush_all_deltas(bufs: &mut HashMap<String, DeltaBuf>, bus: &Bus) {
+    let ids: Vec<String> = bufs.keys().cloned().collect();
+    for id in ids {
+        flush_session_deltas(&id, bufs, bus);
+    }
+}
+
+fn flush_session_deltas(sid: &str, bufs: &mut HashMap<String, DeltaBuf>, bus: &Bus) {
+    let Some(buf) = bufs.get_mut(sid) else {
+        return;
+    };
+    if !buf.reason.is_empty() {
+        let text = std::mem::take(&mut buf.reason);
+        let _ = bus.send(notify(
+            "event.append",
+            event_payload(
+                sid,
+                SessionEvent::delta_chunk(DeltaChannel::Reasoning, text),
+            ),
+        ));
+    }
+    if !buf.content.is_empty() {
+        let text = std::mem::take(&mut buf.content);
+        let _ = bus.send(notify(
+            "event.append",
+            event_payload(sid, SessionEvent::delta_chunk(DeltaChannel::Content, text)),
+        ));
+    }
+}
+
+fn event_payload(session: &str, ev: SessionEvent) -> Value {
+    let mut v = serde_json::to_value(&ev).unwrap_or(json!(null));
+    if !session.is_empty() {
+        if let Some(o) = v.as_object_mut() {
+            o.insert("session".into(), json!(session));
+        }
+    }
+    v
+}
+
 pub fn apply_dispatch(inner: &mut Inner, shared: Arc<Mutex<Inner>>, dispatch: Dispatch) -> Value {
     match dispatch {
         Dispatch::Result { result, events } => {
+            let sid = inner.session.session_id().to_string();
             for e in &events {
-                let _ = inner.bus.send(notify("event.append", json!(e)));
+                let _ = inner
+                    .bus
+                    .send(notify("event.append", event_payload(&sid, e.clone())));
             }
             push_state(inner);
             result
         }
         Dispatch::Error(err) => json!({"ok": false, "error": err.message, "code": err.code}),
         Dispatch::TurnStart { prompt, parts } => {
-            start_turn(inner, shared, prompt, parts, None);
+            start_turn(inner, shared, prompt, parts, None, None);
             json!({"ok": true, "started": true})
         }
         Dispatch::Abort => {
-            if let Some(live) = &inner.live {
-                live.cancel.cancel();
-            }
-            clear_pending_permits(inner);
-            clear_pending_clarifies(inner);
+            abort_focused(inner);
+            let sid = inner.session.session_id().to_string();
+            drop_session_modals(inner, &sid);
+            push_focused_modals(inner);
             push_state(inner);
             json!({"ok": true, "aborted": true})
         }
         Dispatch::AbortClear { cleared } => {
-            if let Some(live) = &inner.live {
-                live.cancel.cancel();
-            }
-            clear_pending_permits(inner);
-            clear_pending_clarifies(inner);
+            abort_focused(inner);
+            let sid = inner.session.session_id().to_string();
+            drop_session_modals(inner, &sid);
+            push_focused_modals(inner);
             push_state(inner);
             json!({"ok": true, "aborted": true, "cleared": cleared})
         }
     }
 }
 
-/// abort/panic 后丢弃全部待审批(drop reply 即隐式 deny)并让前端关掉弹窗,
-/// 否则死弹窗压住 FIFO,后续审批永远弹不出来。
-fn clear_pending_permits(inner: &mut Inner) {
-    if inner.pending.is_empty() {
-        return;
+fn abort_focused(inner: &mut Inner) {
+    let id = inner.session.session_id().to_string();
+    if let Some(live) = inner.live.get(&id) {
+        live.cancel.cancel();
     }
-    inner.pending.clear();
-    let _ = inner.bus.send(notify("permit.clear", json!(null)));
 }
 
-fn clear_pending_clarifies(inner: &mut Inner) {
-    if inner.pending_clarify.is_empty() {
-        return;
+fn session_matches(tagged: &str, focused: &str) -> bool {
+    tagged.is_empty() || tagged == focused
+}
+
+fn modal_for_session<'a, T>(
+    items: impl IntoIterator<Item = &'a T>,
+    focused: &str,
+    session_of: impl Fn(&T) -> &str,
+) -> Option<&'a T> {
+    items
+        .into_iter()
+        .find(|p| session_matches(session_of(p), focused))
+}
+
+fn drop_session_modals(inner: &mut Inner, session_id: &str) {
+    inner.pending.retain(|p| p.req.session != session_id);
+    inner
+        .pending_clarify
+        .retain(|p| p.req.session != session_id);
+}
+
+fn push_focused_modals(inner: &Inner) {
+    match inner.focused_permit() {
+        Some(p) => {
+            let _ = inner.bus.send(notify("permit.ask", p.json()));
+        }
+        None => {
+            let _ = inner.bus.send(notify("permit.clear", json!(null)));
+        }
     }
-    for p in inner.pending_clarify.drain(..) {
-        let _ = p.req.reply.send(ClarifyDecision::Skip);
+    match inner.focused_clarify() {
+        Some(p) => {
+            let _ = inner.bus.send(notify("clarify.ask", p.json()));
+        }
+        None => {
+            let _ = inner.bus.send(notify("clarify.clear", json!(null)));
+        }
     }
-    let _ = inner.bus.send(notify("clarify.clear", json!(null)));
+}
+
+fn unix_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
 }
 
 pub(crate) fn push_state(inner: &Inner) {
-    let _ = inner.bus.send(notify("state", inner.session.state_json()));
+    let _ = inner.bus.send(notify("state", inner.console_state()));
 }
 
 /// Retry bookkeeping for a cron-triggered turn. On error we defer the next
@@ -601,6 +975,7 @@ pub(crate) enum CronRetry {
 /// 待审批,否则 `live` 永远是 Some,整个控制台永久 busy 到重启。
 struct TurnPanicGuard {
     shared: Arc<Mutex<Inner>>,
+    session_id: String,
     armed: bool,
 }
 
@@ -609,29 +984,33 @@ impl Drop for TurnPanicGuard {
         if !self.armed {
             return;
         }
+        let sid = self.session_id.clone();
         if let Ok(mut g) = self.shared.try_lock() {
-            cleanup_after_panic(&mut g);
+            cleanup_after_panic(&mut g, &sid);
         } else if let Ok(handle) = tokio::runtime::Handle::try_current() {
             let shared = self.shared.clone();
             handle.spawn(async move {
                 let mut g = shared.lock().await;
-                cleanup_after_panic(&mut g);
+                cleanup_after_panic(&mut g, &sid);
             });
         }
     }
 }
 
-fn cleanup_after_panic(g: &mut Inner) {
-    // finish_turn 顺带把 turn_in_flight 复位,并落一条错误 stop
-    let extra = g
-        .session
-        .finish_turn(&TurnResult::fail("internal error: turn task panicked"));
+fn cleanup_after_panic(g: &mut Inner, session_id: &str) {
+    let extra = if let Some(sess) = g.session_mut(session_id) {
+        sess.finish_turn(&TurnResult::fail("internal error: turn task panicked"))
+    } else {
+        Vec::new()
+    };
     for e in extra {
-        let _ = g.bus.send(notify("event.append", json!(e)));
+        let _ = g
+            .bus
+            .send(notify("event.append", event_payload(session_id, e)));
     }
-    g.live = None;
-    clear_pending_permits(g);
-    clear_pending_clarifies(g);
+    g.live.remove(session_id);
+    drop_session_modals(g, session_id);
+    push_focused_modals(g);
     push_state(g);
 }
 
@@ -641,9 +1020,17 @@ pub fn start_turn(
     prompt: String,
     parts: Vec<MediaPart>,
     cron_retry: Option<CronRetry>,
+    session_id: Option<String>,
 ) {
-    inner.session.maybe_autotitle(&prompt);
-    inner.session.begin_turn();
+    let sid = session_id.unwrap_or_else(|| inner.session.session_id().to_string());
+    let (snapshot, steer) = {
+        let Some(sess) = inner.session_mut(&sid) else {
+            return;
+        };
+        sess.maybe_autotitle(&prompt);
+        sess.begin_turn();
+        (sess.snapshot(), sess.steer_slot())
+    };
     // Agent 不把 User 事件转发给 live sink；这里带上 media，发送当下就能出缩略图。
     let stored: Vec<StoredMedia> = parts
         .iter()
@@ -654,37 +1041,55 @@ pub fn start_turn(
         })
         .collect();
     let user = SessionEvent::user(&prompt).with_media(stored);
-    let _ = inner.bus.send(notify("event.append", json!(user)));
+    let _ = inner
+        .bus
+        .send(notify("event.append", event_payload(&sid, user)));
     let cancel = CancelFlag::new();
+    let (local_tx, mut local_rx) = mpsc::unbounded_channel();
+    let tagged = inner.ev_tx.clone();
+    let stamp = sid.clone();
+    tokio::spawn(async move {
+        while let Some(ev) = local_rx.recv().await {
+            let _ = tagged.send((stamp.clone(), ev));
+        }
+    });
     let req = TurnRequest {
         prompt,
         parts,
-        snapshot: inner.session.snapshot(),
+        snapshot,
         cancel: cancel.clone(),
-        emit: EventSink::new(inner.ev_tx.clone()),
+        emit: EventSink::new(local_tx),
         messages: Vec::new(),
-        steer: inner.session.steer_slot(),
+        steer,
         persist: true,
-        permit: Some(inner.permit.clone()),
-        clarify: Some(inner.clarify.clone()),
+        permit: Some(inner.permit.clone().with_session(&sid)),
+        clarify: Some(inner.clarify.clone().with_session(&sid)),
     };
     let cfg = inner.cfg.clone();
     let agents_md = inner.agents_md;
     let agents_md_head = inner.agents_md_head;
+    let turn_sid = sid.clone();
     let join = tokio::spawn(async move {
         let mut guard = TurnPanicGuard {
             shared: shared.clone(),
+            session_id: turn_sid.clone(),
             armed: true,
         };
         let result = execute_turn(cfg, agents_md, agents_md_head, req).await;
         let mut g = shared.lock().await;
         guard.armed = false;
-        let extra = g.session.finish_turn(&result);
+        let extra = if let Some(sess) = g.session_mut(&turn_sid) {
+            sess.finish_turn(&result)
+        } else {
+            Vec::new()
+        };
         let extra_has_stop = extra.iter().any(|e| matches!(e, SessionEvent::Stop(_)));
         for e in extra {
-            let _ = g.bus.send(notify("event.append", json!(e)));
+            let _ = g
+                .bus
+                .send(notify("event.append", event_payload(&turn_sid, e)));
         }
-        g.live = None;
+        g.live.remove(&turn_sid);
         if let Some(err) = result.error {
             match cron_retry {
                 Some(CronRetry::Job { id }) => {
@@ -700,23 +1105,33 @@ pub fn start_turn(
                 None => {}
             }
             if !extra_has_stop {
-                let _ = g
-                    .bus
-                    .send(notify("event.append", json!(SessionEvent::stop(err))));
+                let _ = g.bus.send(notify(
+                    "event.append",
+                    event_payload(&turn_sid, SessionEvent::stop(err)),
+                ));
             }
         }
-        // finish_turn 已 reload 落盘事件;整体重播一次,中途刷新/WS Lagged
-        // 的客户端才能补回本 turn 的前半段
+        // Streamed events already went out as event.append. Do not put the
+        // whole JSONL on the bus — that payload alone lagged Windows clients
+        // and triggered a hello/history death spiral. Catch-up is GET /history.
         let _ = g.bus.send(notify(
             "history.replace",
-            json!({"events": g.session.events()}),
+            json!({"refetch": true, "session": turn_sid}),
         ));
-        let _ = g.bus.send(notify("state", g.session.state_json()));
-        if let Some((next, parts)) = g.session.pop_follow_up() {
-            start_turn(&mut g, shared.clone(), next, parts, None);
+        let _ = g.bus.send(notify("state", g.console_state()));
+        let follow = g.session_mut(&turn_sid).and_then(|s| s.pop_follow_up());
+        if let Some((next, parts)) = follow {
+            start_turn(&mut g, shared.clone(), next, parts, None, Some(turn_sid));
         }
     });
-    inner.live = Some(LiveTurn { cancel, join });
+    inner.live.insert(
+        sid,
+        LiveTurn {
+            cancel,
+            join,
+            started_ms: unix_ms(),
+        },
+    );
     push_state(inner);
 }
 
@@ -742,8 +1157,12 @@ pub fn redact_key(key: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{channels_fingerprint, endpoint_static_runtime, redact_key};
+    use super::{
+        channels_fingerprint, console_events, endpoint_static_runtime, event_payload, redact_key,
+        session_matches,
+    };
     use hyper_loop::config::Config;
+    use hyper_loop::session::{SessionEvent, StoredMedia};
     use hyper_loop::ChannelEndpoint;
 
     #[test]
@@ -804,5 +1223,37 @@ mod tests {
         assert_eq!(endpoint_static_runtime(&ep).state, "running");
         ep.kind = "discord".into(); // 不在进程内的平台
         assert_eq!(endpoint_static_runtime(&ep).state, "off");
+    }
+
+    #[test]
+    fn console_events_drop_inline_data_uris() {
+        let ev = SessionEvent::tool("c1", "view", "Image loaded").with_media(vec![StoredMedia {
+            kind: "image".into(),
+            mime: "image/png".into(),
+            url: "data:image/png;base64,AAAA".into(),
+        }]);
+        let path = SessionEvent::tool("c2", "view", "ok").with_media(vec![StoredMedia {
+            kind: "image".into(),
+            mime: "image/png".into(),
+            url: ".grok-hyper/generated/shot.png".into(),
+        }]);
+        let v = console_events(&[ev, path]);
+        assert_eq!(v[0]["media"][0]["url"], "");
+        assert_eq!(v[1]["media"][0]["url"], ".grok-hyper/generated/shot.png");
+    }
+
+    #[test]
+    fn event_payload_stamps_session() {
+        let v = event_payload("abc", SessionEvent::user("hi"));
+        assert_eq!(v["session"], "abc");
+        assert_eq!(v["type"], "user");
+        assert_eq!(v["text"], "hi");
+    }
+
+    #[test]
+    fn modal_session_matches_focused_or_untagged() {
+        assert!(session_matches("", "abc"));
+        assert!(session_matches("abc", "abc"));
+        assert!(!session_matches("abc", "def"));
     }
 }

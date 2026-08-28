@@ -340,6 +340,15 @@ if (!gotLock) {
   });
 }
 
+ipcMain.handle("desktop:pickFolder", async (event) => {
+  const win = BrowserWindow.fromWebContents(event.sender);
+  const r = await dialog.showOpenDialog(win ?? undefined, {
+    title: "选择工作区文件夹",
+    properties: ["openDirectory", "createDirectory"],
+  });
+  if (r.canceled || !r.filePaths[0]) return { cancelled: true };
+  return { path: r.filePaths[0] };
+});
 ipcMain.on("desktop:close", (event) => {
   BrowserWindow.fromWebContents(event.sender)?.close();
 });

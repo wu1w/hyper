@@ -1225,7 +1225,7 @@ textarea.input { height: auto; padding: 8px 10px; resize: vertical; }
 }
 .session-item:hover { background: var(--paper-1); }
 .session-item.on { background: var(--brand-soft); }
-.session-item .t { font-size: 12.5px; color: var(--label-1); }
+.session-item .t { font-size: 12.5px; color: var(--label-1); display: flex; align-items: center; gap: 6px; }
 .session-item .sid { margin-top: 2px; }
 .session-item .m { font-size: 10.5px; color: var(--label-3); margin-top: 2px; font-family: var(--mono); }
 .session-row {
@@ -1234,6 +1234,17 @@ textarea.input { height: auto; padding: 8px 10px; resize: vertical; }
 }
 .session-row:hover { background: var(--paper-1); }
 .session-row.on { background: var(--brand-soft); }
+.session-row.run .run-dot {
+  background: var(--brand);
+  box-shadow: 0 0 0 3px var(--brand-soft);
+  animation: pulse 1.4s var(--ease-out) infinite;
+}
+.session-name { display: inline-flex; align-items: center; gap: 6px; }
+.session-name .run-dot {
+  background: var(--brand);
+  box-shadow: 0 0 0 3px var(--brand-soft);
+  animation: pulse 1.4s var(--ease-out) infinite;
+}
 .session-row .tick {
   flex: 0 0 36px; display: grid; place-items: center;
   border: 0; background: transparent; color: var(--label-2);

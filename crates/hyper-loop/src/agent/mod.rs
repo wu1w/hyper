@@ -293,6 +293,15 @@ pub fn apply_unattended_policy(opts: &mut RunOpts, cfg: &crate::config::Config) 
 
 const DEFAULT_COMPACT_RATIO: f64 = 0.80;
 const TURN_START_COMPACT_PREFIX: u32 = 120_000;
+/// A finished tool-heavy turn should not be replayed as a cold prefill, even
+/// when the cheap byte estimate sits under 120k (ComputerUse captions are short).
+const TURN_START_COMPACT_TOOLS: usize = 8;
+/// In-memory screenshots from the previous turn. Wire caps at 4; archive sooner.
+const TURN_START_COMPACT_IMAGES: usize = 4;
+/// Mid-turn ComputerUse: archive older closed groups so 60 screenshot hops
+/// are not replayed as a cold prefill. Ordinary Read/Grep batches stay intact
+/// (prefix-cache).
+const MID_TURN_COMPACT_CU: usize = 16;
 /// Compact-window headroom when the host has no generation cap.
 pub(crate) const DEFAULT_GENERATION_RESERVE: u32 = 32_768;
 
@@ -338,6 +347,26 @@ fn should_compact_at_user_turn(
     }
     over_soft_threshold(prefix, reserve, working_window, compact_ratio)
         || prefix > TURN_START_COMPACT_PREFIX
+}
+
+fn should_compact_follow_up(
+    prefix: u32,
+    reserve: u32,
+    working_window: u32,
+    compact_ratio: f64,
+    tool_messages: usize,
+    image_parts: usize,
+) -> bool {
+    if working_window == 0 {
+        return false;
+    }
+    tool_messages >= TURN_START_COMPACT_TOOLS
+        || image_parts > TURN_START_COMPACT_IMAGES
+        || should_compact_at_user_turn(prefix, reserve, working_window, compact_ratio)
+}
+
+fn should_compact_mid_turn(cu_tools: usize, image_parts: usize) -> bool {
+    image_parts > TURN_START_COMPACT_IMAGES || cu_tools >= MID_TURN_COMPACT_CU
 }
 
 #[derive(Clone, Debug)]
