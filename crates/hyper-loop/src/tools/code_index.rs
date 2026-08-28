@@ -4,8 +4,9 @@
 //! four.
 
 use std::collections::{HashMap, HashSet};
-use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::io::Read;
+use std::path::{Component, Path, PathBuf};
+use std::process::{Command, Stdio};
 use std::sync::Mutex;
 use std::time::{Duration, Instant, UNIX_EPOCH};
 
@@ -24,6 +25,10 @@ const INDEX_SCHEMA: i64 = 2;
 /// scanned moments ago is still current; skip git-ls + metadata until this
 /// window elapses so Windows doesn't re-walk tens of thousands of files.
 const RESCAN_EVERY: Duration = Duration::from_secs(12);
+/// Hard cap for the first-hop scan. Windows Defender + Documents/Desktop as
+/// the workspace used to block "等待模型" for minutes before any HTTP call.
+const INDEX_BUDGET: Duration = Duration::from_secs(3);
+const GIT_TIMEOUT: Duration = Duration::from_secs(4);
 static LAST_FULL_SCAN: Mutex<Option<(PathBuf, Instant)>> = Mutex::new(None);
 
 fn scan_key(root: &Path) -> PathBuf {
@@ -62,6 +67,8 @@ const SKIP_DIR: &[&str] = &[
     "Library",
     "Caches",
     "OneDrive",
+    "Downloads",
+    "Dropbox",
 ];
 
 pub struct CodeIndex {
@@ -81,22 +88,24 @@ impl CodeIndex {
         // Packaged Electron used to spawn with cwd=home. Indexing a Windows
         // profile (AppData / OneDrive / Downloads) blocks the first model hop
         // for minutes while the UI says "正在调用模型".
-        // A stray `~/.git` must not own the index: `git ls-files` will not
-        // enter nested repositories, so search returns nothing useful.
-        if is_user_home(root) {
-            let idx = Self::empty();
-            idx.sync_root(root, collect_nested_git_files(root));
-            return idx;
+        if skip_index_root(root) {
+            return Self::empty();
         }
         if reuse_persistent(root) {
             if let Some(idx) = Self::persistent(root) {
                 return idx;
             }
         }
+        let budget = ScanBudget::new(INDEX_BUDGET);
         let tracked = git_ls_files(root);
-        let mut files = tracked.clone().unwrap_or_else(|| walk_fallback(root));
-        if tracked.is_some() {
-            files.extend(collect_nested_git_files(root));
+        if budget.exceeded() {
+            return Self::persistent(root).unwrap_or_else(Self::empty);
+        }
+        let mut files = tracked
+            .clone()
+            .unwrap_or_else(|| walk_fallback(root, &budget));
+        if tracked.is_some() && !budget.exceeded() {
+            files.extend(collect_nested_git_files(root, &budget));
             files.sort();
             files.dedup();
         }
@@ -107,8 +116,8 @@ impl CodeIndex {
         } else {
             Self::empty()
         };
-        idx.sync_root(root, files);
-        if tracked.is_some() {
+        idx.sync_root(root, files, &budget);
+        if tracked.is_some() && !budget.exceeded() {
             mark_scanned(root);
         }
         idx
@@ -136,7 +145,7 @@ impl CodeIndex {
         })
     }
 
-    fn sync_root(&self, root: &Path, files: Vec<PathBuf>) {
+    fn sync_root(&self, root: &Path, files: Vec<PathBuf>, budget: &ScanBudget) {
         let known = {
             let conn = crate::lock_unpoison(&self.conn);
             let Ok(mut stmt) = conn.prepare("SELECT path, size, mtime_ns FROM files") else {
@@ -159,6 +168,9 @@ impl CodeIndex {
         let mut seen = HashSet::new();
         let mut updates = Vec::new();
         for rel in files.into_iter().take(MAX_FILES) {
+            if budget.exceeded() {
+                break;
+            }
             if !should_index(&rel) {
                 continue;
             }
@@ -831,11 +843,69 @@ fn skip_rel(rel: &Path) -> bool {
     s.split('/').any(|c| SKIP_DIR.contains(&c))
 }
 
+struct ScanBudget {
+    started: Instant,
+    limit: Duration,
+}
+
+impl ScanBudget {
+    fn new(limit: Duration) -> Self {
+        Self {
+            started: Instant::now(),
+            limit,
+        }
+    }
+
+    #[cfg(test)]
+    fn unlimited() -> Self {
+        Self::new(Duration::from_secs(3600))
+    }
+
+    fn exceeded(&self) -> bool {
+        self.started.elapsed() >= self.limit
+    }
+}
+
+/// Home, Desktop/Documents/Downloads, or a drive root. Scanning these on
+/// Windows is how the first hop froze for minutes.
+fn skip_index_root(root: &Path) -> bool {
+    is_volume_root(root) || is_user_home(root) || is_profile_dump(root)
+}
+
+fn is_volume_root(root: &Path) -> bool {
+    let c = std::fs::canonicalize(root).unwrap_or_else(|_| root.to_path_buf());
+    !c.components().any(|c| matches!(c, Component::Normal(_)))
+}
+
 fn is_user_home(root: &Path) -> bool {
     let Some(home) = crate::config::user_home() else {
         return false;
     };
     same_dir(root, &home)
+}
+
+fn is_profile_dump(root: &Path) -> bool {
+    let Some(home) = crate::config::user_home() else {
+        return false;
+    };
+    const NAMES: &[&str] = &[
+        "Desktop",
+        "Documents",
+        "Downloads",
+        "Pictures",
+        "Videos",
+        "Music",
+        "OneDrive",
+        "Dropbox",
+        "桌面",
+        "文档",
+        "文稿",
+        "下载",
+        "图片",
+        "音乐",
+        "视频",
+    ];
+    NAMES.iter().any(|n| same_dir(root, &home.join(n)))
 }
 
 fn same_dir(a: &Path, b: &Path) -> bool {
@@ -856,20 +926,37 @@ fn git_toplevel(root: &Path) -> Option<PathBuf> {
 fn git_at(root: &Path, args: &[&str]) -> Option<Vec<u8>> {
     let mut cmd = Command::new("git");
     crate::proc_spawn::hide_window(&mut cmd);
-    let out = cmd
-        .args(["-C"])
+    cmd.args(["-C"])
         .arg(root)
         .args(["-c", "safe.directory=*"])
         .args(args)
         .env("GIT_TERMINAL_PROMPT", "0")
         .env("GIT_OPTIONAL_LOCKS", "0")
         .env("GIT_PAGER", "")
-        .output()
-        .ok()?;
-    if !out.status.success() {
-        return None;
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null());
+    let mut child = cmd.spawn().ok()?;
+    let started = Instant::now();
+    loop {
+        match child.try_wait() {
+            Ok(Some(st)) if st.success() => {
+                let mut buf = Vec::new();
+                let _ = child.stdout.as_mut()?.read_to_end(&mut buf);
+                return Some(buf);
+            }
+            Ok(Some(_)) => return None,
+            Ok(None) if started.elapsed() > GIT_TIMEOUT => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return None;
+            }
+            Ok(None) => std::thread::sleep(Duration::from_millis(20)),
+            Err(_) => {
+                let _ = child.kill();
+                return None;
+            }
+        }
     }
-    Some(out.stdout)
 }
 
 /// `git ls-files` relative to `root`. None when git is missing, the repo is the
@@ -903,23 +990,29 @@ fn git_ls_files_raw(root: &Path) -> Option<Vec<PathBuf>> {
 }
 
 /// Directories with their own `.git` that `git ls-files` on the parent skips.
-fn collect_nested_git_files(root: &Path) -> Vec<PathBuf> {
+fn collect_nested_git_files(root: &Path, budget: &ScanBudget) -> Vec<PathBuf> {
     let mut out = Vec::new();
-    walk_nested_git(root, root, 0, &mut out);
+    walk_nested_git(root, root, 0, &mut out, budget);
     out
 }
 
 const NESTED_GIT_DEPTH: usize = 8;
 
-fn walk_nested_git(root: &Path, dir: &Path, depth: usize, out: &mut Vec<PathBuf>) {
-    if out.len() >= MAX_FILES || depth > NESTED_GIT_DEPTH {
+fn walk_nested_git(
+    root: &Path,
+    dir: &Path,
+    depth: usize,
+    out: &mut Vec<PathBuf>,
+    budget: &ScanBudget,
+) {
+    if budget.exceeded() || out.len() >= MAX_FILES || depth > NESTED_GIT_DEPTH {
         return;
     }
     let Ok(entries) = std::fs::read_dir(dir) else {
         return;
     };
     for entry in entries.flatten() {
-        if out.len() >= MAX_FILES {
+        if budget.exceeded() || out.len() >= MAX_FILES {
             return;
         }
         let name = entry.file_name();
@@ -947,7 +1040,7 @@ fn walk_nested_git(root: &Path, dir: &Path, depth: usize, out: &mut Vec<PathBuf>
                 }
             } else {
                 let mut nested = Vec::new();
-                walk_dir(&path, &path, &mut nested);
+                walk_dir(&path, &path, &mut nested, budget);
                 for f in nested {
                     if let Ok(rel) = path.join(f).strip_prefix(root) {
                         out.push(rel.to_path_buf());
@@ -956,25 +1049,25 @@ fn walk_nested_git(root: &Path, dir: &Path, depth: usize, out: &mut Vec<PathBuf>
             }
             continue;
         }
-        walk_nested_git(root, &path, depth + 1, out);
+        walk_nested_git(root, &path, depth + 1, out, budget);
     }
 }
 
-fn walk_fallback(root: &Path) -> Vec<PathBuf> {
+fn walk_fallback(root: &Path, budget: &ScanBudget) -> Vec<PathBuf> {
     let mut out = Vec::new();
-    walk_dir(root, root, &mut out);
+    walk_dir(root, root, &mut out, budget);
     out
 }
 
-fn walk_dir(root: &Path, dir: &Path, out: &mut Vec<PathBuf>) {
-    if out.len() >= MAX_FILES {
+fn walk_dir(root: &Path, dir: &Path, out: &mut Vec<PathBuf>, budget: &ScanBudget) {
+    if budget.exceeded() || out.len() >= MAX_FILES {
         return;
     }
     let Ok(entries) = std::fs::read_dir(dir) else {
         return;
     };
     for entry in entries.flatten() {
-        if out.len() >= MAX_FILES {
+        if budget.exceeded() || out.len() >= MAX_FILES {
             return;
         }
         let name = entry.file_name();
@@ -990,7 +1083,7 @@ fn walk_dir(root: &Path, dir: &Path, out: &mut Vec<PathBuf>) {
             if super::path::is_reparse_or_symlink(&path) {
                 continue;
             }
-            walk_dir(root, &path, out);
+            walk_dir(root, &path, out, budget);
         } else if ft.is_file() {
             if let Ok(rel) = path.strip_prefix(root) {
                 out.push(rel.to_path_buf());
@@ -1312,7 +1405,11 @@ mod tests {
         let idx = CodeIndex {
             conn: Mutex::new(conn),
         };
-        idx.sync_root(ws.root(), walk_fallback(ws.root()));
+        idx.sync_root(
+            ws.root(),
+            walk_fallback(ws.root(), &ScanBudget::unlimited()),
+            &ScanBudget::unlimited(),
+        );
         let before: Vec<i64> = {
             let conn = crate::lock_unpoison(&idx.conn);
             let mut stmt = conn
@@ -1323,7 +1420,11 @@ mod tests {
                 .collect::<rusqlite::Result<Vec<_>>>()
                 .unwrap()
         };
-        idx.sync_root(ws.root(), walk_fallback(ws.root()));
+        idx.sync_root(
+            ws.root(),
+            walk_fallback(ws.root(), &ScanBudget::unlimited()),
+            &ScanBudget::unlimited(),
+        );
         let after: Vec<i64> = {
             let conn = crate::lock_unpoison(&idx.conn);
             let mut stmt = conn
@@ -1465,7 +1566,16 @@ mod tests {
         assert!(skip_rel(Path::new("AppData/Local/foo.rs")));
         assert!(skip_rel(Path::new("Library/Caches/bar.py")));
         assert!(skip_rel(Path::new("OneDrive/docs.rs")));
+        assert!(skip_rel(Path::new("Downloads/setup.rs")));
         assert!(!skip_rel(Path::new("src/foo.rs")));
+    }
+
+    #[test]
+    fn skip_index_root_covers_home_and_volume() {
+        assert!(is_volume_root(Path::new("/")));
+        if let Some(home) = crate::config::user_home() {
+            assert!(skip_index_root(&home));
+        }
     }
 
     fn git_init(dir: &Path) {

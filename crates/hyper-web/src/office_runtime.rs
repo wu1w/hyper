@@ -355,6 +355,7 @@ fn docker_cmd() -> Result<Command> {
     let bin = find_docker().ok_or_else(|| anyhow!("docker not found"))?;
     let mut c = Command::new(bin);
     c.env("PATH", docker_path());
+    hyper_loop::hide_window(&mut c);
     Ok(c)
 }
 

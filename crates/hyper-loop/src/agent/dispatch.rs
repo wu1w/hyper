@@ -409,6 +409,12 @@ impl<C: Completer> Agent<C> {
                 return Ok(None);
             }
             self.arm_sink();
+            if attempt == 0 {
+                if let Some(sink) = self.live_sink() {
+                    sink.reset();
+                    sink.reasoning(crate::llm_http::CONNECT_HINT);
+                }
+            }
             let wire = self.wire_messages();
             let result = tokio::select! {
                 biased;

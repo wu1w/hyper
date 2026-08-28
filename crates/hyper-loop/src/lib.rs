@@ -31,6 +31,7 @@ pub mod policy;
 pub mod prefix_cache;
 pub mod probe;
 mod proc_spawn;
+pub use proc_spawn::{hide_window, hide_window_async};
 pub mod prompt;
 pub mod schemas;
 pub mod session;

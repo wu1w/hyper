@@ -388,7 +388,9 @@ export function runPhase(opts: {
   if (!opts.busy && !liveOn) return "idle";
   if (opts.live.content) return "writing";
   if (opts.live.think.includes("网络不稳") || opts.live.think.includes("正在重连")) return "retrying";
-  if (opts.live.think.includes("正在整理上下文")) return "preparing";
+  if (/^(正在整理上下文|正在准备工作区|正在连接模型)…?\s*$/.test(opts.live.think.trim())) {
+    return "preparing";
+  }
   if (opts.live.think) return "thinking";
   const last = opts.events[opts.events.length - 1];
   if (last?.type === "tool") return "tool";
@@ -407,7 +409,7 @@ export const PHASE_LABEL: Record<RunPhase, string> = {
   clarify: "AskQuestion",
   stopping: "正在停止",
   retrying: "正在重连",
-  preparing: "整理上下文",
+  preparing: "准备中",
 };
 
 export function fmtElapsed(s: number) {
