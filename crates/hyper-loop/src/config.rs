@@ -196,7 +196,7 @@ pub struct PolicyConfig {
     pub max_wall_seconds: u64,
     /// IM / `--channels` step budget. 0 = same as `max_steps`. Hermes `max_turns` is 500.
     pub max_steps_unattended: u32,
-    /// IM wall. 0 = no cap (Hermes gateway is idle, not a hard clock). Interactive still uses `max_wall_seconds`.
+    /// IM wall from turn start. 0 = no cap. Default 600s so a stuck hop cannot pin the WeChat worker.
     pub max_wall_unattended_seconds: u64,
     /// User switch: tighter doom/parse/repeat guards. Off = Q8 / high-precision defaults.
     pub low_precision: bool,
@@ -215,7 +215,7 @@ impl Default for PolicyConfig {
             max_steps_think: 100,
             max_wall_seconds: 1800,
             max_steps_unattended: 500,
-            max_wall_unattended_seconds: 0,
+            max_wall_unattended_seconds: 600,
             low_precision: false,
         }
     }
@@ -749,7 +749,7 @@ mod tests {
         assert!(!c.policy.low_precision);
         assert_eq!(c.policy.max_wall_seconds, 1800);
         assert_eq!(c.policy.max_steps_unattended, 500);
-        assert_eq!(c.policy.max_wall_unattended_seconds, 0);
+        assert_eq!(c.policy.max_wall_unattended_seconds, 600);
         assert_eq!(c.server.read_timeout_s, 1800);
         assert_eq!(c.tools.read_default_lines, 600);
         assert_eq!(c.tools.result_max_chars, 10_000);

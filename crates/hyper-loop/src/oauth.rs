@@ -369,11 +369,16 @@ fn tokens_from_json(v: &Value) -> Result<SessionTokens> {
 }
 
 fn http_client() -> Result<reqwest::Client> {
-    reqwest::Client::builder()
+    let mut b = reqwest::Client::builder()
         .connect_timeout(Duration::from_secs(10))
-        .timeout(Duration::from_secs(30))
-        .build()
-        .map_err(|e| Error::Http(e.to_string()))
+        .timeout(Duration::from_secs(30));
+    if let Some(proxy) = crate::llm_http::env_http_proxy() {
+        match reqwest::Proxy::all(&proxy) {
+            Ok(px) => b = b.proxy(px),
+            Err(e) => eprintln!("hyper oauth proxy ignored ({proxy}): {e}"),
+        }
+    }
+    b.build().map_err(|e| Error::Http(e.to_string()))
 }
 
 fn token_url() -> String {

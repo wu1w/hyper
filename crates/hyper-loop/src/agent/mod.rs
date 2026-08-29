@@ -282,7 +282,7 @@ pub(crate) fn interactive_channel(channel: &str) -> bool {
     matches!(channel, "" | "cli" | "tui" | "web" | "console")
 }
 
-/// Hermes-shaped unattended caps: gateway `max_turns` 500, no hard wall while working.
+/// Hermes-shaped unattended caps: gateway `max_turns` 500, plus a wall so IM cannot stall forever.
 pub fn apply_unattended_policy(opts: &mut RunOpts, cfg: &crate::config::Config) {
     if interactive_channel(&opts.channel) {
         return;

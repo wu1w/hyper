@@ -1,11 +1,16 @@
 //! Send QwenPaw `content_parts` back to the originating chat.
 
+use std::time::Duration;
+
 use serde_json::{json, Value};
 
 use crate::error::Result;
 
 use super::envelope::{ContentPart, NativePayload};
 use super::ChannelEndpoint;
+
+const EMPTY_REPLY: &str = "(无文本回复)";
+const DELIVER_ATTEMPTS: u32 = 3;
 
 pub fn reply_text(body: impl Into<String>) -> Vec<ContentPart> {
     let body = body.into();
@@ -36,14 +41,55 @@ pub fn parts_to_text(parts: &[ContentPart]) -> String {
     text
 }
 
+pub fn outbound_parts(parts: &[ContentPart]) -> Vec<ContentPart> {
+    if parts.is_empty() {
+        vec![ContentPart::text(EMPTY_REPLY)]
+    } else {
+        parts.to_vec()
+    }
+}
+
+pub fn with_attempts<T, E>(
+    attempts: u32,
+    mut f: impl FnMut() -> std::result::Result<T, E>,
+) -> std::result::Result<T, E> {
+    let attempts = attempts.max(1);
+    let mut last = None;
+    for _ in 0..attempts {
+        match f() {
+            Ok(v) => return Ok(v),
+            Err(e) => last = Some(e),
+        }
+    }
+    Err(last.expect("attempts >= 1"))
+}
+
 pub async fn deliver(
     ep: Option<&ChannelEndpoint>,
     env: &NativePayload,
     parts: &[ContentPart],
 ) -> Result<()> {
-    if parts.is_empty() {
-        return Ok(());
+    let owned = outbound_parts(parts);
+    let mut last = None;
+    for attempt in 0..DELIVER_ATTEMPTS {
+        match deliver_once(ep, env, &owned).await {
+            Ok(()) => return Ok(()),
+            Err(e) => {
+                last = Some(e);
+                if attempt + 1 < DELIVER_ATTEMPTS {
+                    tokio::time::sleep(Duration::from_millis(200 * (1u64 << attempt))).await;
+                }
+            }
+        }
     }
+    Err(last.expect("DELIVER_ATTEMPTS >= 1"))
+}
+
+async fn deliver_once(
+    ep: Option<&ChannelEndpoint>,
+    env: &NativePayload,
+    parts: &[ContentPart],
+) -> Result<()> {
     let kind = ep.map(|e| e.kind.as_str()).unwrap_or(env.channel.as_str());
     match kind {
         "telegram" => super::telegram::send(ep, env, parts).await,
@@ -112,5 +158,47 @@ fn nonempty(s: &str) -> Option<&str> {
         None
     } else {
         Some(t)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn empty_parts_get_a_placeholder() {
+        let filled = outbound_parts(&[]);
+        assert_eq!(filled.len(), 1);
+        assert_eq!(filled[0].as_text(), Some(EMPTY_REPLY));
+        let keep = vec![ContentPart::text("hi")];
+        let out = outbound_parts(&keep);
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].as_text(), Some("hi"));
+    }
+
+    #[test]
+    fn retries_then_succeeds() {
+        let mut n = 0u32;
+        let r = with_attempts(3, || {
+            n += 1;
+            if n < 3 {
+                Err("fail")
+            } else {
+                Ok("ok")
+            }
+        });
+        assert_eq!(r, Ok("ok"));
+        assert_eq!(n, 3);
+    }
+
+    #[test]
+    fn retries_exhaust() {
+        let mut n = 0u32;
+        let r: std::result::Result<(), &str> = with_attempts(3, || {
+            n += 1;
+            Err("nope")
+        });
+        assert_eq!(r, Err("nope"));
+        assert_eq!(n, 3);
     }
 }

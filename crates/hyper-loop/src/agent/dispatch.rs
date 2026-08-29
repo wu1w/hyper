@@ -365,6 +365,10 @@ impl<C: Completer> Agent<C> {
             Some(TokenSink::events(emit.clone()))
         } else if self.print {
             Some(TokenSink::stdio(self.stdio.clone()))
+        } else if !super::interactive_channel(&self.channel) && !self.channel.is_empty() {
+            // IM has no console sink. Still stream: cli-chat-proxy rejects
+            // non-SSE POSTs, and non-stream JSON often has `"error": null`.
+            Some(TokenSink::discard())
         } else {
             None
         }

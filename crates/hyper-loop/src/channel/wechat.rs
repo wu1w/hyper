@@ -24,6 +24,10 @@ const TEXT_CLIP: usize = 4000;
 const BACKOFF_MIN_SECS: u64 = 5;
 const BACKOFF_MAX_SECS: u64 = 120;
 
+pub fn exclusive_poll_hint() -> &'static str {
+    "exclusive iLink long-poll; do not share this bot_token with Hermes weixin or another getupdates client"
+}
+
 pub fn credentials(ep: &ChannelEndpoint) -> Option<(String, String)> {
     let token = ep
         .extra
@@ -55,6 +59,7 @@ pub async fn run_poll(ep: ChannelEndpoint, mgr: ChannelManager) -> Result<()> {
     let mut seen = TokenDedup::new();
     let mut fail = 0u32;
     eprintln!("hyper wechat long-poll ({})", ep.id);
+    eprintln!("hyper wechat: {}", exclusive_poll_hint());
     loop {
         match poll_once(&http, &ep, &mgr, &token, &base, &mut cursor, &mut seen).await {
             Ok(()) => fail = 0,
@@ -723,5 +728,10 @@ mod tests {
         assert_eq!(backoff_secs(2), 10);
         assert_eq!(backoff_secs(3), 20);
         assert_eq!(backoff_secs(20), BACKOFF_MAX_SECS);
+    }
+
+    #[test]
+    fn exclusive_hint_mentions_hermes() {
+        assert!(exclusive_poll_hint().contains("Hermes weixin"));
     }
 }

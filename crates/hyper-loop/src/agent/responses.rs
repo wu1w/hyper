@@ -127,7 +127,7 @@ impl Completer for ResponsesCompleter {
             return Ok(turn);
         }
         let v: Value = resp.json().await.map_err(|e| Error::Http(e.to_string()))?;
-        if let Some(err) = v.get("error") {
+        if let Some(err) = v.get("error").filter(|e| !e.is_null()) {
             return Err(Error::Http(format_api_error(err)));
         }
         let turn = turn_from_responses(&v)?;
@@ -481,7 +481,7 @@ pub(crate) fn responses_url(base: &str) -> String {
 }
 
 fn turn_from_responses(v: &Value) -> Result<ModelTurn> {
-    if let Some(err) = v.get("error") {
+    if let Some(err) = v.get("error").filter(|e| !e.is_null()) {
         return Err(Error::Http(format_api_error(err)));
     }
     let output = v

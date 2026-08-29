@@ -407,7 +407,7 @@ fn paint_clean(sink: Option<TokenSink>, turn: &ModelTurn) {
 }
 
 fn turn_from_json(v: &Value, truncated: bool) -> Result<ModelTurn> {
-    if let Some(err) = v.get("error") {
+    if let Some(err) = v.get("error").filter(|e| !e.is_null()) {
         return Err(Error::Http(err.to_string()));
     }
     Ok(if truncated {
@@ -819,7 +819,7 @@ async fn read_sse(
         let events = sse.push(text);
         pending.drain(..valid);
         for event in events {
-            if let Some(err) = event.get("error") {
+            if let Some(err) = event.get("error").filter(|e| !e.is_null()) {
                 return Err(Error::Http(err.to_string()));
             }
             acc.apply(&event);
@@ -836,7 +836,7 @@ async fn read_sse(
     }
     let leftover = sse.flush();
     for event in leftover {
-        if let Some(err) = event.get("error") {
+        if let Some(err) = event.get("error").filter(|e| !e.is_null()) {
             return Err(Error::Http(err.to_string()));
         }
         acc.apply(&event);

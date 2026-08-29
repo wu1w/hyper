@@ -13,6 +13,8 @@ use super::{arg_str, arg_u32, folded_response, BlobStore, ToolLimits, Workspace}
 use crate::tool_calls::{CancelFlag, ToolCall, ToolResponse, ToolState};
 
 const OUTPUT_MAX_BYTES: usize = 1024 * 1024;
+/// Model often omits block_until_ms. Without a floor, `sleep 3600` pins the IM worker.
+const DEFAULT_BLOCK_UNTIL_MS: u32 = 120_000;
 /// shell 退出后管道的收尾读窗口：孙进程（`sleep 30 & echo hi`）继承了
 /// stdout/stderr 写端，EOF 可能永远不来，超时就放弃。
 const DRAIN_TIMEOUT: Duration = Duration::from_secs(2);
@@ -122,11 +124,7 @@ pub async fn bash(
     } else {
         ws.root().to_path_buf()
     };
-    let timeout = arg_u32(&call.arguments, "block_until_ms")
-        .or_else(|| arg_u32(&call.arguments, "timeout"))
-        .or_else(|| arg_u32(&call.arguments, "timeout_ms"))
-        .filter(|n| *n > 0)
-        .map(|ms| Duration::from_millis(ms as u64));
+    let timeout = Some(resolved_block_until(&call.arguments));
 
     let mut child = match spawn_shell(&command, &cwd) {
         Ok(c) => c,
@@ -245,6 +243,15 @@ fn spawn_shell(command: &str, cwd: &Path) -> std::io::Result<tokio::process::Chi
     }
     crate::proc_spawn::hide_window_async(&mut cmd);
     cmd.spawn()
+}
+
+fn resolved_block_until(args: &serde_json::Value) -> Duration {
+    arg_u32(args, "block_until_ms")
+        .or_else(|| arg_u32(args, "timeout"))
+        .or_else(|| arg_u32(args, "timeout_ms"))
+        .filter(|n| *n > 0)
+        .map(|ms| Duration::from_millis(ms as u64))
+        .unwrap_or(Duration::from_millis(DEFAULT_BLOCK_UNTIL_MS as u64))
 }
 
 /// Bash runs `--noprofile --norc`, so rustup's shell hook never runs.
@@ -574,6 +581,30 @@ mod tests {
             name: "bash".into(),
             arguments: args,
         }
+    }
+
+    #[test]
+    fn missing_timeout_uses_default_block() {
+        assert_eq!(
+            resolved_block_until(&json!({})),
+            std::time::Duration::from_millis(DEFAULT_BLOCK_UNTIL_MS as u64)
+        );
+        assert_eq!(
+            resolved_block_until(&json!({"block_until_ms": 0})),
+            std::time::Duration::from_millis(DEFAULT_BLOCK_UNTIL_MS as u64)
+        );
+    }
+
+    #[test]
+    fn explicit_block_until_ms_wins() {
+        assert_eq!(
+            resolved_block_until(&json!({"block_until_ms": 50})),
+            std::time::Duration::from_millis(50)
+        );
+        assert_eq!(
+            resolved_block_until(&json!({"timeout_ms": 80})),
+            std::time::Duration::from_millis(80)
+        );
     }
 
     #[tokio::test]

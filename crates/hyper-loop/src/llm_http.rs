@@ -117,7 +117,29 @@ pub fn build_client_for(connect_s: u64, timeout_s: u64, base_url: &str) -> Resul
                 .http2_keep_alive_while_idle(true);
         }
     }
+    // reqwest is built with default-features=false, so HTTPS_PROXY is ignored
+    // unless we set it. Loopback (llama.cpp) stays direct.
+    if is_loopback_base(base_url) {
+        b = b.no_proxy();
+    } else if let Some(proxy) = env_http_proxy() {
+        match reqwest::Proxy::all(&proxy) {
+            Ok(px) => b = b.proxy(px),
+            Err(e) => eprintln!("hyper llm proxy ignored ({proxy}): {e}"),
+        }
+    }
     b.build().map_err(|e| Error::Http(e.to_string()))
+}
+
+pub(crate) fn env_http_proxy() -> Option<String> {
+    for key in ["HTTPS_PROXY", "https_proxy", "HTTP_PROXY", "http_proxy"] {
+        if let Ok(v) = std::env::var(key) {
+            let v = v.trim().to_string();
+            if !v.is_empty() {
+                return Some(v);
+            }
+        }
+    }
+    None
 }
 
 pub fn is_transient(err: &Error) -> bool {
