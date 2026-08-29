@@ -131,9 +131,7 @@ pub async fn run_gateway(ep: ChannelEndpoint, mgr: ChannelManager) -> Result<()>
             "qq: extra.app_id and extra.client_secret required",
         ));
     };
-    let http = reqwest::Client::builder()
-        .timeout(Duration::from_secs(20))
-        .build()?;
+    let http = crate::llm_http::env_aware_client(20, TOKEN_URL)?;
     let bases = api_bases(&ep);
     eprintln!("hyper qq gateway starting app_id={app_id}");
     loop {
@@ -397,7 +395,7 @@ pub async fn send(
     let Some((app_id, secret)) = credentials(ep) else {
         return Err(Error::msg("qq send: missing credentials"));
     };
-    let http = reqwest::Client::new();
+    let http = crate::llm_http::env_aware_client(20, TOKEN_URL)?;
     let token = access_token(&http, &app_id, &secret).await?;
     let bases = api_bases(ep);
     let text = super::xfer::spoken_text(parts);

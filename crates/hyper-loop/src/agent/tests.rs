@@ -3659,7 +3659,7 @@ fn unattended_im_uses_hermes_caps() {
     o.channel = "wechat".into();
     crate::agent::apply_unattended_policy(&mut o, &Config::default());
     assert_eq!(o.max_steps, 500);
-    assert_eq!(o.max_wall, std::time::Duration::from_secs(600));
+    assert_eq!(o.max_wall, std::time::Duration::from_secs(1800));
     o.channel = "web".into();
     o.max_steps = 80;
     o.max_wall = std::time::Duration::from_secs(1800);

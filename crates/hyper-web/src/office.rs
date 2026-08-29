@@ -79,7 +79,12 @@ struct PathQuery {
 
 pub async fn docs_ready(docs_url: &str) -> bool {
     let url = format!("{}/healthcheck", docs_url.trim_end_matches('/'));
-    let client = match reqwest::Client::builder().timeout(HEALTH_TIMEOUT).build() {
+    let client = match hyper_loop::llm_http::apply_env_proxy(
+        reqwest::Client::builder().timeout(HEALTH_TIMEOUT),
+        docs_url,
+    )
+    .build()
+    {
         Ok(c) => c,
         Err(_) => return false,
     };
@@ -408,9 +413,7 @@ async fn command_forcesave(office: &OfficeConfig, key: &str) -> Result<()> {
     let mut body = payload;
     body["token"] = json!(token);
     let url = format!("{}/coauthoring/CommandService.ashx", office.docs_origin());
-    let client = reqwest::Client::builder()
-        .timeout(Duration::from_secs(15))
-        .build()?;
+    let client = hyper_loop::llm_http::env_aware_client(15, &url).map_err(|e| anyhow!(e))?;
     let r = client.post(url).json(&body).send().await?;
     let v: Value = r.json().await.unwrap_or(json!({}));
     let err = v.get("error").and_then(|e| e.as_i64()).unwrap_or(-1);
@@ -421,9 +424,7 @@ async fn command_forcesave(office: &OfficeConfig, key: &str) -> Result<()> {
 }
 
 async fn download_edited(url: &str) -> Result<Vec<u8>> {
-    let client = reqwest::Client::builder()
-        .timeout(Duration::from_secs(60))
-        .build()?;
+    let client = hyper_loop::llm_http::env_aware_client(60, url).map_err(|e| anyhow!(e))?;
     let r = client.get(url).send().await?;
     if !r.status().is_success() {
         bail!("download edited file: HTTP {}", r.status());

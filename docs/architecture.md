@@ -95,9 +95,9 @@ Cron / 心跳 / 频道入站也是 **主机定时器或适配器** 去调 `turn.
 4. 工具调用按审批模式停或放行；结果写回 messages，直到模型停或打到 `max_steps`。
 5. 事件追加到会话 JSONL；`stop` 结束本轮。控制台会重放本轮前半段，避免 WS 丢包后画面残缺。
 
-默认 `auto` 对 grok-4.6 映射为 **high**（思考关不掉）；Qwen 仍是官方中性 `medium`。`/think`、`--think`、`/fast` 仍可人工覆盖。grok 走 Responses：不回放思考、不回放 tool-hop 助手正文、不把 QwenPaw 的 `[trajectory]` / `[style]` / `[out]` / `[locate]` / `[oracle]` / `[guard]` 注记当用户消息。同参工具第 6 次安静停止（`budget:repeat`）。控制台和 TUI 不把 tool-hop 旁白画成答案气泡。Qwen 本地权重仍走软干预：同参 6 次提醒一次，dump 延后工具并观察一次。
+默认 `auto` 对 grok-4.6 映射为 **xhigh**（思考关不掉）；Qwen 仍是官方中性 `medium`。`/think`、`--think`、`/fast` 仍可人工覆盖。grok 走 Responses：不回放思考、不回放 tool-hop 助手正文、不把 QwenPaw 的 `[trajectory]` / `[style]` / `[out]` / `[locate]` / `[oracle]` / `[guard]` 注记当用户消息。同参工具第 6 次安静停止（`budget:repeat`）。控制台和 TUI 不把 tool-hop 旁白画成答案气泡。Qwen 本地权重仍走软干预：同参 6 次提醒一次，dump 延后工具并观察一次。
 
-轨迹控制：测试转红、修改测试期望和编辑摇摆只作为隐藏事实反馈，不替模型决定停止或回退。思考触及上限时保留模型选择的思考模式；grok 不再追加“collapse to one conclusion”讲义。只有再次触顶、时间、步数或上下文硬上限才终止。控制台/TUI 默认 80 步、30 分钟硬墙钟。IM 默认 500 步、**10 分钟墙钟**（`max_wall_unattended_seconds = 600`）；Shell 未带 `block_until_ms` 时默认 120 秒。出站空正文会发「(无文本回复)」并重试 3 次。微信 iLink 长轮询独占 cursor，不能和 Hermes weixin 共用同一个 bot。子代理 `Task` 的 registry 写 `{id}.task.json`：进程重启后 `resume` / AwaitShell 能找到孩子；当时还在跑的记成 `interrupted: process restarted`，不自动重跑。
+轨迹控制：测试转红、修改测试期望和编辑摇摆只作为隐藏事实反馈，不替模型决定停止或回退。思考触及上限时保留模型选择的思考模式；grok 不再追加“collapse to one conclusion”讲义。只有再次触顶、时间、步数或上下文硬上限才终止。控制台/TUI 默认 80 步、30 分钟硬墙钟。IM 默认 500 步、**30 分钟墙钟**（`max_wall_unattended_seconds = 1800`）；Shell 未带 `block_until_ms` 时由 coordinator（默认 `code_mode.timeout_s = 60`）offload/取消，bash 内层不再套 120 秒硬杀。出站空正文会发「(无文本回复)」；连接失败会重试，读超时不重试以免 QQ 重复消息。微信 iLink 长轮询独占 cursor，不能和 Hermes weixin 共用同一个 bot。子代理 `Task` 的 registry 写 `{id}.task.json`：进程重启后 `resume` / AwaitShell 能找到孩子；当时还在跑的记成 `interrupted: process restarted`，不自动重跑。
 
 上下文窗口默认 **500000**。超过 `working_window * 0.80` 或 200k 价格悬崖时，session/api_key 走官方 `POST /v1/responses/compact`；openai_compat 仍用本地 archive compact。
 

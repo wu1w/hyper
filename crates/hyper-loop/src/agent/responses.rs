@@ -127,7 +127,7 @@ impl Completer for ResponsesCompleter {
             return Ok(turn);
         }
         let v: Value = resp.json().await.map_err(|e| Error::Http(e.to_string()))?;
-        if let Some(err) = v.get("error").filter(|e| !e.is_null()) {
+        if let Some(err) = crate::llm_http::json_api_error(&v) {
             return Err(Error::Http(format_api_error(err)));
         }
         let turn = turn_from_responses(&v)?;
@@ -481,7 +481,7 @@ pub(crate) fn responses_url(base: &str) -> String {
 }
 
 fn turn_from_responses(v: &Value) -> Result<ModelTurn> {
-    if let Some(err) = v.get("error").filter(|e| !e.is_null()) {
+    if let Some(err) = crate::llm_http::json_api_error(v) {
         return Err(Error::Http(format_api_error(err)));
     }
     let output = v
@@ -999,10 +999,8 @@ async fn read_responses_sse(
         let events = sse.push(text);
         pending.drain(..valid);
         for ev in events {
-            if let Some(err) = ev.get("error") {
-                if !err.is_null() {
-                    return Err(Error::Http(format_api_error(err)));
-                }
+            if let Some(err) = crate::llm_http::json_api_error(&ev) {
+                return Err(Error::Http(format_api_error(err)));
             }
             acc.apply_event(&ev);
             if let Some(s) = &slot {
@@ -1017,10 +1015,8 @@ async fn read_responses_sse(
         }
     }
     for ev in sse.flush() {
-        if let Some(err) = ev.get("error") {
-            if !err.is_null() {
-                return Err(Error::Http(format_api_error(err)));
-            }
+        if let Some(err) = crate::llm_http::json_api_error(&ev) {
+            return Err(Error::Http(format_api_error(err)));
         }
         acc.apply_event(&ev);
         if let Some(s) = &slot {
@@ -1688,6 +1684,23 @@ mod tests {
         assert_eq!(turn.tool_calls[0].name, "Read");
         assert_eq!(turn.tool_calls[0].arguments["path"], json!("notes.md"));
         assert_eq!(turn.prompt_tokens, 10);
+    }
+
+    #[test]
+    fn error_null_is_success() {
+        let v = json!({
+            "error": null,
+            "output": [{
+                "type": "function_call",
+                "name": "Read",
+                "call_id": "c1",
+                "arguments": "{\"path\":\"notes.md\"}"
+            }],
+            "usage": {"input_tokens": 10, "output_tokens": 4}
+        });
+        let turn = turn_from_responses(&v).unwrap();
+        assert_eq!(turn.tool_calls.len(), 1);
+        assert_eq!(turn.tool_calls[0].name, "Read");
     }
 
     #[test]

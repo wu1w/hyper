@@ -448,11 +448,7 @@ pub async fn run_official_compact(
         "model": OFFICIAL_MODEL,
         "input": input,
     });
-    let client = reqwest::Client::builder()
-        .connect_timeout(std::time::Duration::from_secs(15))
-        .timeout(std::time::Duration::from_secs(120))
-        .build()
-        .map_err(|e| Error::Http(e.to_string()))?;
+    let client = crate::llm_http::build_client_for(15, 120, base_url)?;
     let mut req = client.post(&url).json(&body);
     if !api_key.is_empty() {
         req = req.bearer_auth(api_key);

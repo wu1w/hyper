@@ -1,5 +1,3 @@
-use std::time::Duration;
-
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -83,11 +81,11 @@ impl ProbeReport {
 }
 
 pub async fn run_probe(cfg: &Config) -> Result<ProbeReport> {
-    let client = Client::builder()
-        .connect_timeout(Duration::from_secs(cfg.server.connect_timeout_s.max(1)))
-        .timeout(Duration::from_secs(cfg.server.read_timeout_s.max(5)))
-        .build()
-        .map_err(|e| Error::Http(e.to_string()))?;
+    let client = crate::llm_http::probe_client_for(
+        cfg.server.connect_timeout_s.max(1),
+        cfg.server.read_timeout_s.max(5),
+        &cfg.server.base_url,
+    )?;
 
     let mut notes = Vec::new();
     let mut red = Vec::new();
@@ -341,11 +339,7 @@ pub async fn fetch_model(client: &Client, cfg: &Config) -> Result<(String, Optio
 
 /// Cheap GET `/models` for the console titlebar. Does not run the full probe.
 pub async fn ping_models(cfg: &Config) -> Result<String> {
-    let client = Client::builder()
-        .connect_timeout(Duration::from_secs(2))
-        .timeout(Duration::from_secs(3))
-        .build()
-        .map_err(|e| Error::Http(e.to_string()))?;
+    let client = crate::llm_http::build_client_for(2, 3, &cfg.server.base_url)?;
     let (id, _) = fetch_model(&client, cfg).await?;
     if cfg.server.model.trim().is_empty() {
         Ok(id)
@@ -406,7 +400,7 @@ async fn complete_chat(
         req = req.bearer_auth(&cfg.server.api_key);
     }
     let v: Value = req.send().await?.error_for_status()?.json().await?;
-    if let Some(err) = v.get("error") {
+    if let Some(err) = crate::llm_http::json_api_error(&v) {
         return Err(Error::Http(err.to_string()));
     }
     let msg = &v["choices"][0]["message"];
@@ -889,7 +883,7 @@ async fn complete_messages(
     if !status.is_success() {
         return Err(Error::Http(format!("{status}: {v}")));
     }
-    if let Some(err) = v.get("error") {
+    if let Some(err) = crate::llm_http::json_api_error(&v) {
         return Err(Error::Http(err.to_string()));
     }
     let msg = &v["choices"][0]["message"];

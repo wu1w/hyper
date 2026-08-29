@@ -63,11 +63,14 @@ impl WebRunner {
                 }
             }
         };
-        let client = reqwest::Client::builder()
-            .user_agent(USER_AGENT)
-            .connect_timeout(Duration::from_secs(5))
-            .build()
-            .unwrap_or_default();
+        let client = crate::llm_http::apply_env_proxy(
+            reqwest::Client::builder()
+                .user_agent(USER_AGENT)
+                .connect_timeout(Duration::from_secs(5)),
+            "",
+        )
+        .build()
+        .unwrap_or_default();
         Self {
             cfg,
             provider,

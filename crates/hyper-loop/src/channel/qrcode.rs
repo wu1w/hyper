@@ -110,11 +110,14 @@ pub async fn poll_qrcode(kind: &str, token: &str, domain: Option<&str>) -> QrRes
 }
 
 fn http(timeout: Duration) -> QrResult<reqwest::Client> {
-    reqwest::Client::builder()
-        .timeout(timeout)
-        .redirect(reqwest::redirect::Policy::limited(8))
-        .build()
-        .map_err(|e| QrError::Internal(e.to_string()))
+    crate::llm_http::apply_env_proxy(
+        reqwest::Client::builder()
+            .timeout(timeout)
+            .redirect(reqwest::redirect::Policy::limited(8)),
+        "",
+    )
+    .build()
+    .map_err(|e| QrError::Internal(e.to_string()))
 }
 
 fn clean_str(v: &Value) -> String {

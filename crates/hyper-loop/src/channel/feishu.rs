@@ -214,10 +214,8 @@ pub async fn run_ws(ep: ChannelEndpoint, mgr: ChannelManager) -> Result<()> {
             "feishu: extra.app_id and extra.app_secret required",
         ));
     };
-    let http = reqwest::Client::builder()
-        .timeout(Duration::from_secs(20))
-        .build()?;
     let base = open_base(&ep);
+    let http = crate::llm_http::env_aware_client(20, base)?;
     eprintln!("hyper feishu gateway starting app_id={app_id} base={base}");
     loop {
         match run_once(&http, &ep, &mgr, &app_id, &secret, base).await {
@@ -239,10 +237,8 @@ pub async fn send(
     let Some((app_id, secret)) = credentials(ep) else {
         return Err(Error::msg("feishu send: missing credentials"));
     };
-    let http = reqwest::Client::builder()
-        .timeout(Duration::from_secs(30))
-        .build()?;
     let base = open_base(ep);
+    let http = crate::llm_http::env_aware_client(30, base)?;
     let text = super::xfer::spoken_text(parts);
     if !text.trim().is_empty() {
         send_text(&http, env, base, &app_id, &secret, &text).await?;

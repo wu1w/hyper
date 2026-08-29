@@ -7,6 +7,7 @@ use std::future::Future;
 use std::time::{Duration, Instant};
 
 use reqwest::Client;
+use serde_json::Value;
 
 use crate::config::Config;
 use crate::error::{Error, Result};
@@ -117,21 +118,51 @@ pub fn build_client_for(connect_s: u64, timeout_s: u64, base_url: &str) -> Resul
                 .http2_keep_alive_while_idle(true);
         }
     }
-    // reqwest is built with default-features=false, so HTTPS_PROXY is ignored
-    // unless we set it. Loopback (llama.cpp) stays direct.
+    finish_client(b, base_url)
+}
+
+/// Honor `HTTPS_PROXY` / `NO_PROXY` on a caller-configured builder.
+pub fn finish_client(b: reqwest::ClientBuilder, target_url: &str) -> Result<Client> {
+    apply_env_proxy(b, target_url)
+        .build()
+        .map_err(|e| Error::Http(e.to_string()))
+}
+
+/// Short-lived HTTP client for IM / media / office. Loopback stays direct.
+pub fn env_aware_client(timeout_s: u64, target_url: &str) -> Result<Client> {
+    finish_client(
+        Client::builder().timeout(Duration::from_secs(timeout_s.max(1))),
+        target_url,
+    )
+}
+
+/// Apply `HTTPS_PROXY` / `HTTP_PROXY` / `ALL_PROXY` plus `NO_PROXY`.
+/// Loopback stays direct so llama.cpp never goes through a remote proxy.
+pub fn apply_env_proxy(b: reqwest::ClientBuilder, base_url: &str) -> reqwest::ClientBuilder {
     if is_loopback_base(base_url) {
-        b = b.no_proxy();
-    } else if let Some(proxy) = env_http_proxy() {
-        match reqwest::Proxy::all(&proxy) {
-            Ok(px) => b = b.proxy(px),
-            Err(e) => eprintln!("hyper llm proxy ignored ({proxy}): {e}"),
+        return b.no_proxy();
+    }
+    let Some(proxy) = env_http_proxy() else {
+        return b;
+    };
+    match reqwest::Proxy::all(&proxy) {
+        Ok(px) => b.proxy(px.no_proxy(reqwest::NoProxy::from_env())),
+        Err(e) => {
+            eprintln!("hyper llm proxy ignored ({proxy}): {e}");
+            b
         }
     }
-    b.build().map_err(|e| Error::Http(e.to_string()))
 }
 
 pub(crate) fn env_http_proxy() -> Option<String> {
-    for key in ["HTTPS_PROXY", "https_proxy", "HTTP_PROXY", "http_proxy"] {
+    for key in [
+        "HTTPS_PROXY",
+        "https_proxy",
+        "HTTP_PROXY",
+        "http_proxy",
+        "ALL_PROXY",
+        "all_proxy",
+    ] {
         if let Ok(v) = std::env::var(key) {
             let v = v.trim().to_string();
             if !v.is_empty() {
@@ -142,6 +173,11 @@ pub(crate) fn env_http_proxy() -> Option<String> {
     None
 }
 
+/// OpenAI-compat and xAI often emit `"error": null` on success.
+pub(crate) fn json_api_error(v: &Value) -> Option<&Value> {
+    v.get("error").filter(|e| !e.is_null())
+}
+
 pub fn is_transient(err: &Error) -> bool {
     match err {
         Error::Watchdog => false,
@@ -149,6 +185,53 @@ pub fn is_transient(err: &Error) -> bool {
         Error::Io(_) => true,
         Error::Http(s) | Error::Msg(s) => looks_transient(s),
     }
+}
+
+/// Retry an IM send only when the request likely never reached the peer.
+/// A read timeout after the POST left this process can duplicate QQ messages.
+pub fn outbound_retryable(err: &Error) -> bool {
+    match err {
+        Error::Watchdog
+        | Error::Config(_)
+        | Error::Template(_)
+        | Error::Tokenizer(_)
+        | Error::Vendor(_) => false,
+        Error::Io(_) => true,
+        Error::Http(s) | Error::Msg(s) => looks_undelivered(s),
+    }
+}
+
+fn looks_undelivered(raw: &str) -> bool {
+    let l = raw.to_ascii_lowercase();
+    if l.contains("timed out") || l.contains("timeout") || l.contains("time out") {
+        return false;
+    }
+    if l.contains("认证失败")
+        || l.contains("unauthorized")
+        || l.contains("forbidden")
+        || l.contains("expired")
+    {
+        return false;
+    }
+    if let Some(code) = http_status_in(&l) {
+        return matches!(code, 408 | 425 | 429 | 500..=599);
+    }
+    const NEEDLES: &[&str] = &[
+        "error sending request",
+        "connection refused",
+        "connection reset",
+        "connection abort",
+        "connection closed",
+        "dns error",
+        "dns_probe",
+        "name or service not known",
+        "failed to lookup",
+        "network unreachable",
+        "host unreachable",
+        "offline",
+        "broken pipe",
+    ];
+    NEEDLES.iter().any(|n| l.contains(n))
 }
 
 fn looks_transient(raw: &str) -> bool {
@@ -277,6 +360,37 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn json_api_error_skips_null() {
+        assert!(json_api_error(&serde_json::json!({"error": null})).is_none());
+        assert!(json_api_error(&serde_json::json!({})).is_none());
+        assert_eq!(
+            json_api_error(&serde_json::json!({"error": "boom"})).and_then(|e| e.as_str()),
+            Some("boom")
+        );
+    }
+
+    #[test]
+    fn outbound_retryable_skips_timeouts_and_4xx() {
+        assert!(!outbound_retryable(&Error::Http("timed out".into())));
+        assert!(!outbound_retryable(&Error::Http(
+            "channel outbound 400 https://api.sgroup.qq.com".into()
+        )));
+        assert!(!outbound_retryable(&Error::Http("unauthorized".into())));
+        assert!(outbound_retryable(&Error::Http(
+            "connection refused".into()
+        )));
+        assert!(outbound_retryable(&Error::Http(
+            "error sending request".into()
+        )));
+        assert!(outbound_retryable(&Error::Http(
+            "channel outbound 503 https://x".into()
+        )));
+        assert!(outbound_retryable(&Error::Http(
+            "channel outbound 429 https://x".into()
+        )));
+    }
 
     #[test]
     fn remote_connect_floor_covers_old_five_second_default() {

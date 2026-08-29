@@ -407,7 +407,7 @@ fn paint_clean(sink: Option<TokenSink>, turn: &ModelTurn) {
 }
 
 fn turn_from_json(v: &Value, truncated: bool) -> Result<ModelTurn> {
-    if let Some(err) = v.get("error").filter(|e| !e.is_null()) {
+    if let Some(err) = crate::llm_http::json_api_error(v) {
         return Err(Error::Http(err.to_string()));
     }
     Ok(if truncated {
@@ -819,7 +819,7 @@ async fn read_sse(
         let events = sse.push(text);
         pending.drain(..valid);
         for event in events {
-            if let Some(err) = event.get("error").filter(|e| !e.is_null()) {
+            if let Some(err) = crate::llm_http::json_api_error(&event) {
                 return Err(Error::Http(err.to_string()));
             }
             acc.apply(&event);
@@ -836,7 +836,7 @@ async fn read_sse(
     }
     let leftover = sse.flush();
     for event in leftover {
-        if let Some(err) = event.get("error").filter(|e| !e.is_null()) {
+        if let Some(err) = crate::llm_http::json_api_error(&event) {
             return Err(Error::Http(err.to_string()));
         }
         acc.apply(&event);
@@ -982,6 +982,22 @@ mod tests {
         assert_eq!(o.turn.tool_calls[0].arguments["path"], "a.rs");
         assert!(o.turn.content.is_empty());
         assert!(!o.turn.watchdog_hit);
+    }
+
+    #[test]
+    fn error_null_is_success() {
+        let v = json!({
+            "error": null,
+            "choices": [{
+                "message": {
+                    "content": "ok",
+                }
+            }],
+            "usage": {"prompt_tokens": 1, "completion_tokens": 1}
+        });
+        let turn = turn_from_json(&v, false).unwrap();
+        assert_eq!(turn.content, "ok");
+        assert!(turn.tool_calls.is_empty());
     }
 
     #[test]

@@ -433,9 +433,7 @@ pub async fn load_part(part: &ContentPart, workspace: Option<&Path>) -> Result<B
 }
 
 async fn fetch_http(url: &str) -> Result<Blob> {
-    let resp = reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(30))
-        .build()?
+    let resp = crate::llm_http::env_aware_client(30, url)?
         .get(url)
         .send()
         .await?;

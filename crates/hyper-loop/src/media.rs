@@ -659,12 +659,15 @@ pub async fn fetch_http_bytes(url: &str, cap: usize) -> Result<(String, Vec<u8>)
         return Err("only http(s) urls".into());
     }
     let origin = parsed.origin().ascii_serialization();
-    let client = reqwest::Client::builder()
-        .redirect(reqwest::redirect::Policy::limited(4))
-        .timeout(std::time::Duration::from_secs(20))
-        .user_agent("Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36")
-        .build()
-        .map_err(|e| e.to_string())?;
+    let client = crate::llm_http::apply_env_proxy(
+        reqwest::Client::builder()
+            .redirect(reqwest::redirect::Policy::limited(4))
+            .timeout(std::time::Duration::from_secs(20))
+            .user_agent("Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36"),
+        u,
+    )
+    .build()
+    .map_err(|e| e.to_string())?;
     let resp = client
         .get(parsed)
         .header(

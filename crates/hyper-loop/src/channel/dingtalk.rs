@@ -52,9 +52,7 @@ pub async fn run_gateway(ep: ChannelEndpoint, mgr: ChannelManager) -> Result<()>
             "dingtalk: extra.client_id/client_secret or DINGTALK_CLIENT_ID/DINGTALK_CLIENT_SECRET required",
         ));
     };
-    let http = reqwest::Client::builder()
-        .timeout(Duration::from_secs(20))
-        .build()?;
+    let http = crate::llm_http::env_aware_client(20, OPEN_URL)?;
     eprintln!("hyper dingtalk gateway starting client_id={client_id}");
     loop {
         match run_once(&http, &ep, &mgr, &client_id, &client_secret).await {
@@ -488,9 +486,7 @@ pub async fn send(
     let Some(url) = webhook_from_env(env) else {
         return Err(Error::msg("dingtalk send: missing session_webhook"));
     };
-    let http = reqwest::Client::builder()
-        .timeout(Duration::from_secs(15))
-        .build()?;
+    let http = crate::llm_http::env_aware_client(15, &url)?;
     let spoken = super::xfer::spoken_text(parts);
     let mut notes = Vec::new();
     let mut image_urls = Vec::new();

@@ -75,9 +75,13 @@ pub async fn deliver(
         match deliver_once(ep, env, &owned).await {
             Ok(()) => return Ok(()),
             Err(e) => {
+                let retry =
+                    attempt + 1 < DELIVER_ATTEMPTS && crate::llm_http::outbound_retryable(&e);
                 last = Some(e);
-                if attempt + 1 < DELIVER_ATTEMPTS {
+                if retry {
                     tokio::time::sleep(Duration::from_millis(200 * (1u64 << attempt))).await;
+                } else {
+                    break;
                 }
             }
         }
@@ -123,7 +127,7 @@ async fn post_webhook(
         "text": parts_to_text(parts),
         "meta": env.meta,
     });
-    let client = reqwest::Client::new();
+    let client = crate::llm_http::env_aware_client(20, &url)?;
     let mut req = client.post(&url).json(&body);
     if let Some(secret) = ep.and_then(|e| nonempty(&e.secret).map(|s| s.to_string())) {
         req = req.header("X-Q38-Token", secret);

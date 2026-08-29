@@ -52,9 +52,7 @@ pub async fn run_poll(ep: ChannelEndpoint, mgr: ChannelManager) -> Result<()> {
             "wechat: extra.bot_token or WECHAT_BOT_TOKEN required",
         ));
     };
-    let http = reqwest::Client::builder()
-        .timeout(Duration::from_secs(POLL_TIMEOUT_SECS))
-        .build()?;
+    let http = crate::llm_http::env_aware_client(POLL_TIMEOUT_SECS, &base)?;
     let mut cursor = load_cursor(&ep.id);
     let mut seen = TokenDedup::new();
     let mut fail = 0u32;
@@ -89,9 +87,7 @@ pub async fn send(
         return Err(Error::msg("wechat send: missing to_user_id"));
     }
     let context_token = meta_str(env, "context_token");
-    let http = reqwest::Client::builder()
-        .timeout(Duration::from_secs(30))
-        .build()?;
+    let http = crate::llm_http::env_aware_client(30, &base)?;
     let mut items: Vec<Value> = Vec::new();
     let text = clip(&super::xfer::spoken_text(parts), TEXT_CLIP);
     if !text.trim().is_empty() {

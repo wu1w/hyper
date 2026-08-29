@@ -436,10 +436,12 @@ async fn transcribe_http(
     let form = reqwest::multipart::Form::new()
         .text("model", "whisper-1")
         .part("file", part);
-    let client = reqwest::Client::builder()
-        .timeout(Duration::from_secs(60))
-        .build()
-        .ok()?;
+    let client = crate::llm_http::apply_env_proxy(
+        reqwest::Client::builder().timeout(Duration::from_secs(60)),
+        &url,
+    )
+    .build()
+    .ok()?;
     let mut req = client.post(&url).multipart(form);
     if !key.is_empty() && key != "local" {
         req = req.bearer_auth(key);
@@ -474,9 +476,7 @@ async fn fetch_capped(
     max_bytes: usize,
     caps: &MediaCaps,
 ) -> Result<(Vec<u8>, String), String> {
-    let client = reqwest::Client::builder()
-        .timeout(Duration::from_secs(30))
-        .build()
+    let client = crate::llm_http::env_aware_client(30, url)
         .map_err(|e| format!("Error: http client: {e}"))?;
     let mut req = client.get(url);
     if let Some((base, key)) = &caps.origin {

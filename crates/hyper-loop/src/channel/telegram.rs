@@ -30,9 +30,7 @@ pub async fn run_long_poll(ep: ChannelEndpoint, mgr: ChannelManager) -> Result<(
             "telegram: set extra.bot_token or TELEGRAM_BOT_TOKEN",
         ));
     };
-    let client = reqwest::Client::builder()
-        .timeout(Duration::from_secs(40))
-        .build()?;
+    let client = crate::llm_http::env_aware_client(40, API)?;
     let mut offset = load_offset(&ep.id);
     eprintln!("hyper channel telegram long-poll ({})", ep.id);
     let mut conflict_n = 0u32;
@@ -112,7 +110,7 @@ pub async fn send(
     if chat_id.is_empty() {
         return Err(Error::msg("telegram send: missing chat_id"));
     }
-    let client = reqwest::Client::new();
+    let client = crate::llm_http::env_aware_client(30, API)?;
     let text = super::xfer::spoken_text(parts);
     if !text.trim().is_empty() {
         send_message(&client, &token, &chat_id, &text).await?;
