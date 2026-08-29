@@ -195,6 +195,9 @@ impl<C: Completer> Agent<C> {
             match decision {
                 GateDecision::Continue { continuation, .. } => {
                     self.mark_clean();
+                    if self.arm_im_wrap_up(&turn.content, "") {
+                        continue;
+                    }
                     let stop_reason = if continuation.is_empty() {
                         None
                     } else {
@@ -204,10 +207,10 @@ impl<C: Completer> Agent<C> {
                 }
                 GateDecision::Stop { reason } => {
                     self.mark_clean();
+                    if self.arm_im_wrap_up(&turn.content, &reason) {
+                        continue;
+                    }
                     if is_physics_stop(&reason) {
-                        if self.arm_im_wrap_up(&turn.content, &reason) {
-                            continue;
-                        }
                         self.note(&reason);
                         return self.finish(turn.content, None, steps);
                     }
@@ -222,6 +225,9 @@ impl<C: Completer> Agent<C> {
                 // handler contract change cannot panic the loop.
                 GateDecision::Bypass => {
                     self.mark_clean();
+                    if self.arm_im_wrap_up(&turn.content, "") {
+                        continue;
+                    }
                     return self.finish(turn.content, None, steps);
                 }
             }
@@ -434,8 +440,8 @@ impl<C: Completer> Agent<C> {
         }
     }
 
-    /// IM tool loops often dump the answer into think and never emit content.
-    /// One no-tool hop after a physics cap, so QQ/WeChat get a visible reply.
+    /// Hermes contract: a turn is not done until there is user-visible text.
+    /// One toolless hop (like `handle_max_iterations`), IM/unattended only.
     fn arm_im_wrap_up(&mut self, spoken: &str, reason: &str) -> bool {
         if self.physics_nudged || !spoken.trim().is_empty() {
             return false;
@@ -532,11 +538,19 @@ impl<C: Completer> Agent<C> {
         }
         let reason = stop_reason.clone().unwrap_or_else(|| "stop".into());
         self.log_event(SessionEvent::stop(reason));
-        let text = if stop_reason.as_deref() == Some("aborted") || !text.trim().is_empty() {
+        let aborted = stop_reason.as_deref() == Some("aborted");
+        let mut text = if aborted || !text.trim().is_empty() {
             text
         } else {
             self.last_spoken.clone().unwrap_or_default()
         };
+        if !aborted
+            && text.trim().is_empty()
+            && !super::interactive_channel(&self.channel)
+            && !self.channel.is_empty()
+        {
+            text = im_no_reply_text(stop_reason.as_deref());
+        }
         Ok(AgentOutcome {
             text,
             stop_reason,
@@ -587,8 +601,20 @@ pub(crate) const THINK_DIVERGENCE_NOTE: &str = "[trajectory] This turn's thinkin
 Compress known facts and open questions first; answer or act if the evidence is enough, else take only the smallest missing step.";
 
 pub(crate) const PHYSICS_WRAP_NOTE: &str =
-    "[trajectory] This turn is near the step, time, or context cap. \
-Close with a user-visible conclusion from the evidence you have; do not start a new tool loop.";
+    "[trajectory] No user-visible reply yet. Summarize what you found and accomplished; \
+do not call any more tools.";
+
+/// Hermes turn-completion explainer: IM never returns a blank box.
+pub(crate) fn im_no_reply_text(reason: Option<&str>) -> String {
+    let why = match reason {
+        Some(r) if is_physics_stop(r) => {
+            "这轮工具步数、时间或上下文用尽，模型没有写出给用户看的结论。"
+        }
+        Some(r) if r.contains("watchdog") => "思考长度触顶后仍没有正文。",
+        _ => "模型只做了工具调用，没有写出给用户看的结论。",
+    };
+    format!("没有可见回复：{why}直接发「继续」我再收一次。")
+}
 
 #[cfg(test)]
 pub(crate) const PARSE_REPAIR_NOTE: &str = "[trajectory] The last hop's tool call did not parse. \

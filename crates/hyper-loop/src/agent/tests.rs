@@ -489,6 +489,50 @@ async fn im_physics_cap_wraps_with_visible_reply() {
 }
 
 #[tokio::test]
+async fn im_empty_text_hop_wraps_with_visible_reply() {
+    let dir = std::env::temp_dir().join(format!("hyper-im-empty-{}", uuid::Uuid::new_v4().simple()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let mut o = opts(&dir);
+    o.max_steps = 8;
+    o.peripheral = false;
+    o.channel = "qq".into();
+    let scripted = Scripted {
+        turns: Mutex::new(VecDeque::from([
+            turn_text(""),
+            turn_text("here is the answer"),
+        ])),
+        meter: false,
+    };
+    let mut agent = Agent::new(scripted, o).unwrap();
+    let out = agent.run("what did you find").await.unwrap();
+    assert_eq!(out.text, "here is the answer", "{:?}", out.stop_reason);
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+#[tokio::test]
+async fn im_empty_after_wrap_emits_explainer() {
+    let dir =
+        std::env::temp_dir().join(format!("hyper-im-explainer-{}", uuid::Uuid::new_v4().simple()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let mut o = opts(&dir);
+    o.max_steps = 8;
+    o.peripheral = false;
+    o.channel = "qq".into();
+    let scripted = Scripted {
+        turns: Mutex::new(VecDeque::from([turn_text(""), turn_text("")])),
+        meter: false,
+    };
+    let mut agent = Agent::new(scripted, o).unwrap();
+    let out = agent.run("what did you find").await.unwrap();
+    assert!(
+        out.text.contains("没有可见回复"),
+        "expected explainer, got {:?}",
+        out.text
+    );
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+#[tokio::test]
 async fn steer_injects_after_tool_round() {
     let dir = std::env::temp_dir().join(format!("hyper-steer-{}", uuid::Uuid::new_v4().simple()));
     std::fs::create_dir_all(&dir).unwrap();
