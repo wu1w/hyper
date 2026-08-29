@@ -38,6 +38,9 @@ const INTENT_PUBLIC_GUILD_MESSAGES: u64 = 1 << 30;
 
 static MSG_SEQ: AtomicU64 = AtomicU64::new(1);
 
+/// QQ Bot C2C "对方正在输入". Hermes qqbot `MSG_TYPE_INPUT_NOTIFY`.
+const MSG_TYPE_INPUT_NOTIFY: i64 = 6;
+
 pub fn credentials(ep: &ChannelEndpoint) -> Option<(String, String)> {
     let app_id = ep
         .extra
@@ -429,6 +432,47 @@ pub async fn send(
         }
     }
     Ok(())
+}
+
+/// Hermes `_keep_typing`: C2C input_notify, 60s bubble, refresh before expiry.
+pub async fn send_typing(ep: Option<&ChannelEndpoint>, env: &NativePayload) -> Result<()> {
+    let Some(ep) = ep else {
+        return Ok(());
+    };
+    let msg_type = env
+        .meta
+        .get("message_type")
+        .and_then(Value::as_str)
+        .unwrap_or("c2c");
+    if msg_type != "c2c" {
+        return Ok(());
+    }
+    if env
+        .meta
+        .get("msg_id")
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .is_empty()
+    {
+        return Ok(());
+    }
+    let Some((app_id, secret)) = credentials(ep) else {
+        return Ok(());
+    };
+    let http = crate::llm_http::env_aware_client(20, TOKEN_URL)?;
+    let token = access_token(&http, &app_id, &secret).await?;
+    let bases = api_bases(ep);
+    send_typed(
+        &http,
+        &token,
+        &bases,
+        env,
+        MSG_TYPE_INPUT_NOTIFY,
+        json!({
+            "input_notify": { "input_type": 1, "input_second": 60 }
+        }),
+    )
+    .await
 }
 
 fn clip_qq(text: &str) -> String {

@@ -186,7 +186,17 @@ async fn session_worker<H: ChannelHandler>(
 ) {
     while let Some(env) = rx.recv().await {
         let ep = cfg.endpoint_for(&env.channel).cloned();
-        match handler.handle(env.clone()).await {
+        let live = if env.channel == "qq" {
+            Some(super::outbound::spawn_live_presence(ep.clone(), env.clone()))
+        } else {
+            None
+        };
+        let result = handler.handle(env.clone()).await;
+        if let Some(live) = live {
+            live.abort();
+            let _ = live.await;
+        }
+        match result {
             Ok(parts) => {
                 if let Err(e) = super::outbound::deliver(ep.as_ref(), &env, &parts).await {
                     eprintln!("hyper channel deliver: {e}");

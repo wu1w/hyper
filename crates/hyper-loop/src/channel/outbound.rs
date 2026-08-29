@@ -1,8 +1,9 @@
 //! Send QwenPaw `content_parts` back to the originating chat.
 
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use serde_json::{json, Value};
+use tokio::task::JoinHandle;
 
 use crate::error::Result;
 
@@ -11,6 +12,11 @@ use super::ChannelEndpoint;
 
 const EMPTY_REPLY: &str = "(无文本回复)";
 const DELIVER_ATTEMPTS: u32 = 3;
+/// Hermes qqbot: input_notify lasts 60s, refresh at 50s.
+const QQ_TYPING_REFRESH: Duration = Duration::from_secs(50);
+/// First visible heartbeat if the turn is still running (QQ cannot edit a bubble).
+const QQ_HEARTBEAT_FIRST: Duration = Duration::from_secs(90);
+const QQ_HEARTBEAT_EVERY: Duration = Duration::from_secs(180);
 
 pub fn reply_text(body: impl Into<String>) -> Vec<ContentPart> {
     let body = body.into();
@@ -87,6 +93,54 @@ pub async fn deliver(
         }
     }
     Err(last.expect("DELIVER_ATTEMPTS >= 1"))
+}
+
+/// Hermes gateway: typing + long-running notices run *while* the agent works,
+/// not after `handle()` returns. QQ C2C uses input_notify; a text heartbeat
+/// lands if the turn is still going after 90s (no message-edit on QQ).
+pub fn spawn_live_presence(
+    ep: Option<ChannelEndpoint>,
+    env: NativePayload,
+) -> JoinHandle<()> {
+    tokio::spawn(async move {
+        let kind = ep
+            .as_ref()
+            .map(|e| e.kind.as_str())
+            .unwrap_or(env.channel.as_str());
+        if kind != "qq" {
+            std::future::pending::<()>().await;
+            return;
+        }
+        if let Err(e) = super::qq::send_typing(ep.as_ref(), &env).await {
+            eprintln!("hyper qq typing: {e}");
+        }
+        let start = Instant::now();
+        let mut last_hb: Option<Instant> = None;
+        loop {
+            tokio::time::sleep(QQ_TYPING_REFRESH).await;
+            if let Err(e) = super::qq::send_typing(ep.as_ref(), &env).await {
+                eprintln!("hyper qq typing: {e}");
+            }
+            let elapsed = start.elapsed();
+            let due = match last_hb {
+                None => elapsed >= QQ_HEARTBEAT_FIRST,
+                Some(t) => t.elapsed() >= QQ_HEARTBEAT_EVERY,
+            };
+            if due {
+                let mins = elapsed.as_secs() / 60;
+                let text = if mins == 0 {
+                    "还在处理中…".to_string()
+                } else {
+                    format!("还在处理中（已 {mins} 分钟）…")
+                };
+                let parts = vec![ContentPart::text(text)];
+                if let Err(e) = deliver_once(ep.as_ref(), &env, &parts).await {
+                    eprintln!("hyper qq heartbeat: {e}");
+                }
+                last_hb = Some(Instant::now());
+            }
+        }
+    })
 }
 
 async fn deliver_once(
