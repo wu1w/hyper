@@ -1,6 +1,5 @@
 //! Hidden cards at the start of a user turn: explicit `[skill:]` / `[mcp:]`,
-//! plus plan/clarify mode cards. Locate / out / style / web / numeric lectures
-//! are not part of the Cursor hop.
+//! plus plan/clarify mode cards and a compact `[workset]` snapshot.
 
 use super::{Agent, Completer};
 use crate::mcp::card_for as mcp_card;
@@ -16,6 +15,7 @@ impl<C: Completer> Agent<C> {
         forced_mcp: Option<&str>,
     ) {
         self.inject_cursor_mode_notes(user, forced_skill, forced_mcp);
+        self.inject_workset_note();
     }
 
     /// Cursor/Responses: only plan/clarify mode cards and an explicit
@@ -59,6 +59,19 @@ impl<C: Completer> Agent<C> {
         }
         if (self.plan_mode || self.clarify_mode) && !sticky::live_has_clarify_note(&self.messages) {
             self.push_hidden_user(crate::clarify::CLARIFY_CARD);
+        }
+    }
+
+    fn inject_workset_note(&mut self) {
+        let stubbed = sticky::stub_live_workset_notes(&mut self.messages);
+        self.note_stubbed(stubbed);
+        let mut window: Vec<String> =
+            super::dispatch::observed_from_messages(&self.messages, &self.workspace)
+                .into_iter()
+                .collect();
+        window.sort();
+        if let Some(card) = super::workset::card(self.workspace.root(), &window) {
+            self.push_hidden_user(card);
         }
     }
 

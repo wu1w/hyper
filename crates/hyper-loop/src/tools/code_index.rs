@@ -1,7 +1,6 @@
-//! Workspace code index. One `search` tool covers Cursor's glob / exact-symbol
-//! / keyword paths and returns function-sized spans, not grep dumps. Not a
-//! fifth frozen tool JSON — the agent appends `search_tool()` after the frozen
-//! four.
+//! Workspace code index. `Search` covers Cursor's glob / exact-symbol /
+//! keyword paths and returns function-sized spans, not grep dumps. Not in
+//! the frozen 13 — `bind_periphery` appends `search_tool()` after them.
 
 use std::collections::{HashMap, HashSet};
 use std::io::Read;
@@ -121,6 +120,15 @@ impl CodeIndex {
             mark_scanned(root);
         }
         idx
+    }
+
+    pub(crate) fn is_empty(&self) -> bool {
+        let conn = crate::lock_unpoison(&self.conn);
+        conn.query_row("SELECT COUNT(*) FROM chunks", [], |row| {
+            row.get::<_, i64>(0)
+        })
+        .unwrap_or(0)
+            == 0
     }
 
     fn empty() -> Self {
@@ -538,7 +546,12 @@ pub fn run_search(index: &CodeIndex, call: &ToolCall, limits: ToolLimits) -> Too
     let path = arg_str(&call.arguments, "path").filter(|s| !s.trim().is_empty());
     let hits = index.search(&query, path.as_deref(), HIT_CAP);
     if hits.is_empty() {
-        return ToolResponse::text(&call.id, "No matches.", ToolState::Success);
+        let hint = if index.is_empty() {
+            "No matches. The workspace index has no chunks (home folder, huge tree, or scan budget). Use Grep for exact search."
+        } else {
+            "No matches."
+        };
+        return ToolResponse::text(&call.id, hint, ToolState::Success);
     }
     folded_response(
         &call.id,
@@ -1377,6 +1390,20 @@ mod tests {
         assert!(text.contains("|"), "{text}");
         assert!(text.contains("upgrade_medium"), "{text}");
         let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn empty_index_search_points_at_grep() {
+        let idx = CodeIndex::empty();
+        let call = ToolCall {
+            id: "t".into(),
+            name: "search".into(),
+            arguments: json!({"query": "nothing-here"}),
+        };
+        let out = run_search(&idx, &call, ToolLimits::default());
+        let text = out.joined_text();
+        assert!(text.contains("No matches"), "{text}");
+        assert!(text.contains("Grep"), "{text}");
     }
 
     #[test]

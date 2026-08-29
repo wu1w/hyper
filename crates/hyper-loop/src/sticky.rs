@@ -93,6 +93,7 @@ pub fn is_sticky_note(text: &str) -> bool {
         || inner.starts_with("[mcp]")
         || inner.starts_with("[style]")
         || inner.starts_with("[out]")
+        || inner.starts_with("[workset]")
         || inner.starts_with("MEMORY hot")
         || inner.starts_with("MEMORY hosts")
         || inner.starts_with("MEMORY.md")
@@ -135,6 +136,9 @@ fn stub_body(inner: &str) -> String {
     if inner.starts_with("[out]") {
         return "[out] applied".into();
     }
+    if inner.starts_with("[workset]") {
+        return "[workset] applied".into();
+    }
     "applied".into()
 }
 
@@ -154,6 +158,13 @@ pub fn stub_live_skill_notes(messages: &mut [ChatMessage]) -> usize {
 /// Fresh `[out]` card each user turn.
 pub fn stub_live_out_notes(messages: &mut [ChatMessage]) -> usize {
     stub_notes(messages, StubWhen::Now, |inner| inner.starts_with("[out]"))
+}
+
+/// Fresh `[workset]` card each user turn.
+pub fn stub_live_workset_notes(messages: &mut [ChatMessage]) -> usize {
+    stub_notes(messages, StubWhen::Now, |inner| {
+        inner.starts_with("[workset]")
+    })
 }
 
 /// User explicitly named an MCP server. Don't wait two turns.

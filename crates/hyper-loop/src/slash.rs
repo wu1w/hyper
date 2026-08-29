@@ -794,7 +794,7 @@ pub fn compact_reply(plan: Option<&CompactEvent>) -> String {
                 .into()
         }
         Some(p) => format!(
-            "**Compact complete.**\n\n- Archived through seq {}\n- Continuation is extractive (not an LLM summary)\n- Older turns stay in JSONL; use recall",
+            "**Compact complete.**\n\n- Archived through seq {}\n- Continuation is extractive (not an LLM summary)\n- Older turns stay in JSONL",
             p.until_seq
         ),
     }

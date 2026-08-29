@@ -4,7 +4,16 @@
 //! Commands stay cheap: `cargo test -p <pkg> --lib` or `pytest` on related
 //! files. Full-workspace `cargo test` is never the default.
 
+use std::io::Read;
 use std::path::{Path, PathBuf};
+use std::process::{Command, Stdio};
+use std::time::{Duration, Instant};
+
+use crate::tool_calls::CancelFlag;
+use serde_json::Value;
+
+const DIAG_TIMEOUT: Duration = Duration::from_secs(12);
+const DIAG_MAX: usize = 2000;
 
 const CODE_EXT: &[&str] = &[
     "rs", "py", "ts", "tsx", "js", "jsx", "mjs", "cjs", "go", "java", "kt", "kts", "c", "cc",
@@ -68,6 +77,215 @@ pub fn scoped_test_cmd(root: &Path, edited: &[String]) -> Option<String> {
         return Some(cmd);
     }
     python_unittest(root)
+}
+
+/// Compile/lint after a successful Write/StrReplace. Empty = clean (append nothing).
+/// Runs on a blocking thread so `cargo check` cannot stall the agent runtime.
+pub async fn run_diagnostics_async(
+    root: &Path,
+    edited: &[String],
+    cancel: &CancelFlag,
+) -> Option<String> {
+    let root = root.to_path_buf();
+    let edited = edited.to_vec();
+    let cancel = cancel.clone();
+    tokio::task::spawn_blocking(move || run_diagnostics(&root, &edited, &cancel))
+        .await
+        .ok()
+        .flatten()
+}
+
+pub fn run_diagnostics(root: &Path, edited: &[String], cancel: &CancelFlag) -> Option<String> {
+    if cancel.is_cancelled() {
+        return None;
+    }
+    let code: Vec<String> = edited
+        .iter()
+        .map(|p| normalize(p))
+        .filter(|p| is_code_path(p))
+        .collect();
+    if code.is_empty() {
+        return None;
+    }
+    let raw = cargo_diag(root, &code, cancel)
+        .or_else(|| tsc_diag(root, &code, cancel))
+        .or_else(|| ruff_diag(root, &code, cancel))?;
+    let text = raw.trim();
+    if text.is_empty() {
+        return None;
+    }
+    let mut out = String::from("[diagnostics]\n");
+    out.push_str(text);
+    if out.len() > DIAG_MAX {
+        out.truncate(DIAG_MAX);
+        while !out.is_char_boundary(out.len()) {
+            out.pop();
+        }
+    }
+    Some(out)
+}
+
+fn cargo_diag(root: &Path, edited: &[String], cancel: &CancelFlag) -> Option<String> {
+    let rust: Vec<&str> = edited
+        .iter()
+        .map(|s| s.as_str())
+        .filter(|p| p.ends_with(".rs"))
+        .collect();
+    if rust.is_empty() {
+        return None;
+    }
+    let (_, name) = nearest_cargo_package(root, rust[0])?;
+    let stdout = run_cmd(
+        "cargo",
+        &[
+            "check",
+            "-p",
+            &name,
+            "--message-format=json",
+            "--color",
+            "never",
+        ],
+        root,
+        cancel,
+    )?;
+    let mut errors = Vec::new();
+    for line in stdout.lines() {
+        let Ok(v) = serde_json::from_str::<Value>(line) else {
+            continue;
+        };
+        if v["reason"].as_str() != Some("compiler-message") {
+            continue;
+        }
+        let msg = &v["message"];
+        if msg["level"].as_str() != Some("error") {
+            continue;
+        }
+        if let Some(rendered) = msg["rendered"].as_str() {
+            let t = rendered.trim();
+            if !t.is_empty() && !errors.iter().any(|e: &String| e == t) {
+                errors.push(t.to_string());
+            }
+        } else if let Some(m) = msg["message"].as_str() {
+            if !errors.iter().any(|e: &String| e == m) {
+                errors.push(m.to_string());
+            }
+        }
+    }
+    if errors.is_empty() {
+        return None;
+    }
+    Some(errors.join("\n"))
+}
+
+fn tsc_diag(root: &Path, edited: &[String], cancel: &CancelFlag) -> Option<String> {
+    let ts = edited.iter().any(|p| {
+        let e = p.rsplit('.').next().unwrap_or("");
+        matches!(e, "ts" | "tsx" | "js" | "jsx" | "mjs" | "cjs")
+    });
+    if !ts || !root.join("tsconfig.json").is_file() {
+        return None;
+    }
+    let bin = root.join("node_modules/.bin/tsc");
+    let (prog, args): (String, Vec<String>) = if bin.is_file() {
+        (
+            bin.to_string_lossy().into_owned(),
+            vec!["--noEmit".into(), "--pretty".into(), "false".into()],
+        )
+    } else {
+        return None;
+    };
+    let arg_refs: Vec<&str> = args.iter().map(|s| s.as_str()).collect();
+    let out = run_cmd(&prog, &arg_refs, root, cancel)?;
+    let err: String = out
+        .lines()
+        .filter(|l| l.contains("error TS"))
+        .take(12)
+        .collect::<Vec<_>>()
+        .join("\n");
+    if err.trim().is_empty() {
+        None
+    } else {
+        Some(err)
+    }
+}
+
+fn ruff_diag(root: &Path, edited: &[String], cancel: &CancelFlag) -> Option<String> {
+    let py: Vec<&str> = edited
+        .iter()
+        .map(|s| s.as_str())
+        .filter(|p| p.ends_with(".py"))
+        .collect();
+    if py.is_empty() {
+        return None;
+    }
+    if !cmd_exists("ruff") {
+        return None;
+    }
+    let mut args = vec!["check", "--quiet"];
+    args.extend(py.iter().copied());
+    let out = run_cmd("ruff", &args, root, cancel)?;
+    let t = out.trim();
+    if t.is_empty() {
+        None
+    } else {
+        Some(t.to_string())
+    }
+}
+
+fn cmd_exists(name: &str) -> bool {
+    Command::new(name)
+        .arg("--version")
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .is_ok_and(|s| s.success())
+}
+
+fn run_cmd(prog: &str, args: &[&str], cwd: &Path, cancel: &CancelFlag) -> Option<String> {
+    let mut cmd = Command::new(prog);
+    crate::proc_spawn::hide_window(&mut cmd);
+    cmd.args(args)
+        .current_dir(cwd)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    if prog == "cargo" {
+        cmd.env("CARGO_TARGET_DIR", cwd.join("target"));
+        cmd.env("CARGO_TERM_COLOR", "never");
+        cmd.env("CARGO_INCREMENTAL", "0");
+    }
+    let mut child = cmd.spawn().ok()?;
+    let started = Instant::now();
+    loop {
+        if cancel.is_cancelled() {
+            let _ = child.kill();
+            let _ = child.wait();
+            return None;
+        }
+        match child.try_wait() {
+            Ok(Some(_)) => {
+                let mut buf = Vec::new();
+                if let Some(out) = child.stdout.as_mut() {
+                    let _ = out.read_to_end(&mut buf);
+                }
+                if buf.is_empty() {
+                    if let Some(err) = child.stderr.as_mut() {
+                        let _ = err.read_to_end(&mut buf);
+                    }
+                }
+                return Some(String::from_utf8_lossy(&buf).into_owned());
+            }
+            Ok(None) if started.elapsed() > DIAG_TIMEOUT => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return None;
+            }
+            Ok(None) => std::thread::sleep(Duration::from_millis(40)),
+            Err(_) => {
+                let _ = child.kill();
+                return None;
+            }
+        }
+    }
 }
 
 /// Start-of-turn baseline when we do not yet know which files will change.
@@ -229,6 +447,7 @@ pub fn python_launcher() -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::tool_calls::CancelFlag;
 
     #[test]
     fn code_path_skips_office_docs() {
@@ -284,6 +503,65 @@ mod tests {
         assert!(cmd.contains("unittest"), "{cmd}");
         assert!(!cmd.contains("pytest"), "{cmd}");
         assert!(workspace_has_tests(&dir));
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn cargo_check_errors_append_diagnostics() {
+        use std::process::{Command, Stdio};
+        if Command::new("cargo")
+            .arg("-V")
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .ok()
+            .is_none_or(|s| !s.success())
+        {
+            return;
+        }
+        let dir =
+            std::env::temp_dir().join(format!("hyper-diag-{}", uuid::Uuid::new_v4().simple()));
+        std::fs::create_dir_all(dir.join("src")).unwrap();
+        std::fs::write(
+            dir.join("Cargo.toml"),
+            "[package]\nname = \"hyperdiag\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
+        )
+        .unwrap();
+        std::fs::write(dir.join("src/lib.rs"), "pub fn f() -> i32 { \"nope\" }\n").unwrap();
+        let cancel = CancelFlag::new();
+        let got = run_diagnostics(&dir, &["src/lib.rs".into()], &cancel).unwrap();
+        assert!(got.contains("[diagnostics]"), "{got}");
+        assert!(
+            got.contains("mismatched types") || got.contains("error"),
+            "{got}"
+        );
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn clean_rust_edit_appends_nothing() {
+        use std::process::{Command, Stdio};
+        if Command::new("cargo")
+            .arg("-V")
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .ok()
+            .is_none_or(|s| !s.success())
+        {
+            return;
+        }
+        let dir =
+            std::env::temp_dir().join(format!("hyper-diag-ok-{}", uuid::Uuid::new_v4().simple()));
+        std::fs::create_dir_all(dir.join("src")).unwrap();
+        std::fs::write(
+            dir.join("Cargo.toml"),
+            "[package]\nname = \"hyperdiagok\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
+        )
+        .unwrap();
+        std::fs::write(dir.join("src/lib.rs"), "pub fn f() -> i32 { 1 }\n").unwrap();
+        let cancel = CancelFlag::new();
+        assert!(run_diagnostics(&dir, &["src/lib.rs".into()], &cancel).is_none());
         let _ = std::fs::remove_dir_all(dir);
     }
 }

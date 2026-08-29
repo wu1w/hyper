@@ -7,11 +7,13 @@ mod http;
 mod notes;
 mod responses;
 mod setup;
+mod speculate;
 #[cfg(test)]
 mod tests;
 mod turn;
 mod verify;
 mod window;
+mod workset;
 
 use std::collections::HashSet;
 use std::future::Future;
@@ -39,6 +41,7 @@ use crate::tools::{BlobStore, CodeIndex, ToolLimits, Workspace};
 pub use delta::TokenSink;
 pub use http::{parse_cached_tokens, parse_turn, HttpCompleter, ParseOutcome};
 pub use responses::{ResponsesCompleter, TransportCompleter};
+pub(crate) use speculate::SpeculativeSlot;
 
 /// Used by `http.rs` / `responses.rs` when wrapping native tool_calls.
 pub(super) use dispatch::openai_tool_calls;
@@ -128,6 +131,13 @@ pub trait Completer: Send + Sync {
 
     fn media_caps(&self) -> crate::media::MediaCaps {
         crate::media::MediaCaps::default()
+    }
+
+    /// Stream-time slot for speculative read-only tools. Default no-op (tests).
+    fn set_speculate(&self, _slot: Option<SpeculativeSlot>) {}
+
+    fn speculate(&self) -> Option<SpeculativeSlot> {
+        None
     }
 }
 
@@ -427,8 +437,13 @@ pub struct Agent<C> {
     edit_guard: guard::EditGuard,
     /// Empty / cli / tui / web / console are interactive; IM skips AskQuestion.
     channel: String,
-    /// Optional FTS for the legacy `search` tool. Built on first dispatch.
-    code_index: Option<CodeIndex>,
+    /// Optional FTS for the `Search` tool. Built on the first user turn, not
+    /// in `Agent::new` (Windows home-folder hang).
+    code_index: Option<std::sync::Arc<CodeIndex>>,
+    /// In-flight `CodeIndex::build` so hop-1 HTTP can overlap the 3s scan.
+    index_build: Option<tokio::task::JoinHandle<std::sync::Arc<CodeIndex>>>,
+    /// Prefetch handles for the in-flight model hop.
+    speculate: Option<SpeculativeSlot>,
     /// Physics cap (steps / wall / context / tool budget) already got a wrap-up hop.
     physics_nudged: bool,
     /// Last official xAI compaction item (opaque). Next Responses `input` should

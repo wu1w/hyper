@@ -1227,6 +1227,10 @@ async fn search_returns_function_span() {
     };
     let mut agent = Agent::new(scripted, opts(&dir)).unwrap();
     assert!(crate::tools_schema::has_tool(&agent.tools, "Grep"));
+    assert!(
+        crate::tools_schema::has_tool(&agent.tools, "Search"),
+        "Search is mounted after the frozen 13"
+    );
     let out = agent.run("where is think cap upgraded").await.unwrap();
     assert_eq!(out.text, "found");
     let tool_txt = agent
@@ -3268,7 +3272,10 @@ async fn prefix_budget_compacts_then_runs() {
     let log = SessionLog::open_in(&sess, "c2").unwrap();
     let kinds: Vec<_> = log.events().iter().map(|e| e.type_name()).collect();
     if kinds.iter().any(|k| *k == "session/compact") {
-        assert!(has_recall(&agent.tools), "recall appended after compact");
+        assert!(
+            !has_recall(&agent.tools),
+            "Cursor compact does not mount recall"
+        );
         let live_users: Vec<_> = agent
             .messages
             .iter()
@@ -3316,6 +3323,70 @@ async fn persist_session_writes_jsonl() {
     let kinds: Vec<_> = log.events().iter().map(|e| e.type_name()).collect();
     assert_eq!(kinds, ["session/start", "user", "assistant", "stop"]);
     assert_eq!(log.messages().len(), 3);
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+#[tokio::test]
+async fn tool_hop_persists_empty_visible_content() {
+    let dir = std::env::temp_dir().join(format!("hyper-hop-{}", uuid::Uuid::new_v4().simple()));
+    let sess = dir.join("sessions");
+    std::fs::create_dir_all(&sess).unwrap();
+    std::fs::write(dir.join("note.txt"), "abc\n").unwrap();
+    let mut o = opts(&dir);
+    o.persist_session = true;
+    o.session_id = "hop1".into();
+    o.session_dir = Some(sess.clone());
+    let scripted = Scripted {
+        turns: Mutex::new(VecDeque::from([
+            {
+                let mut t = turn_said(
+                    "I'll read note.txt next.",
+                    "read",
+                    json!({"path": "note.txt"}),
+                );
+                t.reasoning = "Long hop essay that must not ride to the next request.".into();
+                t
+            },
+            turn_text("abc"),
+        ])),
+        meter: false,
+    };
+    let mut agent = Agent::new(scripted, o).unwrap();
+    let out = agent.run("read it").await.unwrap();
+    assert_eq!(out.text, "abc");
+    let hop = agent
+        .messages
+        .iter()
+        .find(|m| m.role == "assistant" && m.tool_calls.as_ref().is_some_and(|c| !c.is_empty()))
+        .expect("tool hop");
+    assert!(
+        hop.content.is_none() || hop.content.as_deref() == Some(""),
+        "{:?}",
+        hop.content
+    );
+    assert!(
+        hop.reasoning_content.is_none(),
+        "hop think stays off the model transcript: {:?}",
+        hop.reasoning_content
+    );
+    let log = SessionLog::open_in(&sess, "hop1").unwrap();
+    let stored = log.events().iter().find_map(|e| match e {
+        SessionEvent::Assistant(a) if a.tool_calls.as_ref().is_some_and(|c| !c.is_empty()) => {
+            Some(a.content.as_str())
+        }
+        _ => None,
+    });
+    assert_eq!(stored, Some(""));
+    let stored_think = log.events().iter().find_map(|e| match e {
+        SessionEvent::Assistant(a) if a.tool_calls.as_ref().is_some_and(|c| !c.is_empty()) => {
+            Some(a.reasoning.as_str())
+        }
+        _ => None,
+    });
+    assert_eq!(
+        stored_think,
+        Some("Long hop essay that must not ride to the next request.")
+    );
     let _ = std::fs::remove_dir_all(dir);
 }
 
@@ -4123,6 +4194,144 @@ async fn view_dispatch_attaches_when_caps_allow() {
             || viewed.parts[0].url.starts_with("data:image/png;base64,"),
         "live window should keep a disk path, not a multi-MB data URI: {}",
         viewed.parts[0].url
+    );
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+#[tokio::test]
+async fn agent_mounts_search_by_default() {
+    let dir = std::env::temp_dir().join(format!(
+        "hyper-search-tool-{}",
+        uuid::Uuid::new_v4().simple()
+    ));
+    std::fs::create_dir_all(&dir).unwrap();
+    let scripted = Scripted {
+        turns: Mutex::new(VecDeque::from([turn_text("ok")])),
+        meter: false,
+    };
+    let agent = Agent::new(scripted, opts(&dir)).unwrap();
+    assert!(crate::tools_schema::has_tool(agent.tools(), "Search"));
+    assert!(crate::tools_schema::has_tool(agent.tools(), "Grep"));
+    let frozen = crate::tools_schema::agent_tools();
+    assert!(!crate::tools_schema::has_tool(&frozen, "Search"));
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+#[tokio::test]
+async fn workset_injected_for_git_workspace() {
+    use std::process::{Command, Stdio};
+    if !Command::new("git")
+        .arg("--version")
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .is_ok_and(|s| s.success())
+    {
+        return;
+    }
+    let dir = std::env::temp_dir().join(format!("hyper-workset-{}", uuid::Uuid::new_v4().simple()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let git = |args: &[&str]| {
+        Command::new("git")
+            .args(["-C"])
+            .arg(&dir)
+            .args(args)
+            .env("GIT_TERMINAL_PROMPT", "0")
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .is_ok_and(|s| s.success())
+    };
+    if !git(&["init"]) {
+        let _ = std::fs::remove_dir_all(&dir);
+        return;
+    }
+    let _ = git(&["config", "user.email", "t@t"]);
+    let _ = git(&["config", "user.name", "t"]);
+    std::fs::write(dir.join("a.rs"), "fn a() {}\n").unwrap();
+    let _ = git(&["add", "a.rs"]);
+    let _ = git(&["commit", "-m", "init"]);
+    std::fs::write(dir.join("a.rs"), "fn a() { 1 }\n").unwrap();
+    let scripted = Scripted {
+        turns: Mutex::new(VecDeque::from([turn_text("ok")])),
+        meter: false,
+    };
+    let mut agent = Agent::new(scripted, opts(&dir)).unwrap();
+    let _ = agent.run("hi").await.unwrap();
+    let hidden: Vec<_> = agent
+        .messages
+        .iter()
+        .filter(|m| m.role == "user")
+        .filter_map(|m| m.content.as_deref())
+        .filter(|c| crate::template::is_hidden_user_text(c) && c.contains("[workset]"))
+        .collect();
+    assert_eq!(hidden.len(), 1, "{hidden:?}");
+    assert!(hidden[0].contains("git:"), "{:?}", hidden[0]);
+    assert!(hidden[0].contains("a.rs"), "{:?}", hidden[0]);
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+struct PrefetchThenDelete {
+    inner: Scripted,
+    slot: Mutex<Option<super::SpeculativeSlot>>,
+    path: std::path::PathBuf,
+}
+
+impl Completer for PrefetchThenDelete {
+    async fn complete(
+        &self,
+        messages: &[ChatMessage],
+        tools: Option<&[Value]>,
+    ) -> Result<ModelTurn> {
+        let turn = self.inner.complete(messages, tools).await?;
+        let slot = self.slot.lock().expect("slot").clone();
+        if let Some(slot) = slot {
+            slot.offer(&turn.tool_calls);
+            tokio::time::sleep(std::time::Duration::from_millis(80)).await;
+            let _ = std::fs::remove_file(&self.path);
+        }
+        Ok(turn)
+    }
+
+    fn set_speculate(&self, slot: Option<super::SpeculativeSlot>) {
+        *self.slot.lock().expect("slot") = slot;
+    }
+
+    fn speculate(&self) -> Option<super::SpeculativeSlot> {
+        self.slot.lock().expect("slot").clone()
+    }
+}
+
+#[tokio::test]
+async fn speculative_read_survives_file_delete() {
+    let dir =
+        std::env::temp_dir().join(format!("hyper-prefetch-{}", uuid::Uuid::new_v4().simple()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("note.txt");
+    std::fs::write(&path, "prefetch-ok\n").unwrap();
+    let scripted = PrefetchThenDelete {
+        inner: Scripted {
+            turns: Mutex::new(VecDeque::from([
+                turn_tool("Read", json!({"path": "note.txt"})),
+                turn_text("done"),
+            ])),
+            meter: false,
+        },
+        slot: Mutex::new(None),
+        path: path.clone(),
+    };
+    let mut agent = Agent::new(scripted, opts(&dir)).unwrap();
+    let out = agent.run("read note").await.unwrap();
+    assert_eq!(out.text, "done");
+    let tool_txt = agent
+        .messages
+        .iter()
+        .find(|m| m.role == "tool")
+        .and_then(|m| m.content.as_deref())
+        .unwrap_or("");
+    assert!(
+        tool_txt.contains("prefetch-ok"),
+        "speculative Read should finish before the file is deleted: {tool_txt}"
     );
     let _ = std::fs::remove_dir_all(dir);
 }

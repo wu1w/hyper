@@ -9,11 +9,11 @@ use std::collections::HashSet;
 use std::sync::Mutex;
 
 use super::delta::StreamPaint;
-use super::{Completer, HttpCompleter, ModelTurn, TokenSink};
+use super::{Completer, HttpCompleter, ModelTurn, SpeculativeSlot, TokenSink};
 use crate::config::Config;
 use crate::error::{Error, Result};
 use crate::family::{EndpointCaps, EngineProfile, Family};
-use crate::policy::{grok_forwarding_effort, Effort, ThinkPolicy};
+use crate::policy::{grok_forwarding_effort, ThinkPolicy};
 use crate::session::{messages_to_responses_input, OfficialCompaction};
 use crate::template::ChatMessage;
 use crate::tool_calls::ToolCall;
@@ -32,6 +32,7 @@ pub struct ResponsesCompleter {
     cache_key: Mutex<Option<String>>,
     compaction: Mutex<Option<OfficialCompaction>>,
     compaction_skip: Mutex<usize>,
+    speculate: Mutex<Option<SpeculativeSlot>>,
 }
 
 impl ResponsesCompleter {
@@ -64,6 +65,7 @@ impl ResponsesCompleter {
             cache_key: Mutex::new(None),
             compaction: Mutex::new(None),
             compaction_skip: Mutex::new(0),
+            speculate: Mutex::new(None),
         })
     }
 
@@ -77,6 +79,10 @@ impl ResponsesCompleter {
 
     fn token_sink(&self) -> Option<TokenSink> {
         lock_sink(&self.token_sink).clone()
+    }
+
+    fn speculate(&self) -> Option<SpeculativeSlot> {
+        lock_speculate(&self.speculate).clone()
     }
 }
 
@@ -116,7 +122,8 @@ impl Completer for ResponsesCompleter {
             return Err(auth_or_status(status, &text));
         }
         if sink.is_some() {
-            let turn = read_responses_sse(&mut resp, sink).await?;
+            let turn = read_responses_sse(&mut resp, sink, self.speculate()).await?;
+            offer_turn(self.speculate(), &turn);
             return Ok(turn);
         }
         let v: Value = resp.json().await.map_err(|e| Error::Http(e.to_string()))?;
@@ -126,6 +133,7 @@ impl Completer for ResponsesCompleter {
         let turn = turn_from_responses(&v)?;
         paint_server_output(sink.as_ref(), &v);
         paint_clean(sink, &turn);
+        offer_turn(self.speculate(), &turn);
         Ok(turn)
     }
 
@@ -170,6 +178,14 @@ impl Completer for ResponsesCompleter {
     fn media_caps(&self) -> crate::media::MediaCaps {
         self.caps
             .media_caps(Some((self.origin.clone(), String::new())))
+    }
+
+    fn set_speculate(&self, slot: Option<SpeculativeSlot>) {
+        *lock_speculate(&self.speculate) = slot;
+    }
+
+    fn speculate(&self) -> Option<SpeculativeSlot> {
+        lock_speculate(&self.speculate).clone()
     }
 }
 
@@ -294,6 +310,20 @@ impl Completer for TransportCompleter {
         match self {
             Self::Responses(c) => Completer::media_caps(c),
             Self::Chat(c) => Completer::media_caps(c),
+        }
+    }
+
+    fn set_speculate(&self, slot: Option<SpeculativeSlot>) {
+        match self {
+            Self::Responses(c) => Completer::set_speculate(c, slot),
+            Self::Chat(c) => Completer::set_speculate(c, slot),
+        }
+    }
+
+    fn speculate(&self) -> Option<SpeculativeSlot> {
+        match self {
+            Self::Responses(c) => Completer::speculate(c),
+            Self::Chat(c) => Completer::speculate(c),
         }
     }
 }
@@ -474,13 +504,23 @@ struct ResponsesAcc {
     prompt_tokens: u64,
     completion_tokens: u64,
     cached_tokens: Option<u64>,
+    done_ids: HashSet<String>,
 }
 
 #[derive(Default, Clone)]
 struct PendingCall {
+    /// Responses `call_id` — this is what `function_call_output` must echo.
     id: String,
+    /// SSE `item.id` (`fc_*`). Argument deltas are keyed by this, not `call_id`.
+    item_id: String,
     name: String,
     arguments: String,
+}
+
+impl PendingCall {
+    fn matches_id(&self, id: &str) -> bool {
+        !id.is_empty() && (self.id == id || self.item_id == id)
+    }
 }
 
 impl ResponsesAcc {
@@ -499,9 +539,22 @@ impl ResponsesAcc {
                     self.reasoning.push_str(d);
                 }
             }
-            "response.output_item.added" | "response.output_item.done" => {
+            "response.output_item.added" => {
                 if let Some(item) = ev.get("item") {
                     self.apply_item(item);
+                }
+            }
+            "response.output_item.done" => {
+                if let Some(item) = ev.get("item") {
+                    self.apply_item(item);
+                    if item.get("type").and_then(|t| t.as_str()) == Some("function_call") {
+                        let id = item
+                            .get("call_id")
+                            .or_else(|| item.get("id"))
+                            .and_then(|v| v.as_str())
+                            .unwrap_or("");
+                        self.mark_done(id);
+                    }
                 }
             }
             "response.function_call_arguments.delta" => {
@@ -509,6 +562,15 @@ impl ResponsesAcc {
                     let id = ev.get("item_id").and_then(|x| x.as_str()).unwrap_or("");
                     self.append_args(id, d);
                 }
+            }
+            "response.function_call_arguments.done" => {
+                let id = ev.get("item_id").and_then(|x| x.as_str()).unwrap_or("");
+                if let Some(args) = ev.get("arguments").and_then(|a| a.as_str()) {
+                    if !args.is_empty() {
+                        self.replace_args(id, args);
+                    }
+                }
+                self.mark_done(id);
             }
             ty if ty.starts_with("response.image_generation_call") => {
                 self.take_image_result(ev.get("result"));
@@ -575,12 +637,21 @@ impl ResponsesAcc {
                 merge_snapshot(&mut self.reasoning, &item_text(item));
             }
             "function_call" => {
-                let id = item
-                    .get("call_id")
-                    .or_else(|| item.get("id"))
+                let item_id = item
+                    .get("id")
                     .and_then(|v| v.as_str())
                     .unwrap_or("")
                     .to_string();
+                let call_id = item
+                    .get("call_id")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+                    .to_string();
+                let id = if !call_id.is_empty() {
+                    call_id
+                } else {
+                    item_id.clone()
+                };
                 let name = item
                     .get("name")
                     .and_then(|v| v.as_str())
@@ -591,8 +662,8 @@ impl ResponsesAcc {
                     Some(other) => other.to_string(),
                     None => String::new(),
                 };
-                if !name.is_empty() {
-                    self.upsert_call(id, name, arguments);
+                if !name.is_empty() || !id.is_empty() || !item_id.is_empty() {
+                    self.upsert_call(id, item_id, name, arguments);
                 }
             }
             // Host-executed. Must not become client ToolCalls (x_keyword_search
@@ -617,14 +688,17 @@ impl ResponsesAcc {
         }
     }
 
-    fn upsert_call(&mut self, id: String, name: String, arguments: String) {
+    fn upsert_call(&mut self, id: String, item_id: String, name: String, arguments: String) {
         if let Some(c) = self
             .calls
             .iter_mut()
-            .find(|c| (!id.is_empty() && c.id == id) || (c.name == name && c.arguments.is_empty()))
+            .find(|c| c.matches_id(&id) || c.matches_id(&item_id))
         {
             if !id.is_empty() {
                 c.id = id;
+            }
+            if !item_id.is_empty() {
+                c.item_id = item_id;
             }
             if !name.is_empty() {
                 c.name = name;
@@ -636,26 +710,89 @@ impl ResponsesAcc {
         }
         self.calls.push(PendingCall {
             id,
+            item_id,
             name,
             arguments,
         });
     }
 
     fn append_args(&mut self, id: &str, delta: &str) {
-        if let Some(c) = self
-            .calls
-            .iter_mut()
-            .rev()
-            .find(|c| c.id == id || id.is_empty())
-        {
+        if id.is_empty() {
+            return;
+        }
+        if let Some(c) = self.call_for_item(id) {
             c.arguments.push_str(delta);
             return;
         }
         self.calls.push(PendingCall {
-            id: id.to_string(),
+            id: String::new(),
+            item_id: id.to_string(),
             name: String::new(),
             arguments: delta.to_string(),
         });
+    }
+
+    fn replace_args(&mut self, id: &str, args: &str) {
+        if let Some(c) = self.call_for_item(id) {
+            c.arguments = args.to_string();
+        }
+    }
+
+    fn call_for_item(&mut self, id: &str) -> Option<&mut PendingCall> {
+        if id.is_empty() {
+            return None;
+        }
+        self.calls.iter_mut().rev().find(|c| c.matches_id(id))
+    }
+
+    fn mark_done(&mut self, id: &str) {
+        if id.is_empty() {
+            if let Some(c) = self
+                .calls
+                .iter()
+                .rev()
+                .find(|c| !c.name.is_empty() && !c.id.is_empty())
+            {
+                self.done_ids.insert(c.id.clone());
+                if !c.item_id.is_empty() {
+                    self.done_ids.insert(c.item_id.clone());
+                }
+            }
+            return;
+        }
+        self.done_ids.insert(id.to_string());
+        if let Some(c) = self.calls.iter().find(|c| c.matches_id(id)) {
+            if !c.id.is_empty() {
+                self.done_ids.insert(c.id.clone());
+            }
+            if !c.item_id.is_empty() {
+                self.done_ids.insert(c.item_id.clone());
+            }
+        }
+    }
+
+    fn ready_calls(&self, stream_ended: bool) -> Vec<ToolCall> {
+        let n = self.calls.len();
+        let mut out = Vec::new();
+        for (i, c) in self.calls.iter().enumerate() {
+            let sealed = stream_ended
+                || self.done_ids.contains(&c.id)
+                || self.done_ids.contains(&c.item_id)
+                || i + 1 < n;
+            if !sealed || c.name.is_empty() || c.id.is_empty() {
+                continue;
+            }
+            let arguments = match serde_json::from_str::<Value>(&c.arguments) {
+                Ok(v) if v.is_object() || v.is_array() => v,
+                _ => continue,
+            };
+            out.push(ToolCall {
+                id: c.id.clone(),
+                name: c.name.clone(),
+                arguments,
+            });
+        }
+        out
     }
 
     fn take_image_result(&mut self, result: Option<&Value>) {
@@ -837,6 +974,7 @@ fn json_u64_ref(v: &Value) -> Option<u64> {
 async fn read_responses_sse(
     resp: &mut reqwest::Response,
     sink: Option<TokenSink>,
+    slot: Option<SpeculativeSlot>,
 ) -> Result<ModelTurn> {
     let mut acc = ResponsesAcc::default();
     let mut paint = sink.map(StreamPaint::new);
@@ -867,6 +1005,9 @@ async fn read_responses_sse(
                 }
             }
             acc.apply_event(&ev);
+            if let Some(s) = &slot {
+                s.offer(&acc.ready_calls(false));
+            }
             if let Some(p) = paint.as_mut() {
                 if let Some((name, preview)) = server_tool_tag(&ev, &mut server_seen) {
                     p.tool_tag(&name, &preview);
@@ -882,12 +1023,18 @@ async fn read_responses_sse(
             }
         }
         acc.apply_event(&ev);
+        if let Some(s) = &slot {
+            s.offer(&acc.ready_calls(false));
+        }
         if let Some(p) = paint.as_mut() {
             if let Some((name, preview)) = server_tool_tag(&ev, &mut server_seen) {
                 p.tool_tag(&name, &preview);
             }
             p.push_raw(&acc.reasoning, &acc.content, !acc.calls.is_empty());
         }
+    }
+    if let Some(s) = &slot {
+        s.offer(&acc.ready_calls(true));
     }
     if let Some(p) = paint.as_mut() {
         p.finish(&acc.reasoning, &acc.content, !acc.calls.is_empty());
@@ -1071,6 +1218,18 @@ fn lock_skip(m: &Mutex<usize>) -> std::sync::MutexGuard<'_, usize> {
     m.lock().unwrap_or_else(|e| e.into_inner())
 }
 
+fn lock_speculate(
+    m: &Mutex<Option<SpeculativeSlot>>,
+) -> std::sync::MutexGuard<'_, Option<SpeculativeSlot>> {
+    m.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+fn offer_turn(slot: Option<SpeculativeSlot>, turn: &ModelTurn) {
+    if let Some(slot) = slot {
+        slot.offer(&turn.tool_calls);
+    }
+}
+
 #[derive(Default)]
 struct SseNamed {
     leftover: String,
@@ -1151,6 +1310,7 @@ fn parse_sse_event(raw: &str) -> Option<Value> {
 mod tests {
     use super::*;
     use crate::family::{EndpointCaps, EngineProfile, Family};
+    use crate::policy::Effort;
     use crate::tools_schema::agent_tools;
 
     fn policy_high() -> ThinkPolicy {
@@ -1224,7 +1384,7 @@ mod tests {
     }
 
     #[test]
-    fn grok_alias_remaps_and_fills_high() {
+    fn grok_alias_remaps_and_fills_xhigh() {
         let msgs = vec![ChatMessage::user("hi")];
         let mut policy = ThinkPolicy::agent_default();
         policy.effort = None;
@@ -1240,7 +1400,7 @@ mod tests {
             skip: 0,
         });
         assert_eq!(body["model"], json!("grok-4.6"));
-        assert_eq!(body["reasoning"]["effort"], json!("high"));
+        assert_eq!(body["reasoning"]["effort"], json!("xhigh"));
     }
 
     #[test]
@@ -1707,5 +1867,90 @@ mod tests {
         let dumped_full = serde_json::to_string(&full).unwrap();
         assert!(dumped_full.contains("archive user"), "{dumped_full}");
         assert!(dumped_full.contains("new question"), "{dumped_full}");
+    }
+
+    #[test]
+    fn function_call_arguments_done_seals_ready_call() {
+        let mut acc = ResponsesAcc::default();
+        acc.apply_event(&json!({
+            "type": "response.output_item.added",
+            "item": {
+                "type": "function_call",
+                "id": "fc_1",
+                "call_id": "call_1",
+                "name": "Read",
+                "arguments": ""
+            }
+        }));
+        acc.apply_event(&json!({
+            "type": "response.function_call_arguments.delta",
+            "item_id": "fc_1",
+            "delta": "{\"path\":\"a.rs\"}"
+        }));
+        assert!(
+            acc.ready_calls(false).is_empty(),
+            "incomplete stream must not seal"
+        );
+        acc.apply_event(&json!({
+            "type": "response.function_call_arguments.done",
+            "item_id": "fc_1",
+            "arguments": "{\"path\":\"a.rs\"}"
+        }));
+        let ready = acc.ready_calls(false);
+        assert_eq!(ready.len(), 1, "{ready:?}");
+        assert_eq!(ready[0].id, "call_1");
+        assert_eq!(ready[0].name, "Read");
+        assert_eq!(ready[0].arguments["path"], "a.rs");
+    }
+
+    #[test]
+    fn parallel_function_call_deltas_route_by_item_id() {
+        let mut acc = ResponsesAcc::default();
+        acc.apply_event(&json!({
+            "type": "response.output_item.added",
+            "item": {
+                "type": "function_call",
+                "id": "fc_a",
+                "call_id": "call_a",
+                "name": "Read",
+                "arguments": ""
+            }
+        }));
+        acc.apply_event(&json!({
+            "type": "response.output_item.added",
+            "item": {
+                "type": "function_call",
+                "id": "fc_b",
+                "call_id": "call_b",
+                "name": "Read",
+                "arguments": ""
+            }
+        }));
+        acc.apply_event(&json!({
+            "type": "response.function_call_arguments.delta",
+            "item_id": "fc_a",
+            "delta": "{\"path\":\"a.rs\"}"
+        }));
+        acc.apply_event(&json!({
+            "type": "response.function_call_arguments.delta",
+            "item_id": "fc_b",
+            "delta": "{\"path\":\"b.rs\"}"
+        }));
+        acc.apply_event(&json!({
+            "type": "response.function_call_arguments.done",
+            "item_id": "fc_a",
+            "arguments": "{\"path\":\"a.rs\"}"
+        }));
+        acc.apply_event(&json!({
+            "type": "response.function_call_arguments.done",
+            "item_id": "fc_b",
+            "arguments": "{\"path\":\"b.rs\"}"
+        }));
+        let ready = acc.ready_calls(false);
+        assert_eq!(ready.len(), 2, "{ready:?}");
+        let a = ready.iter().find(|c| c.id == "call_a").expect("call_a");
+        let b = ready.iter().find(|c| c.id == "call_b").expect("call_b");
+        assert_eq!(a.arguments["path"], "a.rs");
+        assert_eq!(b.arguments["path"], "b.rs");
     }
 }

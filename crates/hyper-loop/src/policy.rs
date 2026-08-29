@@ -33,10 +33,10 @@ impl Effort {
         }
     }
 
-    /// `auto` maps to High for Grok 4.6, Medium for Qwen.
+    /// `auto` maps to xhigh for Grok 4.6 (Cursor Super Grok), Medium for Qwen.
     pub fn auto_for(family: crate::family::Family) -> Self {
         if family.thinking_always_on() {
-            Self::High
+            Self::Xhigh
         } else {
             Self::Medium
         }
@@ -59,7 +59,7 @@ pub fn grok_forwarding_effort(policy: &ThinkPolicy, configured_model: &str) -> &
     if let Some(e) = policy.effort {
         return e.as_str();
     }
-    crate::family::Family::implied_effort(configured_model).unwrap_or(Effort::High.as_str())
+    crate::family::Family::implied_effort(configured_model).unwrap_or(Effort::Xhigh.as_str())
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -76,7 +76,6 @@ pub struct ThinkPolicy {
 }
 
 /// Token caps shared by CLI `--think`, slash `/think`, and mode defaults.
-/// `default_effort` is never xhigh — that depth is explicit-only.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct ThinkBudget {
     pub max_think_low: u32,
@@ -143,18 +142,17 @@ impl ThinkPolicy {
         Self::off()
     }
 
-    /// Thinking on, `medium` so official Jinja injects no effort sentence.
-    /// The model picks depth. `max_think_tokens` is a runaway cap only.
-    /// Honor `default_effort` for that cap: Low → `max_think_low`; Medium/Xhigh
-    /// keep `max_think_xhigh`. Never put Low/Xhigh in `effort` here.
+    /// Session default. Grok `auto` is xhigh. Qwen stays medium (no Jinja
+    /// lecture). Low still maps to medium effort so Qwen does not inject the
+    /// brief-low sentence; the think cap still uses `max_think_low`.
     pub fn native_with(b: &ThinkBudget) -> Self {
         let max_think_tokens = match b.default_effort {
             Effort::Low => b.max_think_low,
             Effort::Medium | Effort::High | Effort::Xhigh => b.max_think_xhigh,
         };
         let effort = match b.default_effort {
-            Effort::High => Effort::High,
-            _ => Effort::Medium,
+            Effort::Low => Effort::Medium,
+            other => other,
         };
         Self {
             enabled: true,
@@ -191,7 +189,6 @@ impl ThinkPolicy {
 
     /// CLI `--fast` / `--think` / `--mode`. `--fast` wins.
     /// `--think` overlays effort even when `--mode think` (preserve stays true).
-    /// Config `default_effort=xhigh` is ignored; xhigh is explicit-only.
     pub fn from_cli(b: &ThinkBudget, fast: bool, think: Option<&str>, mode: Option<&str>) -> Self {
         if fast {
             return Self::off_with(b);
@@ -202,7 +199,6 @@ impl ThinkPolicy {
             return Self::think_mode_with(b);
         }
         let Some(effort) = user_effort else {
-            // No `--think` / `/think`: do not inject a low/xhigh lecture.
             return Self::native_with(b);
         };
         let mut p = Self::effort_with(b, effort);
@@ -374,7 +370,7 @@ impl EffortController {
     }
 
     /// Two consecutive test-runner failures (model or harness oracle) bump
-    /// Low→Medium→High. Never auto-xhigh. Already-High stays put (grok-4.6 default).
+    /// Low→Medium→High. Never auto-xhigh. Already-High/Xhigh stays put.
     pub fn note_test_fail(&mut self) -> bool {
         self.test_fails = self.test_fails.saturating_add(1);
         if self.test_fails < 2 {
@@ -522,8 +518,8 @@ mod tests {
         assert_eq!(grok_forwarding_effort(&medium, "g46-xhigh"), "medium");
         let mut unset = ThinkPolicy::agent_default();
         unset.effort = None;
-        assert_eq!(grok_forwarding_effort(&unset, "g46-xhigh"), "high");
-        assert_eq!(grok_forwarding_effort(&unset, "grok-4.6"), "high");
+        assert_eq!(grok_forwarding_effort(&unset, "g46-xhigh"), "xhigh");
+        assert_eq!(grok_forwarding_effort(&unset, "grok-4.6"), "xhigh");
         assert_eq!(
             grok_forwarding_effort(&ThinkPolicy::off(), "g46-xhigh"),
             "low"
@@ -700,22 +696,22 @@ mod tests {
 
         let mut xhigh_cfg = b;
         xhigh_cfg.default_effort = Effort::Xhigh;
-        let clamped = ThinkPolicy::from_cli(&xhigh_cfg, false, None, None);
-        assert_eq!(clamped.effort, Some(Effort::Medium));
-        assert_eq!(clamped.max_think_tokens, 4096);
-        assert_eq!(clamped.max_tokens, 0);
-        assert!(clamped.preserve);
+        let native = ThinkPolicy::from_cli(&xhigh_cfg, false, None, None);
+        assert_eq!(native.effort, Some(Effort::Xhigh));
+        assert_eq!(native.max_think_tokens, 4096);
+        assert_eq!(native.max_tokens, 0);
+        assert!(native.preserve);
     }
 
     #[test]
-    fn auto_for_grok46_is_high() {
+    fn auto_for_grok46_is_xhigh() {
         assert_eq!(
             Effort::auto_for(crate::family::Family::Grok46),
-            Effort::High
+            Effort::Xhigh
         );
         assert_eq!(
             Effort::from_config_for_family("auto", crate::family::Family::Grok46),
-            Some(Effort::High)
+            Some(Effort::Xhigh)
         );
         assert_eq!(Effort::from_config("high"), Some(Effort::High));
         assert_eq!(
@@ -731,6 +727,18 @@ mod tests {
         assert!(p.enabled);
         assert_eq!(p.effort, Some(Effort::Medium));
         assert_eq!(p.max_think_tokens, 4096);
+        assert_eq!(p.max_tokens, 0);
+        assert!(p.preserve);
+    }
+
+    #[test]
+    fn native_xhigh_default_sends_xhigh() {
+        let mut b = ThinkBudget::default();
+        b.default_effort = Effort::Xhigh;
+        let p = ThinkPolicy::native_with(&b);
+        assert!(p.enabled);
+        assert_eq!(p.effort, Some(Effort::Xhigh));
+        assert_eq!(p.max_think_tokens, b.max_think_xhigh);
         assert_eq!(p.max_tokens, 0);
         assert!(p.preserve);
     }

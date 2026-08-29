@@ -569,6 +569,23 @@ mod tests {
     }
 
     #[test]
+    fn unlocked_session_open_uses_xhigh_default() {
+        let mut session = SidecarSession::new(SidecarOpts::default());
+        let open = parse_request_line(
+            r#"{"jsonrpc":"2.0","id":1,"method":"session.open","params":{"session":"s-xhigh","workspace":"/tmp/ws","mode":"agent"}}"#,
+        )
+        .unwrap();
+        match session.handle(&open) {
+            Dispatch::Result { .. } => {}
+            other => panic!("{other:?}"),
+        }
+        let snap = session.snapshot();
+        assert_eq!(snap.policy.effort, Some(Effort::Xhigh));
+        assert_eq!(snap.policy.max_think_tokens, 4096);
+        assert!(!snap.effort_locked);
+    }
+
+    #[test]
     fn slash_xhigh_omits_generation_cap() {
         let mut session = open_mem();
         let think = parse_request_line(

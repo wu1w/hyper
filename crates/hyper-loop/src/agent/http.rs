@@ -12,7 +12,8 @@ use reqwest::Client;
 use serde_json::{json, Value};
 
 use super::delta::StreamPaint;
-use super::{Completer, ModelTurn, TokenSink};
+use super::speculate::openai_ready_calls;
+use super::{Completer, ModelTurn, SpeculativeSlot, TokenSink};
 use crate::adapter::{build_chat_body, ChatRequestSpec};
 use crate::config::Config;
 use crate::error::{Error, Result};
@@ -36,6 +37,7 @@ pub struct HttpCompleter {
     id_slot: Mutex<Option<i64>>,
     conv_id: Mutex<Option<String>>,
     low_precision: AtomicBool,
+    speculate: Mutex<Option<SpeculativeSlot>>,
 }
 
 impl HttpCompleter {
@@ -78,6 +80,7 @@ impl HttpCompleter {
             id_slot: Mutex::new(None),
             conv_id: Mutex::new(None),
             low_precision: AtomicBool::new(cfg.policy.low_precision),
+            speculate: Mutex::new(None),
         })
     }
 
@@ -98,6 +101,10 @@ impl HttpCompleter {
 
     fn token_sink(&self) -> Option<TokenSink> {
         lock_sink(&self.token_sink).clone()
+    }
+
+    fn speculate(&self) -> Option<SpeculativeSlot> {
+        lock_speculate(&self.speculate).clone()
     }
 
     async fn post(
@@ -172,10 +179,22 @@ impl Completer for HttpCompleter {
                 let v: Value = resp.json().await?;
                 let turn = turn_from_json(&v, false)?;
                 paint_clean(sink, &turn);
+                offer_turn(self.speculate(), &turn);
                 return Ok(turn);
             }
-            match read_sse(&mut resp, self.caps.family, watchdog, sink).await {
-                Ok(turn) => return Ok(turn),
+            match read_sse(
+                &mut resp,
+                self.caps.family,
+                watchdog,
+                sink,
+                self.speculate(),
+            )
+            .await
+            {
+                Ok(turn) => {
+                    offer_turn(self.speculate(), &turn);
+                    return Ok(turn);
+                }
                 Err(Error::Watchdog) => {
                     drop(resp);
                     return Ok(ModelTurn::watchdog());
@@ -186,6 +205,7 @@ impl Completer for HttpCompleter {
         let v: Value = resp.json().await?;
         let turn = turn_from_json(&v, false)?;
         paint_clean(sink, &turn);
+        offer_turn(self.speculate(), &turn);
         Ok(turn)
     }
 
@@ -231,6 +251,14 @@ impl Completer for HttpCompleter {
             .map(|u| u.to_string())
             .unwrap_or_else(|| self.url.clone());
         self.caps.media_caps(Some((origin, self.api_key.clone())))
+    }
+
+    fn set_speculate(&self, slot: Option<SpeculativeSlot>) {
+        *lock_speculate(&self.speculate) = slot;
+    }
+
+    fn speculate(&self) -> Option<SpeculativeSlot> {
+        lock_speculate(&self.speculate).clone()
     }
 }
 
@@ -279,6 +307,18 @@ fn lock_slot(m: &Mutex<Option<i64>>) -> std::sync::MutexGuard<'_, Option<i64>> {
 
 fn lock_conv(m: &Mutex<Option<String>>) -> std::sync::MutexGuard<'_, Option<String>> {
     m.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+fn lock_speculate(
+    m: &Mutex<Option<SpeculativeSlot>>,
+) -> std::sync::MutexGuard<'_, Option<SpeculativeSlot>> {
+    m.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+fn offer_turn(slot: Option<SpeculativeSlot>, turn: &ModelTurn) {
+    if let Some(slot) = slot {
+        slot.offer(&turn.tool_calls);
+    }
 }
 
 fn grok_like_url(url: &str) -> bool {
@@ -755,6 +795,7 @@ async fn read_sse(
     family: Family,
     watchdog: Option<u32>,
     sink: Option<TokenSink>,
+    slot: Option<SpeculativeSlot>,
 ) -> Result<ModelTurn> {
     let mut acc = StreamAcc::new();
     let mut paint = sink.map(StreamPaint::new);
@@ -782,6 +823,9 @@ async fn read_sse(
                 return Err(Error::Http(err.to_string()));
             }
             acc.apply(&event);
+            if let Some(s) = &slot {
+                s.offer(&openai_ready_calls(&acc.tool_calls, false));
+            }
             if let Some(p) = paint.as_mut() {
                 p.push_raw(&acc.reasoning, &acc.content, !acc.tool_calls.is_empty());
             }
@@ -796,12 +840,18 @@ async fn read_sse(
             return Err(Error::Http(err.to_string()));
         }
         acc.apply(&event);
+        if let Some(s) = &slot {
+            s.offer(&openai_ready_calls(&acc.tool_calls, false));
+        }
         if let Some(p) = paint.as_mut() {
             p.push_raw(&acc.reasoning, &acc.content, !acc.tool_calls.is_empty());
         }
         if watchdog_hit(family, watchdog, &acc) {
             return Err(Error::Watchdog);
         }
+    }
+    if let Some(s) = &slot {
+        s.offer(&openai_ready_calls(&acc.tool_calls, true));
     }
     if let Some(p) = paint.as_mut() {
         p.finish(&acc.reasoning, &acc.content, !acc.tool_calls.is_empty());

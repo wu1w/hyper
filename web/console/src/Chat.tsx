@@ -2432,17 +2432,11 @@ function buildTurns(events: SessionEvent[], rows?: SubagentSnap[]): TurnGroup[] 
           }
         }
         const media = parseStoredMedia(e.media);
-        const spoken = stripLeakedToolMarkup(e.content || "");
+        const hopTools = (e.tool_calls || []).length > 0;
+        const spoken = hopTools ? "" : stripLeakedToolMarkup(e.content || "");
         if (spoken || media.length) {
-          if ((e.tool_calls || []).length > 0 && !media.length) {
-            // Tool-hop narration is not the answer. Cursor keeps it in the
-            // activity strip; showing it as a bubble is 复读.
-            const t = firstLine(spoken);
-            if (t) activity().steps.push({ kind: "note", text: clipEnd(t, 160) });
-          } else {
-            act = undefined;
-            turn().blocks.push({ kind: "text", text: spoken, media });
-          }
+          act = undefined;
+          turn().blocks.push({ kind: "text", text: spoken, media });
         }
         (e.tool_calls || []).forEach((c, j) => {
           const name = c.function?.name || "tool";

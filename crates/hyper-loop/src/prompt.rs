@@ -25,8 +25,9 @@ That is the only citation format.
 Prefer editing existing files. Match local style. Do not commit, push, or \
 open a PR unless they ask.
 
-Use the tools provided. Prefer Read, Glob, and Grep over Shell cat, ls, or \
-rg. Independent read-only calls belong in one turn. Do not parallel writes \
+Use the tools provided. Prefer Search to find code, then Read. Grep is exact \
+regex; Glob is paths. Prefer those over Shell cat, ls, or rg. Independent \
+read-only calls belong in one turn. Do not parallel writes \
 to the same path. Paths are workspace-relative unless absolute. Write \
 complete files; no placeholder ellipses. Independent multi-step work can go \
 to Task; do not spawn one for a single Read.
@@ -114,6 +115,13 @@ pub fn is_stale_hop_builtin(text: &str) -> bool {
         && !text.contains("Tool hops keep visible text empty")
 }
 
+/// Previous builtin that preferred Grep/Glob/Read without Search.
+pub fn is_stale_search_builtin(text: &str) -> bool {
+    text.contains("You are grok-hyper, an agent in this workspace")
+        && text.contains("Prefer Read, Glob, and Grep over Shell cat")
+        && !text.contains("Prefer Search to find code")
+}
+
 pub fn is_stale_builtin(text: &str) -> bool {
     is_stale_office_builtin(text)
         || is_stale_coding_builtin(text)
@@ -121,6 +129,7 @@ pub fn is_stale_builtin(text: &str) -> bool {
         || is_stale_doc_read_builtin(text)
         || is_stale_task_builtin(text)
         || is_stale_hop_builtin(text)
+        || is_stale_search_builtin(text)
 }
 
 /// Rewrite home AGENT.md when it is still a previous builtin snapshot.
@@ -175,6 +184,8 @@ mod tests {
         assert!(!DEFAULT_AGENT_MD.contains("Tool names and schemas"));
         assert!(DEFAULT_AGENT_MD.contains("Read"));
         assert!(DEFAULT_AGENT_MD.contains("Grep"));
+        assert!(DEFAULT_AGENT_MD.contains("Search"));
+        assert!(DEFAULT_AGENT_MD.contains("Prefer Search to find code"));
         assert!(!DEFAULT_AGENT_MD.contains("1-based chunk"));
         assert!(!DEFAULT_AGENT_MD.contains("Office files"));
         assert!(DEFAULT_AGENT_MD.contains("startLine:endLine:filepath"));
@@ -266,6 +277,10 @@ mod tests {
             "You are grok-hyper, an agent in this workspace. Independent multi-step work can go to Task"
         ));
         assert!(!is_stale_hop_builtin(DEFAULT_AGENT_MD));
+        assert!(is_stale_search_builtin(
+            "You are grok-hyper, an agent in this workspace. Prefer Read, Glob, and Grep over Shell cat, ls, or rg."
+        ));
+        assert!(!is_stale_search_builtin(DEFAULT_AGENT_MD));
         assert!(!is_stale_builtin(DEFAULT_AGENT_MD));
     }
 

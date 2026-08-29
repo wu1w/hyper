@@ -136,6 +136,38 @@ mod tests {
     }
 
     #[test]
+    fn derive_drops_tool_hop_visible_content() {
+        let dir = tmp_dir();
+        let mut log =
+            SessionLog::create_in(&dir, start("s-hop", SessionMode::Agent, "sys")).unwrap();
+        log.append(SessionEvent::user("read it")).unwrap();
+        log.append(SessionEvent::assistant(
+            "I'll read a.rs next and then summarize.",
+            "plan",
+            Some(vec![OpenAiToolCall::function(
+                "c1",
+                "Read",
+                r#"{"path":"a.rs"}"#,
+            )]),
+        ))
+        .unwrap();
+        let msgs = derive_messages(log.events());
+        let asst = msgs.iter().find(|m| m.role == "assistant").unwrap();
+        assert!(
+            asst.content.is_none() || asst.content.as_deref() == Some(""),
+            "tool hops must not replay hop text: {:?}",
+            asst.content
+        );
+        assert!(asst.tool_calls.as_ref().is_some_and(|c| !c.is_empty()));
+        assert!(
+            asst.reasoning_content.is_none(),
+            "tool hops must not replay hop think: {:?}",
+            asst.reasoning_content
+        );
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
     fn derive_restores_view_media_parts() {
         let dir = tmp_dir();
         let mut log =

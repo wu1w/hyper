@@ -800,7 +800,10 @@ mod tests {
             .any(|e| e.type_name() == "session/compact");
         eprintln!("  compacted={compacted} answer={:?}", out.text);
         if compacted {
-            assert!(crate::tools_schema::has_recall(agent.tools()));
+            assert!(
+                !crate::tools_schema::has_recall(agent.tools()),
+                "Cursor compact does not mount recall"
+            );
             let archives: Vec<_> = agent
                 .messages()
                 .iter()

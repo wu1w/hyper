@@ -135,8 +135,7 @@ impl CompactEvent {
             head.push('\n');
         }
         let footer = "\n═══════════════ END OF ARCHIVED INDEX ═══════════════\n\
-             The CURRENT LIVE TURN follows. Answer the most recent USER message there.\n\
-             Use recall to search archived turns or expand a blob by sha.\n";
+             The CURRENT LIVE TURN follows. Answer the most recent USER message there.\n";
         let mut body = head;
         if !self.index.is_empty() {
             let used = body.chars().count() + footer.chars().count() + "## Index\n".len();
@@ -230,7 +229,12 @@ fn plan_mode(events: &[SessionEvent], mode: Mode) -> Option<CompactEvent> {
     }
     let mut summary = summary;
     let task = live_task(events, user);
-    if !task.is_empty() {
+    // Mid-turn compact (keep_user still inside the evicted range) already
+    // replays the live user after the archive. Pasting that same prompt into
+    // Active Task makes grok-4.6 treat a wrap-up as a brand-new assignment.
+    if user <= until {
+        summary = set_active_task(&summary, LIVE_TASK_POINTER);
+    } else if !task.is_empty() {
         summary = set_active_task(&summary, &task);
     }
     Some(CompactEvent {
@@ -240,6 +244,9 @@ fn plan_mode(events: &[SessionEvent], mode: Mode) -> Option<CompactEvent> {
         index,
     })
 }
+
+/// Mid-turn compact already keeps the live user beside the archive.
+const LIVE_TASK_POINTER: &str = "(see the live user message after this archive)";
 
 fn live_task(events: &[SessionEvent], keep_user: usize) -> String {
     match events.get(keep_user) {
@@ -776,6 +783,11 @@ fn call_detail(c: &OpenAiToolCall) -> String {
 fn think_note(reasoning: &str, calls: Option<&[OpenAiToolCall]>) -> Option<String> {
     let t = reasoning.trim();
     if t.is_empty() || is_task_restatement(t) || is_tool_announcement(t, calls) {
+        return None;
+    }
+    // Hop wrap-up essays (the audit conclusion written in think) must not
+    // land in Current State as if they were operational notes.
+    if t.chars().count() > 240 {
         return None;
     }
     let lower = t.to_ascii_lowercase();
@@ -1434,6 +1446,7 @@ mod tests {
                 .collect::<String>()
         );
         assert!(body.contains("obsidian-compact"));
+        assert!(!body.contains("Use recall"), "{body}");
         assert!(body.chars().count() <= ARCHIVE_CHARS);
         assert!(is_hidden_user_text(&plan.archive_user_text()));
     }
@@ -1478,6 +1491,14 @@ mod tests {
         assert_eq!(plan.until_seq, 3);
         assert_eq!(plan.keep_user_seq, 1);
         assert!(plan.index.contains("old.rs") || plan.summary.contains("old.rs"));
+        let sections = parse_sections(&plan.summary);
+        let task = section_get(&sections, "Active Task").unwrap_or("");
+        assert_eq!(
+            task.trim(),
+            LIVE_TASK_POINTER,
+            "mid-turn compact must not re-paste the live user into Active Task: {}",
+            plan.summary
+        );
     }
 
     #[test]

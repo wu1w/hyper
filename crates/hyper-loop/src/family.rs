@@ -71,7 +71,7 @@ impl Family {
     pub fn implied_effort(model: &str) -> Option<&'static str> {
         let m = model.trim().to_ascii_lowercase();
         if m.contains("xhigh") || m.contains("heavy") {
-            Some("high")
+            Some("xhigh")
         } else if m.contains("fast") || m.ends_with("-low") {
             Some("low")
         } else {
@@ -334,8 +334,8 @@ mod tests {
         );
         assert_eq!(Family::wire_model_id("grok-tu"), "grok-imagine-image-2.0");
         assert_eq!(Family::wire_model_id("grok-4.6"), "grok-4.6");
-        assert_eq!(Family::implied_effort("g46-xhigh"), Some("high"));
-        assert_eq!(Family::implied_effort("g420-heavy"), Some("high"));
+        assert_eq!(Family::implied_effort("g46-xhigh"), Some("xhigh"));
+        assert_eq!(Family::implied_effort("g420-heavy"), Some("xhigh"));
         assert_eq!(Family::implied_effort("grok-4.6-fast"), Some("low"));
         assert_eq!(Family::implied_effort("grok-4.6"), None);
         assert!(Family::Grok46.thinking_always_on());

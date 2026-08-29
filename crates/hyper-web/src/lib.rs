@@ -59,7 +59,7 @@ pub async fn run(opts: WebOpts) -> Result<std::process::ExitCode> {
             .map(|dir| catalog::resume_console_id(&dir, ""))
             .unwrap_or_else(new_session_id)
     };
-    let policy = SessionMode::Agent.default_policy_with(&cfg.policy);
+    let policy = SessionMode::Agent.default_policy_on(&cfg.think_budget());
     let mut session = SidecarSession::new(SidecarOpts {
         session_id,
         workspace: workspace.clone(),

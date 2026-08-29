@@ -111,25 +111,29 @@ pub struct PolicyCaps {
     pub max_think_low: u32,
     pub max_think_medium: u32,
     pub max_think_xhigh: u32,
+    pub default_effort: crate::policy::Effort,
 }
 
 impl Default for PolicyCaps {
     fn default() -> Self {
-        let p = crate::config::PolicyConfig::default();
+        let b = crate::config::PolicyConfig::default().think_budget();
         Self {
-            max_think_low: p.max_think_tokens_low,
-            max_think_medium: p.max_think_tokens_medium,
-            max_think_xhigh: p.max_think_tokens_xhigh,
+            max_think_low: b.max_think_low,
+            max_think_medium: b.max_think_medium,
+            max_think_xhigh: b.max_think_xhigh,
+            default_effort: b.default_effort,
         }
     }
 }
 
 impl PolicyCaps {
     pub fn from_config(cfg: &crate::config::Config) -> Self {
+        let b = cfg.think_budget();
         Self {
-            max_think_low: cfg.policy.max_think_tokens_low,
-            max_think_medium: cfg.policy.max_think_tokens_medium,
-            max_think_xhigh: cfg.policy.max_think_tokens_xhigh,
+            max_think_low: b.max_think_low,
+            max_think_medium: b.max_think_medium,
+            max_think_xhigh: b.max_think_xhigh,
+            default_effort: b.default_effort,
         }
     }
 
@@ -138,7 +142,7 @@ impl PolicyCaps {
             max_think_low: self.max_think_low,
             max_think_medium: self.max_think_medium,
             max_think_xhigh: self.max_think_xhigh,
-            default_effort: crate::policy::Effort::Medium,
+            default_effort: self.default_effort,
         }
     }
 }

@@ -20,6 +20,17 @@ assert.equal(lastAssistantInCurrentTurn([user, asst]), "已改好标题。");
 assert.equal(lastAssistantInCurrentTurn([user]), "");
 
 {
+  const hop: SessionEvent = {
+    type: "assistant",
+    content: "先登中转机看配置。",
+    tool_calls: [{ id: "c1", function: { name: "Read", arguments: "{\"path\":\"a.rs\"}" } }],
+  };
+  assert.equal(lastAssistantContent([user, hop]), "");
+  assert.equal(lastAssistantInCurrentTurn([user, hop]), "");
+  assert.equal(coversLive([user, hop], { think: "", content: "已改好标题。" }), false);
+}
+
+{
   const live = { think: "", content: "已改好标题。" };
   assert.equal(coversLive([user, asst], live), true);
   assert.equal(coversLive([user], live), false);

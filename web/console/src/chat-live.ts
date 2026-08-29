@@ -4,8 +4,8 @@ export type LiveBuf = { think: string; content: string };
 
 export function lastAssistantContent(events: SessionEvent[]): string {
   for (let i = events.length - 1; i >= 0; i--) {
-    const e = events[i];
-    if (e.type === "assistant" && (e.content || "").trim()) return e.content || "";
+    const spoken = spokenAssistant(events[i]);
+    if (spoken) return spoken;
   }
   return "";
 }
@@ -24,10 +24,16 @@ export function lastAssistantInCurrentTurn(events: SessionEvent[]): string {
   }
   const start = lastUser + 1;
   for (let i = events.length - 1; i >= start; i--) {
-    const e = events[i];
-    if (e.type === "assistant" && (e.content || "").trim()) return e.content || "";
+    const spoken = spokenAssistant(events[i]);
+    if (spoken) return spoken;
   }
   return "";
+}
+
+function spokenAssistant(e: SessionEvent): string {
+  if (e.type !== "assistant") return "";
+  if ((e.tool_calls?.length ?? 0) > 0) return "";
+  return (e.content || "").trim();
 }
 
 /**

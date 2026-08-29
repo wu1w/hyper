@@ -21,32 +21,27 @@ use crate::session::{run_recall, OpenAiToolCall, PolicyReason, SessionEvent, Sto
 use crate::skills::run_skill;
 use crate::template::ChatMessage;
 use crate::tool_calls::{CancelFlag, TextBlock, ToolCall, ToolResponse, ToolState};
-use crate::tools::{run_search, run_tool, view, CodeIndex, Workspace};
+use crate::tools::{run_search, run_tool, view, Workspace};
 use crate::tools_schema::{dispatch_name, is_parallel_safe};
 
 impl<C: Completer> Agent<C> {
     pub(crate) async fn execute_tools(&mut self, calls: Vec<ToolCall>) {
         if self.code_index.is_none() && calls.iter().any(|c| dispatch_name(&c.name) == "search") {
-            self.code_index = Some(CodeIndex::build(self.workspace.root()));
+            self.start_code_index();
+            self.settle_code_index().await;
         }
         for call in &calls {
             self.note(&format!("[{}] {}", call.name, preview_args(call)));
         }
         let write_priors = self.snapshot_write_priors(&calls);
-        let responses = if parallel_safe_batch(&calls) {
-            self.dispatch_parallel(&calls).await
-        } else {
-            let mut out = Vec::with_capacity(calls.len());
-            for call in &calls {
-                out.push(self.dispatch_one(call).await);
-            }
-            out
-        };
+        let mut responses = self.dispatch_with_prefetch(&calls).await;
         let mut harness = false;
         let mut test_red = false;
         let mut saw_test_output = false;
         let mut guard_notes: Vec<guard::GuardNote> = Vec::new();
-        for (call, mut response) in calls.iter().zip(responses) {
+        let mut edited: Vec<String> = Vec::new();
+        let mut last_edit_id: Option<String> = None;
+        for (call, response) in calls.iter().zip(responses.iter_mut()) {
             if is_harness_fail(&response) {
                 harness = true;
             }
@@ -76,6 +71,10 @@ impl<C: Completer> Agent<C> {
                         if crate::channel::xfer::is_sendable_rel(&path) {
                             self.channel_files.push(path.clone());
                         }
+                        if verify::is_code_path(&path) {
+                            edited.push(path.clone());
+                            last_edit_id = Some(call.id.clone());
+                        }
                         if let Some(idx) = &self.code_index {
                             idx.refresh(&self.workspace, &path);
                             if verify::is_code_path(&path) && !verify::is_test_path(&path) {
@@ -103,6 +102,18 @@ impl<C: Completer> Agent<C> {
                     self.sync_effort(PolicyReason::Upgrade);
                 }
             }
+        }
+        if let Some(diag) =
+            verify::run_diagnostics_async(self.workspace.root(), &edited, &self.cancel).await
+        {
+            if let Some(id) = last_edit_id.as_deref() {
+                if let Some(i) = calls.iter().position(|c| c.id == id) {
+                    responses[i].content.push(TextBlock { text: diag });
+                }
+            }
+            self.note("[diagnostics]");
+        }
+        for (call, response) in calls.iter().zip(responses) {
             self.commit_tool(&call.name, response);
         }
         if harness {
@@ -257,6 +268,9 @@ impl<C: Completer> Agent<C> {
                 Ok(turn) => return Ok(Some(turn)),
                 Err(e) if crate::llm_http::is_transient(&e) => {
                     attempt += 1;
+                    if let Some(slot) = self.completer.speculate() {
+                        slot.abort();
+                    }
                     if started.elapsed() >= crate::llm_http::RETRY_BUDGET {
                         return Err(e);
                     }
@@ -503,6 +517,42 @@ impl<C: Completer> Agent<C> {
         // Same handlers as the serial path. `parallel_safe_batch` admits
         // read/view/search/web/ask; mutating tools still run serially.
         futures::future::join_all(calls.iter().map(|c| self.dispatch_one(c))).await
+    }
+
+    async fn dispatch_with_prefetch(&self, calls: &[ToolCall]) -> Vec<ToolResponse> {
+        let mut out: Vec<Option<ToolResponse>> = vec![None; calls.len()];
+        if let Some(slot) = &self.speculate {
+            for (i, call) in calls.iter().enumerate() {
+                if let Some(r) = slot.take(&call.id).await {
+                    out[i] = Some(r);
+                }
+            }
+            slot.abort();
+        }
+        let pending: Vec<(usize, ToolCall)> = calls
+            .iter()
+            .enumerate()
+            .filter(|(i, _)| out[*i].is_none())
+            .map(|(i, c)| (i, c.clone()))
+            .collect();
+        if !pending.is_empty() {
+            let pending_calls: Vec<ToolCall> = pending.iter().map(|(_, c)| c.clone()).collect();
+            let rest = if parallel_safe_batch(&pending_calls) {
+                self.dispatch_parallel(&pending_calls).await
+            } else {
+                let mut serial = Vec::with_capacity(pending_calls.len());
+                for call in &pending_calls {
+                    serial.push(self.dispatch_one(call).await);
+                }
+                serial
+            };
+            for ((i, _), r) in pending.into_iter().zip(rest) {
+                out[i] = Some(r);
+            }
+        }
+        out.into_iter()
+            .map(|r| r.expect("every tool call has a response"))
+            .collect()
     }
 
     pub(crate) fn commit_tool(&mut self, name: &str, response: ToolResponse) {

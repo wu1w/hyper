@@ -242,6 +242,9 @@ fn is_cursor_noise_user(msg: &ChatMessage) -> bool {
         "[cron]",
         "[compact]",
         "[guard]",
+        // Stubbed cards only. A live `[workset]` snapshot must reach grok-4.6;
+        // dropping the prefix here hid every workset card on the Responses wire.
+        "[workset] applied",
         "[background",
         "HYPER_WORKING_WINDOW=",
         "MEMORY hot",
@@ -701,12 +704,29 @@ mod tests {
             ChatMessage::user("task"),
             ChatMessage::hidden_user("[guard] tests went red."),
             ChatMessage::hidden_user("MEMORY hot\nprefer Chinese"),
+            ChatMessage::hidden_user("[workset] applied"),
         ];
         let input = messages_to_responses_input(&msgs);
         let blob = serde_json::to_string(&input).unwrap();
         assert_eq!(input.len(), 1, "{blob}");
         assert!(!blob.contains("[guard]"), "{blob}");
         assert!(!blob.contains("MEMORY hot"), "{blob}");
+        assert!(!blob.contains("[workset] applied"), "{blob}");
+    }
+
+    #[test]
+    fn live_workset_card_reaches_responses() {
+        let msgs = vec![
+            ChatMessage::user("task"),
+            ChatMessage::hidden_user(
+                "[workset]\ngit:\n## main\n M crates/hyper-loop/src/agent/mod.rs",
+            ),
+        ];
+        let input = messages_to_responses_input(&msgs);
+        let blob = serde_json::to_string(&input).unwrap();
+        assert_eq!(input.len(), 2, "{blob}");
+        assert!(blob.contains("[workset]"), "{blob}");
+        assert!(blob.contains("hyper-loop"), "{blob}");
     }
 
     #[test]

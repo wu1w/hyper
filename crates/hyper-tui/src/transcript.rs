@@ -164,19 +164,14 @@ impl Transcript {
                     }
                     self.blocks.push(b);
                 }
-                let content = if a.content.is_empty() {
-                    live.map(|l| l.content).unwrap_or_default()
-                } else {
-                    a.content.clone()
-                };
                 let has_tools = a.tool_calls.as_ref().is_some_and(|c| !c.is_empty());
-                if !content.is_empty() {
-                    if has_tools {
-                        let line = clip_one_line(&content, 120);
-                        if !line.is_empty() {
-                            self.blocks.push(Block::new(Kind::Tool, line));
-                        }
+                if !has_tools {
+                    let content = if a.content.is_empty() {
+                        live.map(|l| l.content).unwrap_or_default()
                     } else {
+                        a.content.clone()
+                    };
+                    if !content.is_empty() {
                         self.blocks.push(Block::new(Kind::Assistant, content));
                     }
                 }
@@ -473,10 +468,15 @@ mod tests {
                 .map(|b| (&b.kind, b.text.as_str()))
                 .collect::<Vec<_>>()
         );
-        assert!(t
-            .blocks()
-            .iter()
-            .any(|b| b.kind == Kind::Tool && b.text.contains("I'll read")));
+        assert!(
+            !t.blocks().iter().any(|b| b.text.contains("I'll read")),
+            "Cursor tool hops have no hop essay card: {:?}",
+            t.blocks()
+                .iter()
+                .map(|b| (&b.kind, b.text.as_str()))
+                .collect::<Vec<_>>()
+        );
+        assert!(t.blocks().iter().any(|b| b.kind == Kind::Tool));
     }
 
     #[test]

@@ -22,7 +22,7 @@ use crate::template::ChatMessage;
 use crate::tool_calls::{CancelFlag, ToolCoordinator, COORDINATOR_OWNED_EXEC_TIMEOUT_SECS};
 use crate::tools::{BlobStore, Workspace};
 use crate::tools_schema::{
-    agent_tools, code_tools, computer_use_tool, dispatch_name, mcp_tool, view_tool,
+    agent_tools, code_tools, computer_use_tool, dispatch_name, mcp_tool, search_tool, view_tool,
 };
 
 impl<C: Completer> Agent<C> {
@@ -125,9 +125,8 @@ impl<C: Completer> Agent<C> {
                 );
             }
         }
-        // Cursor: Grep is rg. The optional `search` index is built on first
-        // dispatch, never in Agent::new (Windows home-folder hang).
-        let code_index: Option<crate::tools::CodeIndex> = None;
+        // Search index: first user turn, never Agent::new (Windows home hang).
+        let code_index: Option<std::sync::Arc<crate::tools::CodeIndex>> = None;
         let web = opts
             .web
             .enabled
@@ -180,6 +179,8 @@ impl<C: Completer> Agent<C> {
             edit_guard: guard::EditGuard::new(),
             channel: opts.channel,
             code_index,
+            index_build: None,
+            speculate: None,
             physics_nudged: false,
             official_compaction: None,
             xai_compact: opts.xai_compact,
@@ -214,6 +215,47 @@ impl<C: Completer> Agent<C> {
 
     pub fn tools(&self) -> &[Value] {
         &self.tools
+    }
+
+    pub(crate) fn start_code_index(&mut self) {
+        if self.code_index.is_some() || self.index_build.is_some() {
+            return;
+        }
+        if !crate::tools_schema::has_tool(&self.tools, "search") {
+            return;
+        }
+        let root = self.workspace.root().to_path_buf();
+        self.index_build = Some(tokio::task::spawn_blocking(move || {
+            std::sync::Arc::new(crate::tools::CodeIndex::build(&root))
+        }));
+    }
+
+    pub(crate) async fn settle_code_index(&mut self) {
+        if self.code_index.is_some() {
+            return;
+        }
+        let Some(h) = self.index_build.take() else {
+            return;
+        };
+        if let Ok(idx) = h.await {
+            self.code_index = Some(idx);
+        }
+    }
+
+    pub(crate) fn speculate_ctx(&self) -> super::speculate::SpeculateCtx {
+        super::speculate::SpeculateCtx {
+            workspace: self.workspace.clone(),
+            limits: self.limits,
+            inherit_env: self.inherit_env,
+            blobs: self.blobs.clone(),
+            cancel: self.cancel.clone(),
+            code_index: self.code_index.clone(),
+            media_caps: self.media_caps.clone(),
+            media_bins: self.media_bins.clone(),
+            media_max_bytes: self.media_max_bytes,
+            child: self.child,
+            plan_mode: self.plan_mode,
+        }
     }
 }
 
@@ -322,6 +364,9 @@ pub(crate) fn bind_periphery(
     };
     if extra_tools && !mcp.servers.is_empty() {
         tools.push(mcp_tool());
+    }
+    if matches!(tool_set, ToolSet::Agent) {
+        tools.push(search_tool());
     }
     if opts.media && matches!(tool_set, ToolSet::Agent) {
         tools.push(view_tool());

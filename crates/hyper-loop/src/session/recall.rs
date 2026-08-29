@@ -1,5 +1,5 @@
-//! Session archive recall. Not in the frozen four-tool schema; the agent
-//! appends `recall_tool()` after a compact (prefix already misses).
+//! Session archive recall. Not in the frozen Cursor schema. Kept for live
+//! tests that mount the tool explicitly; compact no longer appends it.
 
 use crate::session::event::SessionEvent;
 use crate::session::log::SessionLog;

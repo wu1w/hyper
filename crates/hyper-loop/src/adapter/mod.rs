@@ -413,7 +413,7 @@ mod tests {
     }
 
     #[test]
-    fn grok46_alias_remaps_and_fills_high() {
+    fn grok46_alias_remaps_and_fills_xhigh() {
         let caps = EndpointCaps::for_family(Family::Grok46, EngineProfile::Xai);
         let mut policy = ThinkPolicy::agent_default();
         policy.effort = None;
@@ -422,8 +422,8 @@ mod tests {
         s.model = "g46-xhigh";
         let body = build_chat_body(&s);
         assert_eq!(body["model"], json!("grok-4.6"));
-        assert_eq!(body["reasoning"]["effort"], json!("high"));
-        assert_eq!(body["reasoning_effort"], json!("high"));
+        assert_eq!(body["reasoning"]["effort"], json!("xhigh"));
+        assert_eq!(body["reasoning_effort"], json!("xhigh"));
     }
 
     #[test]

@@ -3,7 +3,7 @@
 # Primary target: grok-4.6. Empty base_url → grok login session or XAI_API_KEY (Responses).
 # Custom base_url (not api.x.ai / cli-chat-proxy) → OpenAI-compat. Grok-like
 # models use Responses over HTTP/1.1 SSE; Qwen stays on Chat Completions.
-# Effort follows the session; Cursor aliases (g46-xhigh) fill high only when unset.
+# Effort follows the session; Cursor aliases (g46-xhigh) fill xhigh only when unset.
 # Existing config.toml is not auto-upgraded — copy these numbers if you still have 16k/8-step defaults.
 # Env overlay (HYPER_BASE_URL / HYPER_API_KEY / HYPER_MODEL / XAI_API_KEY) applies to CLI/TUI runs only.
 # `hyper web` ignores HYPER_* on purpose — the console edits this file, and a hidden env
@@ -33,7 +33,7 @@ narrate = true                 # TUI/web Qwen: one-line progress card. grok-4.6 
 
 [policy]
 default_mode = "agent"
-default_effort = "auto"        # grok-4.6 → high; Qwen still medium. /think still overrides.
+default_effort = "auto"        # grok-4.6 → xhigh; Qwen still medium. /think still overrides.
 max_think_tokens_low = 512
 max_think_tokens_medium = 2048
 max_think_tokens_xhigh = 4096

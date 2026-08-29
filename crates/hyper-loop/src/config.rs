@@ -206,7 +206,7 @@ impl Default for PolicyConfig {
     fn default() -> Self {
         Self {
             default_mode: "agent".into(),
-            // `auto` maps to neutral official `medium`: no depth instruction.
+            // `auto` → xhigh on grok-4.6, medium on Qwen.
             default_effort: "auto".into(),
             max_think_tokens_low: 512,
             max_think_tokens_medium: 2048,
@@ -228,10 +228,8 @@ impl PolicyConfig {
 
     pub fn think_budget_for(&self, family: crate::family::Family) -> crate::policy::ThinkBudget {
         use crate::policy::{Effort, ThinkBudget};
-        let default_effort = match Effort::from_config_for_family(&self.default_effort, family) {
-            Some(Effort::Xhigh) | None => Effort::High,
-            Some(e) => e,
-        };
+        let default_effort = Effort::from_config_for_family(&self.default_effort, family)
+            .unwrap_or_else(|| Effort::auto_for(family));
         ThinkBudget {
             max_think_low: self.max_think_tokens_low,
             max_think_medium: self.max_think_tokens_medium,
@@ -742,7 +740,10 @@ mod tests {
         assert!((c.context.compact_ratio - 0.80).abs() < f64::EPSILON);
         assert_eq!(c.server.model, "grok-4.6");
         assert_eq!(c.server.family, Family::Grok46);
-        assert_eq!(c.think_budget().default_effort, crate::policy::Effort::High);
+        assert_eq!(
+            c.think_budget().default_effort,
+            crate::policy::Effort::Xhigh
+        );
         assert!(c.server.base_url.is_empty());
         assert_eq!(c.policy.max_steps, 80);
         assert!(!c.policy.low_precision);
@@ -1041,18 +1042,27 @@ mod tests {
     }
 
     #[test]
-    fn think_budget_follows_server_family_never_auto_xhigh() {
+    fn think_budget_follows_server_family_honors_xhigh() {
         let mut c = Config::default();
         assert_eq!(c.server.family, Family::Grok46);
-        assert_eq!(c.think_budget().default_effort, crate::policy::Effort::High);
+        assert_eq!(
+            c.think_budget().default_effort,
+            crate::policy::Effort::Xhigh
+        );
         c.server.family = Family::Qwen38;
         assert_eq!(
             c.think_budget().default_effort,
             crate::policy::Effort::Medium
         );
         c.policy.default_effort = "xhigh".into();
-        assert_eq!(c.think_budget().default_effort, crate::policy::Effort::High);
+        assert_eq!(
+            c.think_budget().default_effort,
+            crate::policy::Effort::Xhigh
+        );
         c.server.family = Family::Grok46;
-        assert_eq!(c.think_budget().default_effort, crate::policy::Effort::High);
+        assert_eq!(
+            c.think_budget().default_effort,
+            crate::policy::Effort::Xhigh
+        );
     }
 }

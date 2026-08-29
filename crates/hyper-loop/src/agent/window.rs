@@ -9,7 +9,7 @@ use crate::media::MediaKind;
 use crate::session::{compact_messages, derive_messages, plan_compact, SessionEvent};
 use crate::template::{render, ChatMessage, RenderOpts};
 use crate::tokenize::count_tokens;
-use crate::tools_schema::{has_recall, recall_tool};
+use crate::tools_schema::strip_recall;
 use serde_json::Value;
 
 /// Painted into the think panel so a follow-up compact is not silent "等待模型".
@@ -173,7 +173,7 @@ impl<C: Completer> Agent<C> {
         let skip = self.messages.iter().filter(|m| m.role != "system").count();
         self.completer.set_compaction_skip(skip);
         self.after_compact();
-        let tools = self.enable_recall();
+        let tools = strip_recall(&mut self.tools);
         if tools {
             self.note("[compact] cache_invalidated=compact,tools");
         } else {
@@ -264,16 +264,6 @@ impl<C: Completer> Agent<C> {
         self.handler.reset_repeat(&self.session_id);
         self.observed_paths.clear();
         self.read_paths.clear();
-    }
-
-    /// Append `recall` after compact. Returns true when `tools[]` changed
-    /// (`cache_invalidated=tools` on top of the compact miss).
-    pub(crate) fn enable_recall(&mut self) -> bool {
-        if self.tools.is_empty() || has_recall(&self.tools) {
-            return false;
-        }
-        self.tools.push(recall_tool());
-        true
     }
 }
 

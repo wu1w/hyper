@@ -19,7 +19,7 @@ pub const DEFAULT_PLAN_FILE: &str = "plan.md";
 
 // 文案必须与 plan_mode_blocks 的放行面一致：只读 + plan.md 可写。
 pub const PLAN_CARD: &str = "\
-PLAN MODE. Allowed: Read, Glob, Grep, WebSearch, WebFetch, view, recall, \
+PLAN MODE. Allowed: Read, Glob, Grep, Search, WebSearch, WebFetch, view, recall, \
 AskQuestion, ComputerUse screenshot/list_displays/wait, and Write/StrReplace of \
 plan.md (the session plan file). Do not write other files. Mutating Shell, \
 run_code, mcp, and ComputerUse click/type are blocked. Inspect the \

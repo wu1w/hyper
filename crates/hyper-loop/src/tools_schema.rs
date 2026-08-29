@@ -27,7 +27,7 @@ const MEMORY_SEARCH: &str = r#"{"type":"function","function":{"name":"memory_sea
 const SKILL: &str = r#"{"type":"function","function":{"name":"skill","description":"Load a skill by name.","parameters":{"type":"object","properties":{"name":{"type":"string"}},"required":["name"]}}}"#;
 const MCP: &str = r#"{"type":"function","function":{"name":"mcp","description":"Call an MCP server.","parameters":{"type":"object","properties":{"server":{"type":"string"},"method":{"type":"string"},"args":{"type":"object"}},"required":["method"]}}}"#;
 const VIEW: &str = r#"{"type":"function","function":{"name":"view","description":"Load image, video stills, or audio.","parameters":{"type":"object","properties":{"path":{"type":"string"},"kind":{"type":"string","enum":["image","audio","video"]}},"required":["path"]}}}"#;
-const SEARCH: &str = r#"{"type":"function","function":{"name":"search","description":"Find code.","parameters":{"type":"object","properties":{"query":{"type":"string"},"path":{"type":"string"}},"required":["query"]}}}"#;
+const SEARCH: &str = r#"{"type":"function","function":{"name":"Search","description":"Find code in this workspace. Prefer this over Grep when you do not already have a regex. Returns function-sized spans, not whole files. Grep is exact regex; Glob is paths; Read is file contents. Parallel-safe with Read, Glob, and Grep.","parameters":{"type":"object","properties":{"query":{"type":"string"},"path":{"type":"string"}},"required":["query"]}}}"#;
 const WEB: &str = r#"{"type":"function","function":{"name":"web","description":"Web search (query) or fetch a page (url).","parameters":{"type":"object","properties":{"query":{"type":"string"},"url":{"type":"string"}}}}}"#;
 const ASK: &str = r#"{"type":"function","function":{"name":"ask","description":"Ask the user one multiple-choice question (2-4 options). First option is recommended. Blocks until they pick, skip, or type Other.","parameters":{"type":"object","properties":{"title":{"type":"string"},"prompt":{"type":"string"},"options":{"type":"array","items":{"type":"object","properties":{"id":{"type":"string"},"label":{"type":"string"}},"required":["label"]}}},"required":["prompt","options"]}}}"#;
 const COMPUTER_USE: &str = r#"{"type":"function","function":{"name":"ComputerUse","description":"See and control this Windows or macOS desktop. Coordinates are in the last screenshot image, origin top-left. Screenshot first, then click or type. macOS: Screen Recording + Accessibility. Windows: interactive desktop. action: screenshot | list_displays | click | double_click | right_click | move | drag | scroll | type | key | wait. key: enter, tab, cmd+c, ctrl+v, mod+c (cmd on Mac, ctrl on Windows). Not parallel-safe.","parameters":{"type":"object","properties":{"action":{"type":"string","description":"screenshot | list_displays | click | double_click | right_click | move | drag | scroll | type | key | wait"},"x":{"type":"number","description":"Image-space X from the last screenshot."},"y":{"type":"number"},"x2":{"type":"number","description":"Drag end X."},"y2":{"type":"number"},"text":{"type":"string","description":"Unicode text for type."},"keys":{"type":"string","description":"Chord for key: enter, cmd+c, ctrl+shift+t, mod+v."},"scroll_y":{"type":"integer","description":"Positive is down."},"display":{"type":"integer","description":"0-based display index. Default primary."},"ms":{"type":"integer","description":"wait milliseconds, max 8000."}},"required":["action"]}}}"#;
@@ -45,7 +45,7 @@ pub fn dispatch_name(name: &str) -> &str {
         "Delete" | "delete" => "delete",
         "Glob" | "glob" | "list_dir" => "glob",
         "Grep" | "grep" => "grep",
-        "search" => "search",
+        "search" | "Search" => "search",
         "Shell" | "bash" | "run_terminal_command" | "Bash" => "bash",
         "WebSearch" | "WebFetch" | "web" | "web_search" | "web_fetch" => "web",
         "AskQuestion" | "ask" | "ask_user_question" => "ask",
@@ -111,7 +111,7 @@ pub fn code_tool_names() -> [&'static str; 3] {
     ["run_code", "Read", "Shell"]
 }
 
-/// Separate blob. Do not splice into [`agent_tools`] — append after compact.
+/// Separate blob. Not in the frozen Cursor set; live tests may still mount it.
 pub fn recall_tool() -> Value {
     parse(RECALL)
 }
@@ -137,7 +137,7 @@ pub fn computer_use_tool() -> Value {
     parse(COMPUTER_USE)
 }
 
-/// Legacy code-index tool. Not in the frozen Cursor set; executor still accepts `search`.
+/// Workspace code-index tool. Not in the frozen Cursor 13; executor accepts `Search` / `search`.
 pub fn search_tool() -> Value {
     parse(SEARCH)
 }
@@ -185,6 +185,19 @@ pub fn has_tool(tools: &[Value], name: &str) -> bool {
 
 pub fn has_recall(tools: &[Value]) -> bool {
     has_tool(tools, "recall")
+}
+
+/// Drop `recall` if a previous Hyper version appended it. Cursor compact
+/// continues from the archive card; it does not expose a search-archive tool.
+pub fn strip_recall(tools: &mut Vec<Value>) -> bool {
+    let before = tools.len();
+    tools.retain(|t| {
+        t["function"]["name"]
+            .as_str()
+            .map(|n| dispatch_name(n) != "recall")
+            .unwrap_or(true)
+    });
+    tools.len() != before
 }
 
 #[cfg(test)]
@@ -307,7 +320,11 @@ mod tests {
         assert!(!names.contains(&"recall"));
         assert_eq!(serde_json::to_string(&recall_tool()).unwrap(), RECALL);
         assert!(!has_recall(&tools));
-        assert!(has_recall(&[recall_tool()]));
+        let mut with = vec![recall_tool()];
+        assert!(has_recall(&with));
+        assert!(strip_recall(&mut with));
+        assert!(!has_recall(&with));
+        assert!(!strip_recall(&mut with));
         assert_eq!(
             serde_json::to_string(&memory_search_tool()).unwrap(),
             MEMORY_SEARCH
@@ -321,6 +338,11 @@ mod tests {
         );
         assert!(!has_tool(&tools, "ComputerUse"));
         assert_eq!(serde_json::to_string(&search_tool()).unwrap(), SEARCH);
+        assert_eq!(search_tool()["function"]["name"].as_str(), Some("Search"));
+        assert!(search_tool()["function"]["description"]
+            .as_str()
+            .unwrap()
+            .contains("Prefer this over Grep"));
         assert_eq!(serde_json::to_string(&web_tool()).unwrap(), WEB);
         assert_eq!(serde_json::to_string(&ask_tool()).unwrap(), ASK);
         assert!(has_tool(&tools, "AskQuestion"));

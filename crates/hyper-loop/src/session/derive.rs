@@ -74,18 +74,24 @@ fn user_message(u: &crate::session::event::UserEvent) -> ChatMessage {
 }
 
 fn assistant_message(a: &AssistantEvent) -> ChatMessage {
-    let mut msg = match &a.tool_calls {
-        Some(calls) if !calls.is_empty() => ChatMessage::assistant_tools(
-            if a.content.is_empty() {
-                None
-            } else {
-                Some(a.content.clone())
-            },
-            calls.iter().map(OpenAiToolCall::to_value).collect(),
-        ),
-        _ => ChatMessage::assistant(a.content.clone()),
+    let hop = a.tool_calls.as_ref().is_some_and(|c| !c.is_empty());
+    let mut msg = if hop {
+        ChatMessage::assistant_tools(
+            None,
+            a.tool_calls
+                .as_ref()
+                .unwrap()
+                .iter()
+                .map(OpenAiToolCall::to_value)
+                .collect(),
+        )
+    } else {
+        ChatMessage::assistant(a.content.clone())
     };
-    if !a.reasoning.is_empty() {
+    // JSONL keeps hop think for the UI. The next model hop must not see it —
+    // grok-4.6 continues the essay from `reasoning_content` the same way it
+    // used to continue hop `content`.
+    if !hop && !a.reasoning.is_empty() {
         msg.reasoning_content = Some(a.reasoning.clone());
     }
     msg.parts = a.media.iter().filter_map(stored_part).collect();

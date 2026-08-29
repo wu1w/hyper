@@ -54,10 +54,12 @@ impl<C: Completer> Agent<C> {
         self.edit_guard.reset_turn(&user);
         self.oracle_cmd = None;
         self.snapshot_test_baseline().await;
+        self.start_code_index();
         let mut steps = 0u32;
         let mut prompt_tokens = 0u64;
         let mut completion_tokens = 0u64;
         let mut parse_retries = 0u32;
+        let mut first_hop = true;
 
         loop {
             self.drain_background();
@@ -81,6 +83,11 @@ impl<C: Completer> Agent<C> {
                 self.note(&reason);
             }
 
+            if !first_hop {
+                self.settle_code_index().await;
+            }
+            first_hop = false;
+
             let tools_owned = self.tools.clone();
             let tools = if tools_owned.is_empty() {
                 None
@@ -88,7 +95,11 @@ impl<C: Completer> Agent<C> {
                 Some(tools_owned.as_slice())
             };
 
-            let Some(mut turn) = self.complete_or_abort(tools).await? else {
+            self.arm_speculate();
+            let completed = self.complete_or_abort(tools).await;
+            self.completer.set_speculate(None);
+            let Some(mut turn) = completed? else {
+                self.drop_speculate();
                 return self.finish(String::new(), Some("aborted".into()), steps);
             };
             steps += 1;
@@ -100,8 +111,12 @@ impl<C: Completer> Agent<C> {
                 // that thinking itself should be disabled. Give the model one
                 // concise side observation and more room to choose a course.
                 self.note("[watchdog] think cap; soft nudge and one roomy retry");
+                self.drop_speculate();
+                self.arm_speculate();
                 let widened = self.retry_with_runaway_room(tools).await;
+                self.completer.set_speculate(None);
                 if self.cancel.is_cancelled() {
+                    self.drop_speculate();
                     return self.finish(String::new(), Some("aborted".into()), steps);
                 }
                 match widened {
@@ -116,12 +131,17 @@ impl<C: Completer> Agent<C> {
                     None => {}
                 }
                 if turn.watchdog_hit && turn.content.is_empty() && turn.tool_calls.is_empty() {
+                    self.drop_speculate();
                     self.mark_clean();
                     return self.finish(self.last_spoken.clone().unwrap_or_default(), None, steps);
                 }
             }
 
-            if !turn.reasoning.is_empty() && self.print && !self.stdio.think_streamed() {
+            if !turn.reasoning.is_empty()
+                && self.print
+                && !self.stdio.think_streamed()
+                && turn.tool_calls.is_empty()
+            {
                 eprintln!("[think]\n{}", turn.reasoning.trim());
             }
 
@@ -130,6 +150,7 @@ impl<C: Completer> Agent<C> {
                 self.sync_effort(PolicyReason::Upgrade);
                 parse_retries += 1;
                 self.note("[parse] retry");
+                self.drop_speculate();
                 if parse_retries >= self.parse_stop_after {
                     return self.finish(self.last_spoken.clone().unwrap_or_default(), None, steps);
                 }
@@ -154,7 +175,9 @@ impl<C: Completer> Agent<C> {
                     _ => {}
                 }
                 let calls = std::mem::take(&mut turn.tool_calls);
+                self.settle_code_index().await;
                 self.execute_tools(calls).await;
+                self.drop_speculate();
                 self.flush_steer();
                 if self.cancel.is_cancelled() {
                     return self.finish(String::new(), Some("aborted".into()), steps);
@@ -162,6 +185,7 @@ impl<C: Completer> Agent<C> {
                 continue;
             }
 
+            self.drop_speculate();
             match decision {
                 GateDecision::Continue { continuation, .. } => {
                     self.mark_clean();
@@ -196,7 +220,6 @@ impl<C: Completer> Agent<C> {
     }
 
     pub(crate) fn push_assistant(&mut self, turn: &ModelTurn) {
-        let reasoning = empty_to_none(&turn.reasoning);
         let tool_calls = if turn.tool_calls.is_empty() {
             None
         } else {
@@ -207,14 +230,20 @@ impl<C: Completer> Agent<C> {
                     .unwrap_or_else(|| openai_tool_calls(&turn.tool_calls)),
             )
         };
+        let reasoning = if tool_calls.is_some() {
+            None
+        } else {
+            empty_to_none(&turn.reasoning)
+        };
         let content = if tool_calls.is_none() {
             Some(turn.content.clone())
         } else {
-            // Cursor: tool hops keep visible text empty.
+            // Cursor: tool hops keep visible text empty — persist that, or
+            // grok-4.6 continues the essay on the next hop.
             None
         };
         let stored = self.persist_turn_media(&turn.media);
-        let mut msg = ChatMessage::assistant_reply(content, reasoning, tool_calls);
+        let mut msg = ChatMessage::assistant_reply(content.clone(), reasoning, tool_calls);
         msg.parts = stored
             .iter()
             .filter_map(|m| {
@@ -229,7 +258,7 @@ impl<C: Completer> Agent<C> {
         self.messages.push(msg);
         self.log_event(
             SessionEvent::assistant_usage(
-                turn.content.clone(),
+                content.unwrap_or_default(),
                 turn.reasoning.clone(),
                 if turn.tool_calls.is_empty() {
                     None
@@ -383,6 +412,19 @@ impl<C: Completer> Agent<C> {
         retry.filter(|t| !t.watchdog_hit && !t.parse_fail)
     }
 
+    fn arm_speculate(&mut self) {
+        let slot = super::SpeculativeSlot::new(self.speculate_ctx());
+        self.speculate = Some(slot.clone());
+        self.completer.set_speculate(Some(slot));
+    }
+
+    fn drop_speculate(&mut self) {
+        self.completer.set_speculate(None);
+        if let Some(slot) = self.speculate.take() {
+            slot.abort();
+        }
+    }
+
     pub(crate) fn last_real_user(&self) -> &str {
         self.messages
             .iter()
@@ -446,6 +488,14 @@ impl<C: Completer> Agent<C> {
         stop_reason: Option<String>,
         steps: u32,
     ) -> Result<AgentOutcome> {
+        self.drop_speculate();
+        if let Some(h) = self.index_build.take() {
+            if let Ok(rt) = tokio::runtime::Handle::try_current() {
+                rt.spawn(async move {
+                    let _ = h.await;
+                });
+            }
+        }
         self.drain_background();
         if stop_reason.as_deref() == Some("aborted") {
             self.coordinator.cancel_background();
