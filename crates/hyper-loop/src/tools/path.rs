@@ -67,10 +67,19 @@ impl Workspace {
             }
         };
         let normalized = lexical_normalize(&joined);
-        if self.confined {
-            return self.check_confined(&normalized);
-        }
         Ok(normalized)
+    }
+
+    /// Writes stay inside the workspace when `confined` (`workspace_write_only`).
+    /// Reads/Glob/Grep/Shell cwd use [`Self::resolve`] so absolute paths work
+    /// like Hermes.
+    pub fn resolve_write(&self, raw: &str) -> std::result::Result<PathBuf, String> {
+        let normalized = self.resolve(raw)?;
+        if self.confined {
+            self.check_confined(&normalized)
+        } else {
+            Ok(normalized)
+        }
     }
 
     /// Symlink-aware confinement check. Returns the path read/write must use.
@@ -215,9 +224,29 @@ mod tests {
     fn lexical_dotdot_escape_is_rejected() {
         let d = temp_dir("dotdot");
         let ws = Workspace::open(&d, true).unwrap();
-        let err = ws.resolve("a/../../outside.txt").unwrap_err();
+        let err = ws.resolve_write("a/../../outside.txt").unwrap_err();
+        assert!(err.contains("outside the workspace"), "{err}");
+        assert!(ws.resolve("a/../../outside.txt").is_ok());
+        std::fs::remove_dir_all(&d).ok();
+    }
+
+    #[test]
+    fn confined_reads_allow_absolute_outside() {
+        let d = temp_dir("read-out");
+        let outside = std::env::temp_dir().join(format!(
+            "hyper-path-read-out-{}",
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::write(&outside, "ok").unwrap();
+        let ws = Workspace::open(&d, true).unwrap();
+        let p = ws.resolve(outside.to_str().unwrap()).unwrap();
+        assert_eq!(p, outside);
+        let err = ws
+            .resolve_write(outside.to_str().unwrap())
+            .unwrap_err();
         assert!(err.contains("outside the workspace"), "{err}");
         std::fs::remove_dir_all(&d).ok();
+        std::fs::remove_file(&outside).ok();
     }
 
     #[cfg(unix)]
@@ -236,12 +265,13 @@ mod tests {
 
         let leak = d.join("leak.txt");
         symlink(&outside_file, &leak).unwrap();
-        let err = ws.resolve("leak.txt").unwrap_err();
+        let err = ws.resolve_write("leak.txt").unwrap_err();
         assert!(err.contains("outside the workspace"), "{err}");
+        assert!(ws.resolve("leak.txt").is_ok());
 
         let hole = d.join("hole");
         symlink(&outside, &hole).unwrap();
-        let err = ws.resolve("hole/new.txt").unwrap_err();
+        let err = ws.resolve_write("hole/new.txt").unwrap_err();
         assert!(err.contains("outside the workspace"), "{err}");
 
         let inner = d.join("inner.txt");

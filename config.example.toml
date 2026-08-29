@@ -49,7 +49,7 @@ code_mode = true
 tui = false
 skills_auto_catalog = false
 mcp_auto_catalog = false
-workspace_write_only = true
+workspace_write_only = true  # writes stay in workspace; Read/Glob/Grep/Shell can use absolute paths
 # TUI: ask (prompt writes/bash) | auto (edits pass, bash prompts) | yolo
 approvals = "ask"
 # Extra tool: screenshot + mouse/keyboard on the machine running Hyper (Windows / macOS).

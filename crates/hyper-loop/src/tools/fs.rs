@@ -162,7 +162,7 @@ pub fn write_file(ws: &Workspace, call: &ToolCall) -> ToolResponse {
     if crate::stutter::is_placeholder_write(&raw, &content) {
         return ToolResponse::text(&call.id, "Error: invalid path.", ToolState::Error);
     }
-    let path = match ws.resolve(&raw) {
+    let path = match ws.resolve_write(&raw) {
         Ok(p) => p,
         Err(e) => return ToolResponse::text(&call.id, e, ToolState::Error),
     };
@@ -205,7 +205,7 @@ pub fn edit_file(ws: &Workspace, call: &ToolCall) -> ToolResponse {
             ToolState::Error,
         );
     };
-    let path = match ws.resolve(&raw) {
+    let path = match ws.resolve_write(&raw) {
         Ok(p) => p,
         Err(e) => return ToolResponse::text(&call.id, e, ToolState::Error),
     };
@@ -290,7 +290,7 @@ pub fn delete_file(ws: &Workspace, call: &ToolCall) -> ToolResponse {
     let Some(raw) = arg_path(&call.arguments) else {
         return ToolResponse::text(&call.id, "Error: No `path` provided.", ToolState::Error);
     };
-    let path = match ws.resolve(&raw) {
+    let path = match ws.resolve_write(&raw) {
         Ok(p) => p,
         Err(e) => return ToolResponse::text(&call.id, e, ToolState::Error),
     };

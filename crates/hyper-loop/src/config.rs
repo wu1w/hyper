@@ -275,8 +275,8 @@ pub struct FeatureConfig {
     pub tui: bool,
     pub skills_auto_catalog: bool,
     pub mcp_auto_catalog: bool,
-    /// Confine file-oriented tools to the selected workspace. Shell/code use
-    /// it as cwd but are not an operating-system sandbox.
+    /// Writes stay in the selected workspace. Reads/Glob/Grep/Shell may use
+    /// absolute paths (Hermes-like). Shell is not an OS sandbox.
     pub workspace_write_only: bool,
     /// TUI permission mode: ask | auto | yolo. `--print` never prompts.
     pub approvals: String,

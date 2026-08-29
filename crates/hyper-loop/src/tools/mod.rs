@@ -2,7 +2,7 @@
 //! `StrReplace` / `Shell` / …). Executors accept the same names plus a few
 //! transcript aliases (`read` / `bash`).
 //!
-//! Paths resolve from the workspace; writes stay inside it when confined.
+//! Reads resolve anywhere; writes stay inside the workspace when confined.
 
 mod bash;
 mod code_index;
@@ -355,6 +355,35 @@ mod tests {
         );
         assert_eq!(out.state, ToolState::Error);
         assert!(out.joined_text().contains("workspace"));
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn confined_read_allows_absolute_outside() {
+        let (ws, dir) = scratch();
+        let outside = std::env::temp_dir().join(format!(
+            "hyper-read-out-{}",
+            uuid::Uuid::new_v4().simple()
+        ));
+        std::fs::write(&outside, "hello-out\n").unwrap();
+        let r = fs::read_file(
+            &ws,
+            &call("read", json!({"path": outside.to_str().unwrap()})),
+            ToolLimits::default(),
+            None,
+        );
+        assert_eq!(r.state, ToolState::Success, "{}", r.joined_text());
+        assert!(r.joined_text().contains("hello-out"), "{}", r.joined_text());
+        let w = fs::write_file(
+            &ws,
+            &call(
+                "write",
+                json!({"path": outside.to_str().unwrap(), "content": "no"}),
+            ),
+        );
+        assert_eq!(w.state, ToolState::Error);
+        assert!(w.joined_text().contains("workspace"));
+        let _ = std::fs::remove_file(&outside);
         let _ = std::fs::remove_dir_all(dir);
     }
 

@@ -69,6 +69,9 @@ impl<C: Completer> Agent<C> {
             // Pending gate TERMINATE fires before the next model call.
             if let Some(reason) = self.pending_stop.take() {
                 let text = self.last_spoken.clone().unwrap_or_default();
+                if self.arm_im_wrap_up(&text, &reason) {
+                    continue;
+                }
                 if reason.is_empty() || is_physics_stop(&reason) {
                     if !reason.is_empty() {
                         self.note(&reason);
@@ -89,7 +92,7 @@ impl<C: Completer> Agent<C> {
             first_hop = false;
 
             let tools_owned = self.tools.clone();
-            let tools = if tools_owned.is_empty() {
+            let tools = if self.physics_nudged || tools_owned.is_empty() {
                 None
             } else {
                 Some(tools_owned.as_slice())
@@ -132,6 +135,9 @@ impl<C: Completer> Agent<C> {
                 }
                 if turn.watchdog_hit && turn.content.is_empty() && turn.tool_calls.is_empty() {
                     self.drop_speculate();
+                    if self.arm_im_wrap_up("", "[watchdog] think cap") {
+                        continue;
+                    }
                     self.mark_clean();
                     return self.finish(self.last_spoken.clone().unwrap_or_default(), None, steps);
                 }
@@ -199,6 +205,9 @@ impl<C: Completer> Agent<C> {
                 GateDecision::Stop { reason } => {
                     self.mark_clean();
                     if is_physics_stop(&reason) {
+                        if self.arm_im_wrap_up(&turn.content, &reason) {
+                            continue;
+                        }
                         self.note(&reason);
                         return self.finish(turn.content, None, steps);
                     }
@@ -425,6 +434,23 @@ impl<C: Completer> Agent<C> {
         }
     }
 
+    /// IM tool loops often dump the answer into think and never emit content.
+    /// One no-tool hop after a physics cap, so QQ/WeChat get a visible reply.
+    fn arm_im_wrap_up(&mut self, spoken: &str, reason: &str) -> bool {
+        if self.physics_nudged || !spoken.trim().is_empty() {
+            return false;
+        }
+        if super::interactive_channel(&self.channel) || self.channel.is_empty() {
+            return false;
+        }
+        self.physics_nudged = true;
+        if !reason.is_empty() {
+            self.note(reason);
+        }
+        self.push_hidden_user(PHYSICS_WRAP_NOTE);
+        true
+    }
+
     pub(crate) fn last_real_user(&self) -> &str {
         self.messages
             .iter()
@@ -560,7 +586,6 @@ pub(crate) const NO_TOOL_ANSWER_RESERVE: u32 = 4096;
 pub(crate) const THINK_DIVERGENCE_NOTE: &str = "[trajectory] This turn's thinking hit the length budget and may be diverging. \
 Compress known facts and open questions first; answer or act if the evidence is enough, else take only the smallest missing step.";
 
-#[cfg(test)]
 pub(crate) const PHYSICS_WRAP_NOTE: &str =
     "[trajectory] This turn is near the step, time, or context cap. \
 Close with a user-visible conclusion from the evidence you have; do not start a new tool loop.";

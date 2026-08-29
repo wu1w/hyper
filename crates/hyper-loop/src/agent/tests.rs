@@ -454,6 +454,41 @@ async fn physics_step_cap_wraps_then_keeps_spoken_text() {
 }
 
 #[tokio::test]
+async fn im_physics_cap_wraps_with_visible_reply() {
+    let dir = std::env::temp_dir().join(format!("hyper-im-wrap-{}", uuid::Uuid::new_v4().simple()));
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(dir.join("ping.txt"), "pong\n").unwrap();
+    let mut o = opts(&dir);
+    o.max_steps = 2;
+    o.peripheral = false;
+    o.channel = "qq".into();
+    let ping = json!({"path": "ping.txt"});
+    let scripted = Scripted {
+        turns: Mutex::new(VecDeque::from([
+            turn_tool("read", ping.clone()),
+            turn_tool("read", ping.clone()),
+            turn_text("wrapped up"),
+        ])),
+        meter: false,
+    };
+    let mut agent = Agent::new(scripted, o).unwrap();
+    let out = agent.run("read ping.txt").await.unwrap();
+    assert_eq!(out.text, "wrapped up", "{:?}", out.stop_reason);
+    let hidden: Vec<_> = agent
+        .messages
+        .iter()
+        .filter(|m| m.role == "user")
+        .map(|m| m.content.clone().unwrap_or_default())
+        .filter(|c| crate::template::is_hidden_user_text(c))
+        .collect();
+    assert!(
+        hidden.iter().any(|c| c.contains(PHYSICS_WRAP_NOTE)),
+        "IM wrap-up note missing: {hidden:?}"
+    );
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+#[tokio::test]
 async fn steer_injects_after_tool_round() {
     let dir = std::env::temp_dir().join(format!("hyper-steer-{}", uuid::Uuid::new_v4().simple()));
     std::fs::create_dir_all(&dir).unwrap();
