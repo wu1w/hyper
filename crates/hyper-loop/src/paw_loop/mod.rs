@@ -20,7 +20,7 @@ pub use ctx::{hash_args, GateCtx, ToolFingerprint};
 pub use gates::{
     fs_tool_path, BudgetGate, DoomLoopGate, DoomStage, Gate, IterationGate, NameStreakGate,
     PathLoopGate, TimeoutGate, TokenBudgetGate, ToolCallBudgetGate, LOSSY_TOOL_BUDGET, NAME_NOTE,
-    PATH_NOTE, REPEAT_NOTE,
+    PATH_NOTE, REPEAT_NOTE, REPEAT_STOP,
 };
 pub use handler::{HandlerScope, StopHandler, StopHandlerSet};
 pub use store::SessionMap;

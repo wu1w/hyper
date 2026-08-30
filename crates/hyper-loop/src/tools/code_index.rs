@@ -1,6 +1,6 @@
 //! Workspace code index. `Search` covers Cursor's glob / exact-symbol /
 //! keyword paths and returns function-sized spans, not grep dumps. Not in
-//! the frozen 13 — `bind_periphery` appends `search_tool()` after them.
+//! the core tool set — `bind_periphery` appends `search_tool()` when `code_search` is on.
 
 use std::collections::{HashMap, HashSet};
 use std::io::Read;
@@ -14,19 +14,27 @@ use rusqlite::{params, Connection, Transaction};
 use super::{arg_str, folded_response, ToolLimits, Workspace};
 use crate::tool_calls::{ToolCall, ToolResponse, ToolState};
 
+/// Same copy for empty index and "index not bound yet" so the model retries
+/// Search instead of falling through to Glob/Grep.
+pub const SEARCH_WARMING: &str =
+    "No matches. Index is empty or still warming. Retry Search shortly, or Read a path you already know.";
+
 const HIT_CAP: usize = 8;
 const CHUNK_LINES: usize = 80;
 const RENDER_CHARS: usize = 4000;
 const MAX_FILES: usize = 50_000;
 const MAX_FILE_BYTES: usize = 1024 * 1024;
-const INDEX_SCHEMA: i64 = 2;
+const INDEX_SCHEMA: i64 = 4;
 /// Agent::new rebuilds the index every turn. A persistent sqlite that was
 /// scanned moments ago is still current; skip git-ls + metadata until this
 /// window elapses so Windows doesn't re-walk tens of thousands of files.
 const RESCAN_EVERY: Duration = Duration::from_secs(12);
 /// Hard cap for the first-hop scan. Windows Defender + Documents/Desktop as
 /// the workspace used to block "等待模型" for minutes before any HTTP call.
+/// Git-tracked trees are bounded by `git ls-files`; give them more time so
+/// Search is dense enough that grok-4.6 does not fall through to Grep storms.
 const INDEX_BUDGET: Duration = Duration::from_secs(3);
+const INDEX_BUDGET_GIT: Duration = Duration::from_secs(8);
 const GIT_TIMEOUT: Duration = Duration::from_secs(4);
 static LAST_FULL_SCAN: Mutex<Option<(PathBuf, Instant)>> = Mutex::new(None);
 
@@ -55,10 +63,10 @@ const SKIP_DIR: &[&str] = &[
     "node_modules",
     "dist",
     "build",
+    "third_party",
     "__pycache__",
     ".venv",
     "venv",
-    ".grok-hyper",
     "blobs",
     "AppData",
     "Application Data",
@@ -69,6 +77,10 @@ const SKIP_DIR: &[&str] = &[
     "Downloads",
     "Dropbox",
 ];
+
+/// Gitignored workspace overlay. Overnight scripts stay Search-visible;
+/// session dumps / blob archives do not.
+const HYPER_SKIP_DIR: &[&str] = &["sessions", "blobs", "doc-cache", "generated"];
 
 pub struct CodeIndex {
     conn: Mutex<Connection>,
@@ -95,8 +107,12 @@ impl CodeIndex {
                 return idx;
             }
         }
-        let budget = ScanBudget::new(INDEX_BUDGET);
         let tracked = git_ls_files(root);
+        let budget = ScanBudget::new(if tracked.is_some() {
+            INDEX_BUDGET_GIT
+        } else {
+            INDEX_BUDGET
+        });
         if budget.exceeded() {
             return Self::persistent(root).unwrap_or_else(Self::empty);
         }
@@ -105,6 +121,7 @@ impl CodeIndex {
             .unwrap_or_else(|| walk_fallback(root, &budget));
         if tracked.is_some() && !budget.exceeded() {
             files.extend(collect_nested_git_files(root, &budget));
+            files.extend(collect_hyper_overlay_files(root, &budget));
             files.sort();
             files.dedup();
         }
@@ -260,21 +277,23 @@ impl CodeIndex {
 
     pub(crate) fn search(&self, query: &str, path_filter: Option<&str>, limit: usize) -> Vec<Hit> {
         let cap = limit.clamp(1, HIT_CAP);
+        let fetch = cap.saturating_mul(4).clamp(cap, 32);
         let mut out = Vec::new();
         let mut seen = HashSet::new();
 
         if is_glob(query) {
-            if let Ok(hits) = self.search_glob(query, path_filter, cap as i64) {
-                merge_hits(&mut out, &mut seen, cap, hits);
+            if let Ok(hits) = self.search_glob(query, path_filter, fetch as i64) {
+                merge_hits(&mut out, &mut seen, fetch, hits);
             }
             if !out.is_empty() {
                 return out;
             }
         } else if looks_like_filename(query) {
-            if let Ok(hits) = self.search_filename(query, path_filter, cap as i64) {
-                merge_hits(&mut out, &mut seen, cap, hits);
+            if let Ok(hits) = self.search_filename(query, path_filter, fetch as i64) {
+                merge_hits(&mut out, &mut seen, fetch, hits);
             }
             if !out.is_empty() {
+                rank_hits(&mut out, query, cap);
                 return out;
             }
         }
@@ -282,11 +301,11 @@ impl CodeIndex {
         let idents = ident_tokens(query);
         let mut exact_idents = Vec::new();
         for ident in &idents {
-            if let Ok(hits) = self.search_symbol(&ident, path_filter, cap as i64) {
+            if let Ok(hits) = self.search_symbol(&ident, path_filter, fetch as i64) {
                 if !hits.is_empty() {
                     exact_idents.push(ident.clone());
                 }
-                merge_hits(&mut out, &mut seen, cap, hits);
+                merge_hits(&mut out, &mut seen, fetch, hits);
             }
         }
         // An explicit identifier is a much stronger signal than surrounding
@@ -296,24 +315,26 @@ impl CodeIndex {
         if !exact_idents.is_empty() {
             for ident in &exact_idents {
                 let exact = format!("\"{}\"", ident.replace('"', ""));
-                if let Ok(hits) = self.search_fts(&exact, path_filter, cap as i64) {
-                    merge_hits(&mut out, &mut seen, cap, hits);
+                if let Ok(hits) = self.search_fts(&exact, path_filter, fetch as i64) {
+                    merge_hits(&mut out, &mut seen, fetch, hits);
                 }
             }
+            rank_hits(&mut out, query, cap);
             return out;
         }
 
         let fts = fts_query(query);
-        if !fts.is_empty() && out.len() < cap {
-            if let Ok(hits) = self.search_fts(&fts, path_filter, cap as i64) {
-                merge_hits(&mut out, &mut seen, cap, hits);
+        if !fts.is_empty() && out.len() < fetch {
+            if let Ok(hits) = self.search_fts(&fts, path_filter, fetch as i64) {
+                merge_hits(&mut out, &mut seen, fetch, hits);
             }
         }
-        if out.len() < cap {
-            if let Ok(hits) = self.search_like(&search_tokens(query), path_filter, cap as i64) {
-                merge_hits(&mut out, &mut seen, cap, hits);
+        if out.len() < fetch {
+            if let Ok(hits) = self.search_like(&search_tokens(query), path_filter, fetch as i64) {
+                merge_hits(&mut out, &mut seen, fetch, hits);
             }
         }
+        rank_hits(&mut out, query, cap);
         out
     }
 
@@ -499,6 +520,12 @@ impl CodeIndex {
             .trim()
             .trim_start_matches("./")
             .replace('\\', "/");
+        if edited == ".grok-hyper"
+            || edited.starts_with(".grok-hyper/")
+            || edited.contains("/.grok-hyper/")
+        {
+            return None;
+        }
         let mut idents = ident_tokens(snippet);
         if idents.is_empty() {
             idents = fts_tokens(snippet)
@@ -538,28 +565,85 @@ impl CodeIndex {
     }
 }
 
-pub fn run_search(index: &CodeIndex, call: &ToolCall, limits: ToolLimits) -> ToolResponse {
+pub fn run_search(
+    index: &CodeIndex,
+    workspace: &Workspace,
+    call: &ToolCall,
+    limits: ToolLimits,
+) -> ToolResponse {
     let query = arg_str(&call.arguments, "query").unwrap_or_default();
     if query.trim().is_empty() {
         return ToolResponse::text(&call.id, "Error: search needs `query`.", ToolState::Error);
     }
-    let path = arg_str(&call.arguments, "path").filter(|s| !s.trim().is_empty());
-    let hits = index.search(&query, path.as_deref(), HIT_CAP);
+    let path = search_path_filter(
+        workspace,
+        arg_str(&call.arguments, "path")
+            .filter(|s| !s.trim().is_empty())
+            .as_deref(),
+    );
+    let mut hits = index.search(&query, path.as_deref(), HIT_CAP);
+    let mut widened: Option<String> = None;
+    if hits.is_empty() {
+        if let Some(p) = path.as_deref() {
+            let wide = index.search(&query, None, HIT_CAP);
+            if !wide.is_empty() {
+                widened = Some(p.to_string());
+                hits = wide;
+            }
+        }
+    }
     if hits.is_empty() {
         let hint = if index.is_empty() {
-            "No matches. The workspace index has no chunks (home folder, huge tree, or scan budget). Use Grep for exact search."
+            SEARCH_WARMING
         } else {
             "No matches."
         };
         return ToolResponse::text(&call.id, hint, ToolState::Success);
     }
-    folded_response(
-        &call.id,
-        render_hits(&hits, RENDER_CHARS),
-        ToolState::Success,
-        limits,
-        None,
-    )
+    let body = render_hits(&hits, RENDER_CHARS);
+    let body = match widened {
+        Some(p) => format!("Nothing under `{p}`. Workspace hits:\n{body}"),
+        None => body,
+    };
+    folded_response(&call.id, body, ToolState::Success, limits, None)
+}
+
+/// Function-sized spans for a query. Empty if the index has no hits.
+pub fn render_query_spans(index: &CodeIndex, query: &str) -> String {
+    if query.trim().is_empty() {
+        return String::new();
+    }
+    let hits = index.search(query, None, HIT_CAP);
+    if hits.is_empty() {
+        String::new()
+    } else {
+        render_hits(&hits, RENDER_CHARS)
+    }
+}
+
+fn search_path_filter(ws: &Workspace, raw: Option<&str>) -> Option<String> {
+    let raw = raw.map(str::trim).filter(|s| !s.is_empty())?;
+    if matches!(raw, "." | "./" | "/") {
+        return None;
+    }
+    let shown = ws.shown(raw).replace('\\', "/");
+    let shown = shown.trim_start_matches("./");
+    if shown.is_empty() || shown == "." {
+        return None;
+    }
+    let root = ws.display().replace('\\', "/");
+    let root = root.trim_end_matches('/');
+    if shown == root {
+        return None;
+    }
+    if let Some(rest) = shown.strip_prefix(&format!("{root}/")) {
+        return if rest.is_empty() {
+            None
+        } else {
+            Some(rest.to_string())
+        };
+    }
+    Some(shown.to_string())
 }
 
 fn merge_hits(out: &mut Vec<Hit>, seen: &mut HashSet<(String, u32)>, cap: usize, hits: Vec<Hit>) {
@@ -571,6 +655,155 @@ fn merge_hits(out: &mut Vec<Hit>, seen: &mut HashSet<(String, u32)>, cap: usize,
             out.push(h);
         }
     }
+}
+
+/// `src/foo/tests.rs` sorts before `src/foo/progress.rs` in SQLite. Production
+/// spans should lead so a locate query does not open the unit-test first.
+fn search_test_path(path: &str) -> bool {
+    let p = path.replace('\\', "/").to_lowercase();
+    let file = p.rsplit('/').next().unwrap_or("");
+    file == "tests.rs"
+        || file == "tests.ts"
+        || file == "tests.js"
+        || file == "tests.py"
+        || file.starts_with("test_")
+        || file.contains("_test.")
+        || file.contains(".test.")
+        || file.contains(".spec.")
+        || file.ends_with("_tests.rs")
+        || p.split('/')
+            .any(|s| s == "tests" || s == "test" || s == "__tests__")
+}
+
+fn prefer_production_hits(out: &mut Vec<Hit>) {
+    let mut prod = Vec::new();
+    let mut tests = Vec::new();
+    for h in out.drain(..) {
+        if search_test_path(&h.path) || test_chunk(&h.body) || schema_dump_chunk(&h.body) {
+            tests.push(h);
+        } else {
+            prod.push(h);
+        }
+    }
+    prod.extend(tests);
+    *out = prod;
+}
+
+fn test_chunk(body: &str) -> bool {
+    body.contains("#[test]") || body.contains("#[tokio::test]")
+}
+
+/// Frozen tool JSON in `tools_schema.rs` matches words like Shell/background
+/// but is not the implementation.
+fn schema_dump_chunk(body: &str) -> bool {
+    body.contains("r#\"{\"type\":\"function\"")
+        || (body.contains("\"type\":\"function\"") && body.contains("\"parameters\""))
+}
+
+/// Spans that actually contain a query identifier beat FTS prose matches.
+fn prefer_ident_hits(out: &mut Vec<Hit>, query: &str) {
+    let idents = ident_tokens(query);
+    if idents.is_empty() {
+        return;
+    }
+    let mut hit = Vec::new();
+    let mut miss = Vec::new();
+    for h in out.drain(..) {
+        if idents
+            .iter()
+            .any(|id| h.body.contains(id.as_str()) || h.path.contains(id.as_str()))
+        {
+            hit.push(h);
+        } else {
+            miss.push(h);
+        }
+    }
+    hit.extend(miss);
+    *out = hit;
+}
+
+fn rank_hits(out: &mut Vec<Hit>, query: &str, cap: usize) {
+    prefer_ident_hits(out, query);
+    prefer_query_coverage(out, query);
+    prefer_named_path(out, query);
+    prefer_production_hits(out);
+    out.truncate(cap);
+}
+
+/// NL leftover: the span that contains more query tokens (CJK phrase, not
+/// the two-letter "IM" that matches every chat bridge comment).
+fn prefer_query_coverage(out: &mut Vec<Hit>, query: &str) {
+    let toks = search_tokens(query);
+    if toks.len() < 2 {
+        return;
+    }
+    out.sort_by(|a, b| {
+        coverage(b, &toks)
+            .cmp(&coverage(a, &toks))
+            .then_with(|| a.path.cmp(&b.path))
+    });
+}
+
+fn coverage(h: &Hit, toks: &[String]) -> usize {
+    toks.iter()
+        .filter(|t| h.body.contains(t.as_str()) || h.path.contains(t.as_str()))
+        .count()
+}
+
+/// `Search("send_typing wechat")` should open `wechat.rs` before `qq.rs`.
+fn prefer_named_path(out: &mut Vec<Hit>, query: &str) {
+    let tokens: Vec<String> = fts_tokens(query)
+        .into_iter()
+        .map(|t| t.to_ascii_lowercase())
+        .filter(|t| {
+            t.len() >= 4 && !is_syntax_kw(t) && !is_stopword(t) && !is_generic_path_token(t)
+        })
+        .collect();
+    if tokens.is_empty() {
+        return;
+    }
+    let mut named = Vec::new();
+    let mut rest = Vec::new();
+    for h in out.drain(..) {
+        let p = h.path.replace('\\', "/").to_ascii_lowercase();
+        let file = p.rsplit('/').next().unwrap_or("");
+        let stem = file.rsplit_once('.').map(|(s, _)| s).unwrap_or(file);
+        if tokens
+            .iter()
+            .any(|t| stem == t || file.contains(t) || p.split('/').any(|seg| seg == t))
+        {
+            named.push(h);
+        } else {
+            rest.push(h);
+        }
+    }
+    if named.is_empty() {
+        *out = rest;
+        return;
+    }
+    named.extend(rest);
+    *out = named;
+}
+
+fn is_generic_path_token(t: &str) -> bool {
+    matches!(
+        t,
+        "src"
+            | "lib"
+            | "crates"
+            | "channel"
+            | "tools"
+            | "agent"
+            | "session"
+            | "hyper"
+            | "loop"
+            | "test"
+            | "tests"
+            | "code"
+            | "main"
+            | "mod"
+            | "index"
+    )
 }
 
 fn row_to_hit(row: &rusqlite::Row<'_>) -> rusqlite::Result<Hit> {
@@ -585,16 +818,16 @@ fn row_to_hit(row: &rusqlite::Row<'_>) -> rusqlite::Result<Hit> {
 }
 
 fn render_hits(hits: &[Hit], cap: usize) -> String {
-    // This tiny result-local hint replaces a standing prompt lecture. Exact,
-    // bounded spans should normally be consumed before another grep round.
-    let mut out = String::from("[index] bounded spans; grep only if evidence is missing.\n");
+    let mut out = String::new();
     let mut wrote_hit = false;
     for h in hits {
         let block = format_hit(h);
         if wrote_hit && out.chars().count() + block.chars().count() > cap {
             break;
         }
-        out.push('\n');
+        if wrote_hit {
+            out.push('\n');
+        }
         out.push_str(&block);
         wrote_hit = true;
     }
@@ -656,7 +889,12 @@ fn upsert_file_tx(tx: &Transaction<'_>, path: &str, content: &str, stamp: (i64, 
 }
 
 fn format_hit(h: &Hit) -> String {
-    let mut s = format!("## {}:{}-{}\n", h.path, h.start, h.end);
+    let def = h.body.lines().next().is_some_and(is_def_line);
+    let mut s = if def {
+        format!("## [def] {}:{}-{}\n", h.path, h.start, h.end)
+    } else {
+        format!("## {}:{}-{}\n", h.path, h.start, h.end)
+    };
     for (i, line) in h.body.lines().enumerate() {
         s.push_str(&format!("{:>6}|{}\n", h.start as usize + i, line));
     }
@@ -684,8 +922,18 @@ fn chunk_file(content: &str) -> Vec<Chunk> {
         }
     }
     bounds.push(n);
+    let mut starts: Vec<usize> = Vec::with_capacity(bounds.len());
+    for (idx, &b) in bounds.iter().enumerate() {
+        if idx == bounds.len() - 1 {
+            starts.push(n);
+            break;
+        }
+        let pulled = item_prefix_start(&lines, b);
+        let floor = starts.last().copied().unwrap_or(0);
+        starts.push(pulled.max(floor));
+    }
     let mut out = Vec::new();
-    for w in bounds.windows(2) {
+    for w in starts.windows(2) {
         let mut a = w[0];
         let b = w[1];
         while a < b {
@@ -708,6 +956,30 @@ fn chunk_file(content: &str) -> Vec<Chunk> {
         }
     }
     out
+}
+
+/// Doc comments and attributes belong to the *next* item, not the previous
+/// `const`/`fn` span. Otherwise Search hits a one-line `const STREAM_ROTATE`
+/// and the model Opens the file just to read the comment above it.
+fn item_prefix_start(lines: &[&str], def: usize) -> usize {
+    let mut i = def;
+    while i > 0 {
+        let prev = lines[i - 1];
+        if is_def_line(prev) {
+            break;
+        }
+        let t = prev.trim_start();
+        if t.starts_with("///")
+            || t.starts_with("//!")
+            || t.starts_with("#[")
+            || t.starts_with("#!")
+        {
+            i -= 1;
+            continue;
+        }
+        break;
+    }
+    i
 }
 
 fn is_def_line(line: &str) -> bool {
@@ -853,7 +1125,26 @@ fn skip_rel(rel: &Path) -> bool {
     if s.starts_with("eval/nightly/work/") {
         return true;
     }
+    if hyper_overlay_skipped(&s) {
+        return true;
+    }
     s.split('/').any(|c| SKIP_DIR.contains(&c))
+}
+
+fn hyper_overlay_skipped(s: &str) -> bool {
+    let Some(rest) = s.strip_prefix(".grok-hyper/") else {
+        return false;
+    };
+    let first = rest.split('/').next().unwrap_or("");
+    HYPER_SKIP_DIR.contains(&first)
+}
+
+fn skip_index_dir(name: &str, parent_rel: &str) -> bool {
+    if SKIP_DIR.contains(&name) {
+        return true;
+    }
+    let under = parent_rel == ".grok-hyper" || parent_rel.starts_with(".grok-hyper/");
+    under && HYPER_SKIP_DIR.contains(&name)
 }
 
 struct ScanBudget {
@@ -1009,6 +1300,17 @@ fn collect_nested_git_files(root: &Path, budget: &ScanBudget) -> Vec<PathBuf> {
     out
 }
 
+/// `.grok-hyper/` is gitignored; overnight scripts still need Search hits.
+fn collect_hyper_overlay_files(root: &Path, budget: &ScanBudget) -> Vec<PathBuf> {
+    let overlay = root.join(".grok-hyper");
+    if !overlay.is_dir() {
+        return Vec::new();
+    }
+    let mut out = Vec::new();
+    walk_dir(root, &overlay, &mut out, budget);
+    out
+}
+
 const NESTED_GIT_DEPTH: usize = 8;
 
 fn walk_nested_git(
@@ -1036,7 +1338,11 @@ fn walk_nested_git(
         if !ft.is_dir() {
             continue;
         }
-        if SKIP_DIR.contains(&name_s.as_ref()) {
+        let parent_rel = dir
+            .strip_prefix(root)
+            .map(|p| p.to_string_lossy().replace('\\', "/"))
+            .unwrap_or_default();
+        if skip_index_dir(name_s.as_ref(), &parent_rel) {
             continue;
         }
         let path = entry.path();
@@ -1090,7 +1396,11 @@ fn walk_dir(root: &Path, dir: &Path, out: &mut Vec<PathBuf>, budget: &ScanBudget
             continue;
         };
         if ft.is_dir() {
-            if SKIP_DIR.contains(&name_s.as_ref()) {
+            let parent_rel = dir
+                .strip_prefix(root)
+                .map(|p| p.to_string_lossy().replace('\\', "/"))
+                .unwrap_or_default();
+            if skip_index_dir(name_s.as_ref(), &parent_rel) {
                 continue;
             }
             if super::path::is_reparse_or_symlink(&path) {
@@ -1128,25 +1438,105 @@ fn fts_query(raw: &str) -> String {
 }
 
 fn search_tokens(raw: &str) -> Vec<String> {
+    if let Some(s) = signature_query_ident(raw) {
+        return vec![s];
+    }
     let all: Vec<String> = fts_tokens(raw)
         .into_iter()
-        .filter(|t| t.chars().count() > 1)
+        .filter(|t| keep_search_token(t))
         .collect();
     let idents: Vec<String> = all.iter().filter(|t| is_ident(t)).cloned().collect();
     if !idents.is_empty() {
         return idents;
     }
-    all.into_iter().filter(|t| !is_stopword(t)).collect()
-}
-
-fn ident_tokens(raw: &str) -> Vec<String> {
-    fts_tokens(raw)
-        .into_iter()
-        .filter(|t| is_ident(t))
+    all.into_iter()
+        .filter(|t| !is_stopword(t) && !is_syntax_kw(t))
         .collect()
 }
 
+fn ident_tokens(raw: &str) -> Vec<String> {
+    let mut tokens: Vec<String> = fts_tokens(raw)
+        .into_iter()
+        .filter(|t| is_ident(t))
+        .collect();
+    if let Some(s) = signature_query_ident(raw) {
+        if !tokens.iter().any(|t| t == &s) {
+            tokens.insert(0, s);
+        }
+    }
+    tokens
+}
+
+/// `Search("pub(crate) async fn send")` should look up `send`, not AND/OR
+/// visibility keywords. Reuses the same vis-strip as `symbol_of`.
+fn signature_query_ident(raw: &str) -> Option<String> {
+    let t = raw.trim();
+    if t.is_empty() || t.len() > 200 || !signature_kind(t) {
+        return None;
+    }
+    let s = symbol_of(t);
+    if s.len() < 2 || is_syntax_kw(&s) {
+        return None;
+    }
+    Some(s)
+}
+
+fn signature_kind(t: &str) -> bool {
+    let lower = t.to_ascii_lowercase();
+    [
+        "fn ",
+        "fn(",
+        "def ",
+        "function ",
+        "struct ",
+        "enum ",
+        "impl ",
+        "trait ",
+        "class ",
+        "interface ",
+        "const ",
+        "static ",
+        "mod ",
+        "type ",
+        "macro_rules",
+    ]
+    .iter()
+    .any(|k| lower.contains(k))
+}
+
+fn is_syntax_kw(t: &str) -> bool {
+    matches!(
+        t.to_ascii_lowercase().as_str(),
+        "pub"
+            | "crate"
+            | "async"
+            | "await"
+            | "fn"
+            | "def"
+            | "function"
+            | "struct"
+            | "enum"
+            | "impl"
+            | "trait"
+            | "mod"
+            | "type"
+            | "class"
+            | "const"
+            | "static"
+            | "export"
+            | "unsafe"
+            | "interface"
+            | "let"
+            | "mut"
+            | "use"
+            | "return"
+    )
+}
+
 fn is_ident(t: &str) -> bool {
+    if is_syntax_kw(t) {
+        return false;
+    }
     t.contains('_')
         || t.contains('/')
         || (t.chars().any(|c| c.is_ascii_uppercase())
@@ -1318,6 +1708,14 @@ fn fts_tokens(raw: &str) -> Vec<String> {
     tokens
 }
 
+fn keep_search_token(t: &str) -> bool {
+    let n = t.chars().count();
+    if t.chars().any(is_cjk) {
+        return n >= 2;
+    }
+    n >= 3
+}
+
 fn is_cjk(c: char) -> bool {
     matches!(
         c,
@@ -1366,6 +1764,32 @@ mod tests {
     }
 
     #[test]
+    fn chunk_keeps_doc_comment_with_following_item() {
+        let src = concat!(
+            "const MAX: usize = 1;\n",
+            "/// rotate early so a long turn keeps a think bubble\n",
+            "const STREAM_ROTATE: usize = 2;\n",
+        );
+        let ch = chunk_file(src);
+        let rot = ch
+            .iter()
+            .find(|c| c.symbol == "STREAM_ROTATE")
+            .expect("STREAM_ROTATE chunk");
+        assert!(
+            rot.body.contains("rotate early"),
+            "doc should ride with the next item: {}",
+            rot.body
+        );
+        assert!(rot.body.contains("STREAM_ROTATE"));
+        let max = ch.iter().find(|c| c.symbol == "MAX").expect("MAX chunk");
+        assert!(
+            !max.body.contains("rotate early"),
+            "previous const must not steal the next item's docs: {}",
+            max.body
+        );
+    }
+
+    #[test]
     fn search_returns_span_not_whole_file() {
         let (dir, ws) = scratch();
         let idx = CodeIndex::build(ws.root());
@@ -1384,7 +1808,7 @@ mod tests {
             name: "search".into(),
             arguments: json!({"query": "upgrade_medium"}),
         };
-        let out = run_search(&idx, &call, ToolLimits::default());
+        let out = run_search(&idx, &ws, &call, ToolLimits::default());
         let text = out.joined_text();
         assert!(text.contains("## "), "{text}");
         assert!(text.contains("|"), "{text}");
@@ -1393,17 +1817,129 @@ mod tests {
     }
 
     #[test]
-    fn empty_index_search_points_at_grep() {
+    fn search_ranks_production_ahead_of_tests_rs() {
+        let dir = std::env::temp_dir().join(format!("hyper-idx-{}", uuid::Uuid::new_v4().simple()));
+        std::fs::create_dir_all(dir.join("src")).unwrap();
+        std::fs::write(
+            dir.join("src/tests.rs"),
+            "fn zh_think_keep() { /* unit test double */ }\n",
+        )
+        .unwrap();
+        std::fs::write(
+            dir.join("src/progress.rs"),
+            "fn zh_think_keep(line: &str) -> bool { line.chars().any(|c| c as u32 > 127) }\n",
+        )
+        .unwrap();
+        let ws = Workspace::open(&dir, true).unwrap();
+        let idx = CodeIndex::build(ws.root());
+        let hits = idx.search("zh_think_keep", None, 8);
+        assert!(!hits.is_empty(), "{hits:?}");
+        assert!(
+            hits[0].path.contains("progress.rs"),
+            "production span should lead, got {:?}",
+            hits.iter().map(|h| &h.path).collect::<Vec<_>>()
+        );
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn search_ranks_ident_span_ahead_of_unrelated_prose() {
+        let dir = std::env::temp_dir().join(format!("hyper-idx-{}", uuid::Uuid::new_v4().simple()));
+        std::fs::create_dir_all(dir.join("src")).unwrap();
+        std::fs::write(
+            dir.join("src/memory.rs"),
+            "#[cfg(test)]\nmod tests {\n    #[test]\n    fn hot_card_skips_local_questions() {\n        let timeout = 1;\n        assert_eq!(timeout, 1);\n    }\n}\n",
+        )
+        .unwrap();
+        std::fs::write(
+            dir.join("src/timeout.rs"),
+            "pub struct Deadlines { pub kill_at: Option<u64> }\nfn arm_kill_deadline() { let kill_at = 1; }\n",
+        )
+        .unwrap();
+        let ws = Workspace::open(&dir, true).unwrap();
+        let idx = CodeIndex::build(ws.root());
+        let hits = idx.search("kill_at Shell background timeout", None, 8);
+        assert!(!hits.is_empty(), "{hits:?}");
+        assert!(
+            hits[0].path.contains("timeout.rs"),
+            "kill_at span should lead, got {:?}",
+            hits.iter()
+                .map(|h| (&h.path, h.body.chars().take(40).collect::<String>()))
+                .collect::<Vec<_>>()
+        );
+        assert!(hits[0].body.contains("kill_at"), "{}", hits[0].body);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn search_ranks_impl_ahead_of_tool_schema_json() {
+        let dir = std::env::temp_dir().join(format!("hyper-idx-{}", uuid::Uuid::new_v4().simple()));
+        std::fs::create_dir_all(dir.join("src")).unwrap();
+        std::fs::write(
+            dir.join("src/schema.rs"),
+            concat!(
+                "const SHELL: &str = r#\"",
+                r#"{"type":"function","function":{"name":"Shell","description":"background timeout","parameters":{}}}"#,
+                "\"#;\n",
+            ),
+        )
+        .unwrap();
+        std::fs::write(
+            dir.join("src/timeout.rs"),
+            "fn arm_kill_deadline() { let kill_at = 1; let background = true; }\n",
+        )
+        .unwrap();
+        let ws = Workspace::open(&dir, true).unwrap();
+        let idx = CodeIndex::build(ws.root());
+        let hits = idx.search("shell background timeout", None, 8);
+        assert!(!hits.is_empty(), "{hits:?}");
+        assert!(
+            hits[0].path.contains("timeout.rs"),
+            "impl span should lead schema JSON, got {:?}",
+            hits.iter().map(|h| &h.path).collect::<Vec<_>>()
+        );
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn empty_index_search_does_not_steer_to_grep() {
+        let (dir, ws) = scratch();
         let idx = CodeIndex::empty();
         let call = ToolCall {
             id: "t".into(),
             name: "search".into(),
             arguments: json!({"query": "nothing-here"}),
         };
-        let out = run_search(&idx, &call, ToolLimits::default());
+        let out = run_search(&idx, &ws, &call, ToolLimits::default());
         let text = out.joined_text();
         assert!(text.contains("No matches"), "{text}");
-        assert!(text.contains("Grep"), "{text}");
+        assert!(text.contains("warming"), "{text}");
+        assert!(!text.contains("Glob"), "{text}");
+        assert!(!text.contains("Grep"), "{text}");
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn workspace_root_path_does_not_hide_hits() {
+        let (dir, ws) = scratch();
+        let idx = CodeIndex::build(ws.root());
+        let call = ToolCall {
+            id: "t".into(),
+            name: "search".into(),
+            arguments: json!({
+                "query": "upgrade_medium",
+                "path": ws.root().display().to_string(),
+            }),
+        };
+        let text = run_search(&idx, &ws, &call, ToolLimits::default()).joined_text();
+        assert!(text.contains("upgrade_medium"), "{text}");
+        assert_eq!(search_path_filter(&ws, Some(".")), None);
+        assert_eq!(
+            search_path_filter(&ws, Some(ws.root().to_str().unwrap())),
+            None
+        );
+        assert_eq!(search_path_filter(&ws, Some("src")), Some("src".into()));
+        let _ = std::fs::remove_dir_all(dir);
     }
 
     #[test]
@@ -1479,6 +2015,44 @@ mod tests {
     }
 
     #[test]
+    fn empty_path_filter_widens_to_workspace() {
+        let (dir, ws) = scratch();
+        let idx = CodeIndex::build(ws.root());
+        let miss = ToolCall {
+            id: "t".into(),
+            name: "search".into(),
+            arguments: json!({
+                "query": "upgrade_medium",
+                "path": "crates/hyper-cli/src/channels.rs",
+            }),
+        };
+        let out = run_search(&idx, &ws, &miss, ToolLimits::default());
+        let text = out.joined_text();
+        assert!(
+            text.contains("Nothing under `crates/hyper-cli/src/channels.rs`"),
+            "{text}"
+        );
+        assert!(text.contains("upgrade_medium"), "{text}");
+        assert!(!text.starts_with("No matches"), "{text}");
+        let hit = ToolCall {
+            id: "t2".into(),
+            name: "search".into(),
+            arguments: json!({
+                "query": "upgrade_medium",
+                "path": "src",
+            }),
+        };
+        let scoped = run_search(&idx, &ws, &hit, ToolLimits::default());
+        let scoped_text = scoped.joined_text();
+        assert!(
+            !scoped_text.contains("Nothing under"),
+            "hits in the named path must stay scoped: {scoped_text}"
+        );
+        assert!(scoped_text.contains("upgrade_medium"), "{scoped_text}");
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
     fn nl_query_strips_stopwords() {
         let (dir, ws) = scratch();
         let idx = CodeIndex::build(ws.root());
@@ -1492,6 +2066,112 @@ mod tests {
     }
 
     #[test]
+    fn signature_query_strips_vis_and_fn() {
+        assert_eq!(
+            ident_tokens("pub(crate) async fn send"),
+            vec!["send".to_string()]
+        );
+        assert_eq!(
+            search_tokens("pub(crate) async fn send"),
+            vec!["send".to_string()]
+        );
+        assert_eq!(
+            ident_tokens("pub async fn send_progress"),
+            vec!["send_progress".to_string()]
+        );
+        assert!(ident_tokens("where is the think cap").is_empty());
+        assert!(
+            !search_tokens("中文 IM 滤英文思考")
+                .iter()
+                .any(|t| t.eq_ignore_ascii_case("im")),
+            "two-letter IM must not OR-match every chat comment: {:?}",
+            search_tokens("中文 IM 滤英文思考")
+        );
+    }
+
+    #[test]
+    fn cjk_nl_query_ranks_keep_fn_over_im_card() {
+        let dir = std::env::temp_dir().join(format!("hyper-idx-{}", uuid::Uuid::new_v4().simple()));
+        std::fs::create_dir_all(dir.join("src")).unwrap();
+        std::fs::write(
+            dir.join("src/sticky.rs"),
+            "pub const IM_CARD_ZH: &str = \"[im] 即时消息。思考过程和回复都必须用中文。不要用英文写思考。\";\n",
+        )
+        .unwrap();
+        std::fs::write(
+            dir.join("src/progress.rs"),
+            "/// 中文 IM 滤英文思考：只保留 CJK 占优的行和片段\nfn zh_think_keep(s: &str) -> String { s.into() }\n",
+        )
+        .unwrap();
+        let ws = Workspace::open(&dir, true).unwrap();
+        let idx = CodeIndex::build(ws.root());
+        let hits = idx.search("中文 IM 滤英文思考", None, 8);
+        assert!(!hits.is_empty(), "{hits:?}");
+        assert!(
+            hits[0].path.contains("progress.rs"),
+            "CJK locate must open the filter fn, not the IM card: {:?}",
+            hits.iter().map(|h| &h.path).collect::<Vec<_>>()
+        );
+        assert!(hits[0].body.contains("zh_think_keep"), "{:?}", hits[0].body);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn signature_query_finds_pub_async_fn_not_vis_noise() {
+        let dir = std::env::temp_dir().join(format!("hyper-idx-{}", uuid::Uuid::new_v4().simple()));
+        std::fs::create_dir_all(dir.join("src")).unwrap();
+        std::fs::write(
+            dir.join("src/noise.rs"),
+            "pub(crate) async fn other() { let crate_async = 1; }\n",
+        )
+        .unwrap();
+        std::fs::write(
+            dir.join("src/wecom.rs"),
+            "pub async fn send(text: &str) { let _ = text; }\n",
+        )
+        .unwrap();
+        let ws = Workspace::open(&dir, true).unwrap();
+        let idx = CodeIndex::build(ws.root());
+        let hits = idx.search("pub(crate) async fn send", None, 8);
+        assert!(
+            hits.iter()
+                .any(|h| h.path.contains("wecom.rs") && h.body.contains("fn send")),
+            "pub async fn send should match pub(crate) async fn send: {hits:?}"
+        );
+        assert!(
+            hits.iter().all(|h| h.body.contains("send")),
+            "visibility keywords must not rank crate/async noise: {hits:?}"
+        );
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn named_path_in_query_ranks_that_file_first() {
+        let dir = std::env::temp_dir().join(format!("hyper-idx-{}", uuid::Uuid::new_v4().simple()));
+        std::fs::create_dir_all(dir.join("src")).unwrap();
+        std::fs::write(
+            dir.join("src/qq.rs"),
+            "pub async fn send_typing(chat: &str) { let _ = chat; }\n",
+        )
+        .unwrap();
+        std::fs::write(
+            dir.join("src/wechat.rs"),
+            "pub async fn send_typing(chat: &str) { let _ = chat; }\n",
+        )
+        .unwrap();
+        let ws = Workspace::open(&dir, true).unwrap();
+        let idx = CodeIndex::build(ws.root());
+        let hits = idx.search("send_typing wechat", None, 8);
+        assert!(!hits.is_empty(), "{hits:?}");
+        assert!(
+            hits[0].path.contains("wechat.rs"),
+            "named path should lead: {:?}",
+            hits.iter().map(|h| &h.path).collect::<Vec<_>>()
+        );
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
     fn filename_query_finds_path() {
         let (dir, ws) = scratch();
         let idx = CodeIndex::build(ws.root());
@@ -1499,6 +2179,66 @@ mod tests {
         assert!(
             hits.iter().any(|h| h.path.ends_with("policy.rs")),
             "{hits:?}"
+        );
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn search_indexes_overnight_overlay() {
+        let (dir, ws) = scratch();
+        let overnight = dir.join(".grok-hyper/overnight");
+        std::fs::create_dir_all(&overnight).unwrap();
+        std::fs::write(
+            overnight.join("hops.py"),
+            "A hop is an `assistant` event whose `tool_calls` list is non-empty.\n",
+        )
+        .unwrap();
+        std::fs::create_dir_all(dir.join(".grok-hyper/sessions")).unwrap();
+        std::fs::write(dir.join(".grok-hyper/sessions/sid.py"), "tool_calls = []\n").unwrap();
+        let idx = CodeIndex::build(ws.root());
+        let by_name = idx.search("hops.py", None, 8);
+        assert!(
+            by_name.iter().any(|h| h
+                .path
+                .replace('\\', "/")
+                .ends_with(".grok-hyper/overnight/hops.py")),
+            "filename Search must see overlay: {by_name:?}"
+        );
+        let by_body = idx.search("tool_calls", None, 8);
+        assert!(
+            by_body
+                .iter()
+                .any(|h| h.path.replace('\\', "/").contains("overnight/hops.py")),
+            "body Search must see overlay: {by_body:?}"
+        );
+        assert!(
+            by_body
+                .iter()
+                .all(|h| !h.path.replace('\\', "/").contains("sessions/")),
+            "session dumps must stay out: {by_body:?}"
+        );
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn search_indexes_gitignored_overnight_in_git_workspace() {
+        let (dir, ws) = scratch();
+        let overnight = dir.join(".grok-hyper/overnight");
+        std::fs::create_dir_all(&overnight).unwrap();
+        std::fs::write(
+            overnight.join("hops.py"),
+            "def load_events(path):\n    pass\n",
+        )
+        .unwrap();
+        git_init(ws.root());
+        let idx = CodeIndex::build(ws.root());
+        let hits = idx.search("hops.py", None, 8);
+        assert!(
+            hits.iter().any(|h| h
+                .path
+                .replace('\\', "/")
+                .contains(".grok-hyper/overnight/hops.py")),
+            "git ls-files must not hide overlay scripts: {hits:?}"
         );
         let _ = std::fs::remove_dir_all(dir);
     }
@@ -1551,6 +2291,24 @@ mod tests {
     }
 
     #[test]
+    fn referrer_hint_skips_hyper_overlay() {
+        let (dir, ws) = scratch();
+        std::fs::write(
+            dir.join("src/call.rs"),
+            "fn other() {\n    upgrade_medium();\n}\n",
+        )
+        .unwrap();
+        let idx = CodeIndex::build(ws.root());
+        assert!(idx
+            .referrer_hint(
+                ".grok-hyper/overnight/score_all.py",
+                "fn upgrade_medium(&mut self) {"
+            )
+            .is_none());
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
     fn exact_identifier_does_not_fill_with_background_words() {
         let (dir, ws) = scratch();
         std::fs::write(
@@ -1595,6 +2353,9 @@ mod tests {
         assert!(skip_rel(Path::new("OneDrive/docs.rs")));
         assert!(skip_rel(Path::new("Downloads/setup.rs")));
         assert!(!skip_rel(Path::new("src/foo.rs")));
+        assert!(!skip_rel(Path::new(".grok-hyper/overnight/hops.py")));
+        assert!(skip_rel(Path::new(".grok-hyper/sessions/sid.jsonl")));
+        assert!(skip_rel(Path::new(".grok-hyper/blobs/ab")));
     }
 
     #[test]

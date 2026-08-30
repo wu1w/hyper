@@ -1,6 +1,6 @@
 /** Workspace / uploaded media for the console. Backend `/api/files` is the gate. */
 
-import type { Uploaded } from "./api";
+import type { Uploaded } from "./api.ts";
 
 export type StoredMedia = {
   kind: string;

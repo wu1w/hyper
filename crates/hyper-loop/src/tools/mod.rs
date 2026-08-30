@@ -12,6 +12,7 @@ mod find;
 mod fold;
 mod fs;
 mod media_exec;
+mod notebook;
 mod path;
 mod run_code;
 mod todo;
@@ -30,7 +31,11 @@ use crate::tool_calls::{CancelFlag, TextBlock, ToolCall, ToolResponse, ToolState
 /// is not deleted. Same-pid temps are never removed here (`TmpGuard` owns those).
 pub(super) const STALE_TMP_MAX_AGE: Duration = Duration::from_secs(300);
 
-pub use code_index::{bash_search_query, run_search, search_dump_too_big, CodeIndex};
+pub(crate) use bash::cat_like_path;
+pub use code_index::{
+    bash_search_query, render_query_spans, run_search, search_dump_too_big, CodeIndex,
+    SEARCH_WARMING,
+};
 pub use fold::{fold_text, BlobStore, Folded};
 pub use path::{is_reparse_or_symlink, Workspace};
 pub use view::view;
@@ -143,6 +148,7 @@ pub async fn run_tool(
             )
             .await
         }
+        "editnotebook" => notebook::edit_notebook(workspace, call),
         "bash" => bash::bash(workspace, call, cancel, limits, blobs).await,
         "run_code" => run_code::run_code(workspace, call, cancel, limits, inherit_env, blobs).await,
         "view" => {
@@ -191,6 +197,15 @@ pub(crate) fn arg_str(args: &Value, key: &str) -> Option<String> {
     }
 }
 
+pub(crate) fn arg_str_any(args: &Value, keys: &[&str]) -> Option<String> {
+    keys.iter()
+        .find_map(|key| arg_str(args, key))
+        .and_then(|s| {
+            let t = s.trim().trim_matches('"').to_string();
+            (!t.is_empty() && t != "null").then_some(t)
+        })
+}
+
 /// Frozen schema is `path`.
 pub(crate) fn arg_path(args: &Value) -> Option<String> {
     arg_str(args, "path")
@@ -209,6 +224,19 @@ pub(crate) fn arg_u32(args: &Value, key: &str) -> Option<u32> {
     match args.get(key) {
         Some(Value::Number(n)) => n.as_u64().map(|v| v as u32),
         Some(Value::String(s)) => s.parse().ok(),
+        _ => None,
+    }
+}
+
+pub(crate) fn arg_bool(args: &Value, key: &str) -> Option<bool> {
+    match args.get(key) {
+        Some(Value::Bool(b)) => Some(*b),
+        Some(Value::String(s)) => match s.trim().to_ascii_lowercase().as_str() {
+            "true" | "1" | "yes" => Some(true),
+            "false" | "0" | "no" => Some(false),
+            _ => None,
+        },
+        Some(Value::Number(n)) => Some(n.as_u64() == Some(1) || n.as_i64() == Some(1)),
         _ => None,
     }
 }
@@ -343,6 +371,29 @@ mod tests {
         assert!(!rtext.contains("X"), "{rtext}");
         assert!(rtext.contains("1|x"), "{rtext}");
         assert!(rtext.contains("3|x"), "{rtext}");
+        let e = fs::edit_file(
+            &ws,
+            &call(
+                "edit",
+                json!({
+                    "path": "a.txt",
+                    "old_string": "x",
+                    "new_string": "X",
+                    "replace_all": true
+                }),
+            ),
+        );
+        assert_eq!(e.state, ToolState::Success, "{}", e.joined_text());
+        let r = fs::read_file(
+            &ws,
+            &call("read", json!({"path": "a.txt"})),
+            ToolLimits::default(),
+            None,
+        );
+        let rtext = r.joined_text();
+        assert!(rtext.contains("1|X"), "{rtext}");
+        assert!(rtext.contains("3|X"), "{rtext}");
+        assert!(!rtext.contains("1|x"), "{rtext}");
         let _ = std::fs::remove_dir_all(dir);
     }
 

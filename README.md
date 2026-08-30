@@ -2,7 +2,7 @@
 
 grok-4.6 的 Cursor 形 agent harness。CLI 二进制是 `hyper`，配置在 `~/.grok-hyper/`。
 
-默认模型 **grok-4.6**。`grok login` 会话和 xAI API key 走 Responses API；自定义 `base_url` 走 OpenAI 兼容 Chat Completions。发给模型的工具名对齐 Cursor：Read / Write / StrReplace / Delete / Glob / Grep / Shell / WebSearch / WebFetch / TodoWrite / AskQuestion / Task / AwaitShell。
+默认模型 **grok-4.6**。`grok login` 会话和 xAI API key 走 Responses API；自定义 `base_url` 走 OpenAI 兼容 Chat Completions。发给模型的工具名对齐 Cursor：Read / Write / StrReplace / Delete / Glob / Grep / ReadLints / EditNotebook / Shell / WebSearch / WebFetch / GenerateImage / TodoWrite / AskQuestion / SwitchMode / Task / AwaitShell。配置 MCP 后额外挂载 `GetDynamicTools` / `CallDynamicTool` / `FetchMcpResource`，server 工具在运行时发现，不再暴露单个 `mcp` blob。
 
 `Task` 默认 `isolation=auto`（空也是 auto），和 `none` 一样共用父工作区：未提交的文稿和孩子的 Write 都还在用户正在看的目录。只有显式 `isolation=worktree` 才建 git worktree（从当前 HEAD 检出，看不见未提交改动）；跑完目录留在 `~/.grok-hyper/worktrees/<id>`，SUMMARY 里带 `WORKTREE` 路径，resume 用当时记下的 isolation（漏参数不会掉回 auto）。崩溃且没写完 keep 标记的目录，下次 Task 会 prune。孩子走父的审批 / AskQuestion 通道。`/fork --worktree` 仍然只拷会话，不建 git worktree。
 
@@ -53,12 +53,12 @@ hyper web
 | 工作区 | 会话 | 历史 JSONL、切换、删除 |
 | 工作区 | 技能 | `SKILL.md` 目录 |
 | 工作区 | MCP | 外部 MCP 进程 |
-| 工作区 | 工具 | 冻结 tools[]。名字应对齐 Cursor：Read / Write / StrReplace / Shell / Grep / Glob / WebSearch / WebFetch / TodoWrite / AskQuestion / Task |
+| 工作区 | 工具 | 稳定 tools[]。名字对齐 Cursor（含 ReadLints / EditNotebook / GenerateImage / SwitchMode）；MCP 使用 GetDynamicTools / CallDynamicTool / FetchMcpResource |
 | 底栏 | 模型 | 三路接入、模型名、窗口、步数 |
 | 底栏 | 安全 | 审批档位 |
 | 底栏 | 用量 | token / 缓存命中 / 200k 价格悬崖 |
 
-文件页可以粘贴绝对路径或 `~/…`，或用系统选择 / 浏览。快捷方式指向主目录、桌面、文稿、下载。换目录会写入 `~/.grok-hyper/config.toml` 的 `[console] workspace`。这里不做迷你 IDE：改文稿走聊天里的 Write / StrReplace。
+文件页可以粘贴绝对路径或 `~/…`，或用系统选择 / 浏览。快捷方式指向主目录、桌面、文稿、下载。换目录会写入 `~/.grok-hyper/config.toml` 的 `[console] workspace`，以及当前会话 JSONL 的 `session/start.workspace`（否则重启 / 恢复会回到旧目录）。这里不做迷你 IDE：改文稿走聊天里的 Write / StrReplace。
 
 默认 ask：写文件、跑命令会先问。可在聊天或安全页改成自动 / yolo。这是本机控制台，不是沙箱产品。
 
@@ -71,7 +71,8 @@ hyper web                         # 控制台（主入口）
 hyper --print "总结这份文稿"       # 一次性跑完打到 stdout
 hyper                             # 在 TTY 且没有 prompt 时开 TUI
 hyper probe                       # 探测端点能力，写 probe.json
-hyper --sidecar                   # stdio JSON-RPC（给可选 dsh 插件用）
+hyper --sidecar                   # stdio JSON-RPC（给可选 dsh / VS Code 插件用）
+hyper vscode-install              # 可选：装 VS Code / Cursor 侧栏扩展
 ```
 
 全局 `--workspace` 指定根目录。`--print` 适合脚本；日常请用 `hyper web`。
@@ -91,7 +92,7 @@ hyper --sidecar                   # stdio JSON-RPC（给可选 dsh 插件用）
 - `[web]` 搜索工具（无 key 也能用；有 Tavily key 自动升级）
 - `[mcp]` / 技能目录 overlay
 
-工作区还可以放 `AGENT.md`（人设）、`.grok-hyper/skills`、`.grok-hyper/mcp.toml`。
+人设只认 `~/.grok-hyper/AGENT.md`。工作区 `USER.md` / `SOUL.md` / `AGENT.md` 当项目文档，不会改名字。工作区还可以放 `.grok-hyper/skills`、`.grok-hyper/mcp.toml`。
 
 ## 改控制台前端
 
@@ -102,6 +103,10 @@ cd web/console && npm install && npm run build
 ```
 
 再重启 `hyper web`。开发时 `npm run dev` 会把 `/api` 代理到本机 3848。
+
+## 可选：VS Code / Cursor
+
+`hyper vscode-install` 把侧栏 Chat 接到编辑器，Write / StrReplace 用 `vscode.diff` 打开。工具循环仍是 `hyper --sidecar`，不是第二套 agent，也不是 fork VS Code。说明见 [`plugins/vscode-hyper/README.md`](plugins/vscode-hyper/README.md)。
 
 ## 可选：dsh 插件
 

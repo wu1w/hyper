@@ -1,6 +1,6 @@
 //! `ComputerUse` — screenshot + mouse/keyboard on the machine running Hyper.
 //!
-//! Extra tool (not in the frozen Cursor 13). Coordinates are in the last
+//! Extra tool (not in the core Cursor-shaped set). Coordinates are in the last
 //! screenshot's pixel space (top-left origin). macOS needs Screen Recording
 //! (screenshot) and Accessibility (input). Windows needs an interactive
 //! desktop session. Linux returns a clear error: not supported.

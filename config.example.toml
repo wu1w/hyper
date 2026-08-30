@@ -28,7 +28,7 @@ agents_md_max_tokens = 400     # fail-closed; --agents-md-head clips instead of 
 
 [prompt]
 coding = false                 # unused; builtin identity is one agent contract
-file = "AGENT.md"              # workspace first, then ~/.grok-hyper/AGENT.md
+file = "AGENT.md"              # ~/.grok-hyper/AGENT.md only; workspace USER.md/AGENT.md are not persona
 narrate = true                 # TUI/web Qwen: one-line progress card. grok-4.6 / Responses ignores this (Cursor: empty tool-hop text).
 
 [policy]
@@ -37,7 +37,7 @@ default_effort = "auto"        # grok-4.6 → xhigh; Qwen still medium. /think s
 max_think_tokens_low = 512
 max_think_tokens_medium = 2048
 max_think_tokens_xhigh = 4096
-max_steps = 80                 # TUI / web console
+max_steps = 500                # TUI / web console (same as IM so long tasks close)
 max_steps_think = 100
 max_wall_seconds = 1800        # interactive hard cap from turn start; 0 = off
 max_steps_unattended = 500     # IM / --channels (Hermes max_turns)
@@ -50,11 +50,15 @@ tui = false
 skills_auto_catalog = false
 mcp_auto_catalog = false
 workspace_write_only = true  # writes stay in workspace; Read/Glob/Grep/Shell can use absolute paths
-# TUI: ask (prompt writes/bash) | auto (edits pass, bash prompts) | yolo
+# TUI/console: ask (prompt writes/bash) | auto (edits pass, bash prompts) | yolo
+# IM also defaults to ask. YOLO only via `/approvals yolo` (persists in
+# ~/.grok-hyper/sessions/<id>.controls.json).
 approvals = "ask"
-# Extra tool: screenshot + mouse/keyboard on the machine running Hyper (Windows / macOS).
-# Not in the frozen Cursor 13. Click/type prompt in ask/auto; screenshot does not.
-computer_use = true
+# Extra tools, not in the frozen Cursor 17. Default off so tools[] stays 17.
+# computer_use: screenshot + mouse/keyboard (Windows / macOS).
+# code_search: workspace FTS Search. Grep / Glob / Read are already in the 17.
+computer_use = false
+code_search = false
 
 [sidecar]
 transport = "stdio-jsonrpc"
@@ -73,7 +77,7 @@ timeout_s = 60
 inherit_env = true
 
 # [media]
-# enabled = true
+# enabled = false              # extra view() tool; default off, not in frozen 17
 # max_bytes = 2097152          # inline image freeze cap (2 MB)
 # ffmpeg = ""                  # optional; else PATH / HYPER_FFMPEG (ffmpeg.exe on Windows)
 # whisper = ""                 # whisper-cli; else PATH / HYPER_WHISPER
@@ -95,8 +99,10 @@ timeout_s = 12
 max_results = 5
 fetch_max_bytes = 2000000
 
-# Console Files page. `hyper web` (without --workspace) reopens this folder.
-# Empty / omitted = process cwd. Changing the folder in the UI writes this back.
+# Console Files page and new chats. Switching the folder in the UI also
+# rewrites this session's JSONL `session/start.workspace` so resume keeps it.
+# `hyper web --workspace PATH` writes that folder into the opened session.
+# Empty / omitted = process cwd.
 # [console]
 # workspace = ""
 
@@ -109,12 +115,15 @@ fetch_max_bytes = 2000000
 # jwt_secret = ""
 # bridge_bind = "0.0.0.0:3850"
 
-# One mcp() tool is appended only when servers are listed (session-start freeze).
-# Catalog stays out of system unless mcp_auto_catalog. Bodies/methods are a hidden
-# card on "mcp" / [mcp:name] / /name — same geometry as skills.
+# GetDynamicTools + CallDynamicTool + FetchMcpResource are appended only when servers are listed.
+# The stable pair discovers live server schemas at runtime; the catalog stays out
+# of system unless mcp_auto_catalog. [mcp:name] / /name can still force a mount.
 # Overlay: config.toml [mcp], ~/.grok-hyper/mcp.toml + mcp/*.toml, then
-# workspace .grok-hyper/mcp.toml + .grok-hyper/mcp/*.toml (later wins). Never expand tools/list
-# into OpenAI tools[]. Env/command stay out of the card.
+# workspace .grok-hyper/mcp.toml + .grok-hyper/mcp/*.toml (later wins). Server
+# tools stay dynamic instead of being expanded into static OpenAI tools[].
+# [channels]
+# busy = "steer"               # steer: 安全工具边界吸收新指令；queue: 明确排到当前轮之后；interrupt: 打断
+# enabled = ["cli", "sidecar"]
 # [mcp]
 # timeout_s = 30
 # [[mcp.servers]]

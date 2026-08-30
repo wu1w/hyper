@@ -7,7 +7,7 @@ mod token_budget;
 mod tool_budget;
 
 pub use budget::BudgetGate;
-pub use doom::{DoomLoopGate, DoomStage, REPEAT_NOTE};
+pub use doom::{DoomLoopGate, DoomStage, REPEAT_NOTE, REPEAT_STOP};
 pub use iteration::IterationGate;
 pub use lossy::{fs_tool_path, NameStreakGate, PathLoopGate, NAME_NOTE, PATH_NOTE};
 pub use timeout::TimeoutGate;

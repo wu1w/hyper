@@ -72,6 +72,7 @@ pub async fn execute_turn(
     opts.permit = req.permit;
     opts.clarify = req.clarify;
     apply_turn_window(&mut opts, req.snapshot.window);
+    opts.editor_files = req.snapshot.editor.clone();
 
     let cancel = req.cancel.clone();
     let steer = req.steer.clone();
@@ -145,6 +146,8 @@ pub async fn execute_turn(
             events: Vec::new(),
             pending_steer: out.pending_steer,
             streamed: true,
+            plan_mode: Some(out.plan_mode),
+            clarify_mode: Some(out.clarify_mode),
         },
         Err(e) => {
             if cancel.is_cancelled() {

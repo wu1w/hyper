@@ -8,7 +8,9 @@ use crate::config::Config;
 use crate::memory::MemoryStore;
 use crate::policy::ThinkPolicy;
 use crate::session::catalog;
-use crate::session::{new_session_id, SessionEvent, SessionLog, SessionMode, SessionStart};
+use crate::session::{
+    new_session_id, PolicyReason, SessionEvent, SessionLog, SessionMode, SessionStart,
+};
 use crate::skills::SkillCatalog;
 use crate::slash::{
     self, compact_reply, context_text, history_text, model_text, sessions_text, status_text,
@@ -656,23 +658,56 @@ impl SidecarSession {
         }
     }
 
+    fn persist_lifted_policy(&mut self, log: &mut SessionLog) {
+        let prior = log.policy();
+        self.lift_stale_medium_effort();
+        if prior.as_ref() == Some(&self.policy) {
+            return;
+        }
+        let _ = log.append(SessionEvent::policy(
+            self.policy.clone(),
+            PolicyReason::Upgrade,
+        ));
+    }
+
     pub fn reload(&mut self) {
         if !self.persist || self.session_id.is_empty() {
             return;
         }
-        if let Ok(log) = SessionLog::open(&self.session_id) {
+        if let Ok(mut log) = SessionLog::open(&self.session_id) {
             if let Some(p) = log.policy() {
                 if !self.effort_locked {
                     self.policy = p;
                 }
             }
+            let mut ws_changed = false;
+            if let Some(s) = log.start() {
+                if !s.workspace.is_empty() {
+                    let p = PathBuf::from(&s.workspace);
+                    if p != self.workspace {
+                        self.workspace = p;
+                        ws_changed = true;
+                    }
+                }
+            }
+            self.persist_lifted_policy(&mut log);
             self.store = EventStore::Log(log);
             self.refresh_title();
+            if ws_changed {
+                self.refresh_surface();
+            }
         }
     }
 
     pub fn finish_turn(&mut self, result: &TurnResult) -> Vec<SessionEvent> {
         self.turn_in_flight = false;
+        if let Some(plan) = result.plan_mode {
+            self.plan_mode = plan;
+        }
+        if let Some(clarify) = result.clarify_mode {
+            self.clarify_mode = clarify;
+        }
+        self.sync_ask();
         for note in &result.pending_steer {
             self.mailbox.push_queue(note.clone());
         }
@@ -749,7 +784,7 @@ impl SidecarSession {
             return vec![event];
         }
         match SessionLog::open(&self.session_id) {
-            Ok(log) => {
+            Ok(mut log) => {
                 if let Some(p) = log.policy() {
                     if !self.effort_locked {
                         self.policy = p;
@@ -762,6 +797,7 @@ impl SidecarSession {
                         self.workspace = PathBuf::from(&s.workspace);
                     }
                 }
+                self.persist_lifted_policy(&mut log);
                 self.store = EventStore::Log(log);
                 Vec::new()
             }

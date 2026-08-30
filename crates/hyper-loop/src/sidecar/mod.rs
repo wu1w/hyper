@@ -17,8 +17,9 @@ mod types;
 pub use rpc::{encode_error, encode_notification, encode_response, parse_request_line, serve_rpc};
 pub use run::execute_turn;
 pub use types::{
-    Dispatch, EventSink, PolicyCaps, RpcError, RpcRequest, SidecarOpts, TurnRequest, TurnResult,
-    TurnSnapshot, INTERNAL_ERROR, INVALID_PARAMS, INVALID_REQUEST, METHOD_NOT_FOUND, PARSE_ERROR,
+    Dispatch, EditorFile, EventSink, PolicyCaps, RpcError, RpcRequest, SidecarOpts, TurnRequest,
+    TurnResult, TurnSnapshot, INTERNAL_ERROR, INVALID_PARAMS, INVALID_REQUEST, METHOD_NOT_FOUND,
+    PARSE_ERROR,
 };
 
 use std::path::PathBuf;
@@ -28,7 +29,7 @@ use serde_json::json;
 use crate::channel::{ChannelsConfig, Mailbox};
 use crate::family::Family;
 use crate::permit::ApprovalMode;
-use crate::policy::ThinkPolicy;
+use crate::policy::{Effort, ThinkPolicy};
 use crate::session::{SessionEvent, SessionLog, SessionMode};
 
 use types::JSONRPC;
@@ -65,6 +66,7 @@ pub struct SidecarSession {
     pub(crate) approvals: ApprovalMode,
     pub(crate) low_precision: bool,
     pub(crate) workspace_confined: bool,
+    pub(crate) editor: Vec<crate::sidecar::EditorFile>,
 }
 
 impl SidecarSession {
@@ -96,6 +98,7 @@ impl SidecarSession {
             approvals: opts.approvals,
             low_precision: opts.low_precision,
             workspace_confined: opts.workspace_confined,
+            editor: Vec::new(),
         }
     }
 
@@ -129,6 +132,7 @@ impl SidecarSession {
             approvals: self.approvals,
             low_precision: self.low_precision,
             workspace_confined: self.workspace_confined,
+            editor: self.editor.clone(),
         }
     }
 
@@ -191,11 +195,49 @@ impl SidecarSession {
     }
 
     /// Switch the session root. Reloads skills/MCP from the new folder.
+    /// Persists into `session/start.workspace` so resume does not revert.
     /// Caller must refuse this while a turn is in flight.
-    pub fn set_workspace(&mut self, path: PathBuf) {
+    pub fn set_workspace(&mut self, path: PathBuf) -> Result<(), String> {
+        let same = self.workspace == path;
         self.workspace = path;
-        if self.opened {
+        self.persist_workspace()?;
+        if self.opened && !same {
             self.refresh_surface();
+        }
+        Ok(())
+    }
+
+    /// Old JSONL often froze `effort: medium`. Unlocked Agent/Code on grok-4.6
+    /// must run xhigh or the desktop loop looks like a cheap hop.
+    pub(crate) fn lift_stale_medium_effort(&mut self) {
+        if self.effort_locked {
+            return;
+        }
+        if !matches!(self.mode, SessionMode::Agent | SessionMode::Code) {
+            return;
+        }
+        let budget = self.caps.think_budget();
+        if budget.default_effort != Effort::Xhigh {
+            return;
+        }
+        if self.policy.effort == Some(Effort::Xhigh) {
+            return;
+        }
+        self.policy = self.mode.default_policy_on(&budget);
+    }
+
+    fn persist_workspace(&mut self) -> Result<(), String> {
+        let ws = self.workspace.display().to_string();
+        match &mut self.store {
+            EventStore::Memory(events) => {
+                if let Some(SessionEvent::Start(s)) = events.first_mut() {
+                    s.workspace = ws;
+                }
+                Ok(())
+            }
+            EventStore::Log(log) => log
+                .set_workspace(&self.workspace)
+                .map_err(|e| e.to_string()),
         }
     }
 
@@ -260,6 +302,8 @@ impl SidecarSession {
             "approvals": self.approvals.as_str(),
             "low_precision": self.low_precision,
             "agent_scope": if self.workspace_confined { "workspace" } else { "global" },
+            "effort": self.policy.effort.map(|e| e.as_str()),
+            "effort_locked": self.effort_locked,
             "busy": self.mailbox.busy.as_str(),
             "queued": self.mailbox.queued(),
             "steered": self.mailbox.steered(),
@@ -287,6 +331,7 @@ impl SidecarSession {
             low_precision: self.low_precision,
             workspace_confined: self.workspace_confined,
             window: self.window,
+            editor: self.editor.clone(),
         }
     }
 
@@ -455,6 +500,42 @@ mod tests {
     }
 
     #[test]
+    fn set_workspace_rewrites_memory_session_start() {
+        let mut session = SidecarSession::new(SidecarOpts::default());
+        let open = parse_request_line(
+            r#"{"jsonrpc":"2.0","id":1,"method":"session.open","params":{"session":"s-ws","workspace":"/tmp/ws","mode":"agent"}}"#,
+        )
+        .unwrap();
+        match session.handle(&open) {
+            Dispatch::Result { .. } => {}
+            other => panic!("{other:?}"),
+        }
+        session
+            .set_workspace(std::path::PathBuf::from("/tmp/other"))
+            .expect("persist memory start");
+        assert_eq!(session.workspace(), std::path::Path::new("/tmp/other"));
+        match session.events().first() {
+            Some(crate::session::SessionEvent::Start(s)) => {
+                assert_eq!(s.workspace, "/tmp/other");
+            }
+            other => panic!("expected session/start, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn unlocked_agent_lifts_stale_medium_to_xhigh() {
+        let mut session = SidecarSession::new(SidecarOpts::default());
+        session.policy.effort = Some(Effort::Medium);
+        session.lift_stale_medium_effort();
+        assert_eq!(session.policy.effort, Some(Effort::Xhigh));
+
+        session.effort_locked = true;
+        session.policy.effort = Some(Effort::Medium);
+        session.lift_stale_medium_effort();
+        assert_eq!(session.policy.effort, Some(Effort::Medium));
+    }
+
+    #[test]
     fn set_window_is_visible_and_frozen_into_turn_snapshot() {
         let mut session = SidecarSession::new(SidecarOpts::default());
         session.set_window(crate::config::CODING_CTX_TOKENS);
@@ -614,6 +695,23 @@ mod tests {
             other => panic!("{other:?}"),
         }
         session
+    }
+
+    #[test]
+    fn turn_start_keeps_editor_on_snapshot() {
+        let mut session = open_mem();
+        let start = parse_request_line(
+            r#"{"jsonrpc":"2.0","id":2,"method":"turn.start","params":{"prompt":"hi","editor":{"active":"src/a.rs","files":[{"path":"src/a.rs","line":4}]}}}"#,
+        )
+        .unwrap();
+        match session.handle(&start) {
+            Dispatch::TurnStart { .. } => {}
+            other => panic!("{other:?}"),
+        }
+        let snap = session.snapshot();
+        assert_eq!(snap.editor.len(), 1, "{:?}", snap.editor);
+        assert_eq!(snap.editor[0].path, "src/a.rs");
+        assert_eq!(snap.editor[0].line, Some(4));
     }
 
     #[test]

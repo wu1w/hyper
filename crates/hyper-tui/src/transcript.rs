@@ -208,7 +208,13 @@ impl Transcript {
                     format!("Task  {}  {}", s.description, s.status),
                 ));
             }
-            SessionEvent::Start(_) | SessionEvent::Fork(_) | SessionEvent::Undo(_) => {}
+            SessionEvent::Start(_)
+            | SessionEvent::Context(_)
+            | SessionEvent::Run(_)
+            | SessionEvent::Step(_)
+            | SessionEvent::ToolLifecycle(_)
+            | SessionEvent::Fork(_)
+            | SessionEvent::Undo(_) => {}
         }
         self.follow = true;
     }

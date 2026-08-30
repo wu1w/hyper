@@ -14,6 +14,7 @@
 /third_party/grok-build/
 plugins/**/node_modules/
 plugins/**/dist/
+plugins/**/out/
 web/**/node_modules/
 web/desktop/release/
 web/desktop/resources/

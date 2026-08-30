@@ -101,7 +101,7 @@ fn norm(name: &str) -> String {
 pub fn is_write_tool(name: &str) -> bool {
     matches!(
         norm(name).as_str(),
-        "write" | "edit" | "delete" | "strreplace"
+        "write" | "edit" | "delete" | "strreplace" | "editnotebook" | "generateimage"
     )
 }
 
@@ -146,8 +146,13 @@ fn deny_explore(name: &str, args: &Value) -> Option<String> {
             "Error: explore subagent cannot `{name}` (no Write/StrReplace/Delete)."
         ));
     }
-    if matches!(norm(name).as_str(), "runcode" | "mcp") {
+    if matches!(norm(name).as_str(), "runcode" | "mcp" | "calldynamictool") {
         return Some(format!("Error: explore subagent cannot `{name}`."));
+    }
+    if norm(name).as_str() == "fetchmcpresource" && permit::fetch_writes_workspace(args) {
+        return Some(format!(
+            "Error: explore subagent cannot `{name}` (downloadPath writes the workspace)."
+        ));
     }
     if is_shell_tool(name) {
         let cmd = args
@@ -174,7 +179,10 @@ fn deny_plan(name: &str, args: &Value) -> Option<String> {
 fn deny_office(name: &str, cap: CapabilityMode) -> Option<String> {
     let n = norm(name);
     // WebSearch/WebFetch + Read/Write/StrReplace. No git-heavy / shell / mcp.
-    if matches!(n.as_str(), "bash" | "shell" | "runcode" | "mcp") {
+    if matches!(
+        n.as_str(),
+        "bash" | "shell" | "runcode" | "mcp" | "calldynamictool" | "generateimage"
+    ) {
         return Some(format!(
             "Error: office subagent cannot `{name}` (web + file edits only)."
         ));
@@ -203,7 +211,10 @@ fn deny_capability(name: &str, args: &Value, cap: CapabilityMode) -> Option<Stri
                     ));
                 }
             }
-            if matches!(norm(name).as_str(), "runcode" | "mcp") {
+            if matches!(
+                norm(name).as_str(),
+                "runcode" | "mcp" | "calldynamictool" | "generateimage"
+            ) {
                 return Some(format!(
                     "Error: capability_mode=read-write cannot `{name}`."
                 ));
@@ -226,8 +237,16 @@ fn deny_capability(name: &str, args: &Value, cap: CapabilityMode) -> Option<Stri
                     ));
                 }
             }
-            if matches!(norm(name).as_str(), "runcode" | "mcp") {
+            if matches!(
+                norm(name).as_str(),
+                "runcode" | "mcp" | "calldynamictool" | "generateimage"
+            ) {
                 return Some(format!("Error: capability_mode=read-only cannot `{name}`."));
+            }
+            if norm(name).as_str() == "fetchmcpresource" && permit::fetch_writes_workspace(args) {
+                return Some(format!(
+                    "Error: capability_mode=read-only cannot `{name}` (downloadPath writes)."
+                ));
             }
             None
         }
@@ -306,6 +325,20 @@ mod tests {
         assert!(deny_child_tool(SubagentType::Explore, CapabilityMode::ReadOnly, &rm).is_some());
         let read = call("read", json!({"path": "a.rs"}));
         assert!(deny_child_tool(SubagentType::Explore, CapabilityMode::ReadOnly, &read).is_none());
+        let nb = call(
+            "EditNotebook",
+            json!({"target_notebook": "n.ipynb", "cell_idx": 0, "is_new_cell": false}),
+        );
+        assert!(deny_child_tool(SubagentType::Explore, CapabilityMode::All, &nb).is_some());
+        let img = call("GenerateImage", json!({"description": "cat"}));
+        assert!(deny_child_tool(SubagentType::Explore, CapabilityMode::All, &img).is_some());
+        let fetch = call("FetchMcpResource", json!({"server": "echo"}));
+        assert!(deny_child_tool(SubagentType::Explore, CapabilityMode::All, &fetch).is_none());
+        let fetch_w = call(
+            "FetchMcpResource",
+            json!({"server": "echo", "downloadPath": "a.txt"}),
+        );
+        assert!(deny_child_tool(SubagentType::Explore, CapabilityMode::All, &fetch_w).is_some());
         let desk = call("ComputerUse", json!({"action": "screenshot"}));
         assert!(deny_child_tool(SubagentType::Explore, CapabilityMode::All, &desk).is_some());
         assert!(deny_child_tool(SubagentType::Plan, CapabilityMode::All, &desk).is_some());

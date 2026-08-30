@@ -210,6 +210,16 @@ pub struct TurnSnapshot {
     pub workspace_confined: bool,
     /// Live compact window. `execute_turn` uses this, not a stale Config clone.
     pub window: u32,
+    /// Open editors / preview from the host (VS Code, console). Empty = CLI.
+    pub editor: Vec<EditorFile>,
+}
+
+/// Host-side open file. Injected into `[workset]`, not into `tools[]`.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct EditorFile {
+    pub path: String,
+    pub line: Option<u32>,
+    pub selection: Option<String>,
 }
 
 pub struct TurnRequest {
@@ -238,6 +248,9 @@ pub struct TurnResult {
     pub pending_steer: Vec<String>,
     /// Agent already pushed mid-turn events through [`EventSink`].
     pub streamed: bool,
+    /// Runtime mode returned by SwitchMode. None for non-agent turns/errors.
+    pub plan_mode: Option<bool>,
+    pub clarify_mode: Option<bool>,
 }
 
 impl TurnResult {

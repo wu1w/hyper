@@ -95,13 +95,7 @@ async fn handle_conn(
             }
             let body = &buf[body_start..body_start + content_len.min(buf.len() - body_start)];
             let mut env: NativePayload = serde_json::from_slice(body).map_err(Error::msg)?;
-            if env.channel.is_empty() {
-                env.channel = if ep.kind.is_empty() {
-                    ep.id.clone()
-                } else {
-                    ep.kind.clone()
-                };
-            }
+            super::stamp_endpoint(&mut env, ep);
             if env.reply_url().is_none() && !ep.reply_url.is_empty() {
                 env.meta.insert(
                     "reply_url".into(),

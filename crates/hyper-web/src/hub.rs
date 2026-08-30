@@ -59,8 +59,8 @@ pub struct Inner {
 }
 
 impl Inner {
-    pub fn any_live(&self) -> bool {
-        !self.live.is_empty()
+    pub fn focused_live(&self) -> bool {
+        self.session.turn_in_flight() || self.live.contains_key(self.session.session_id())
     }
 
     fn session_mut(&mut self, id: &str) -> Option<&mut SidecarSession> {
@@ -288,7 +288,7 @@ impl AppState {
                 tick.tick().await;
                 let mut g = inner.lock().await;
                 g.cron = CronStore::reload(g.session.workspace(), &g.cron);
-                if g.session.turn_in_flight() || g.live.contains_key(g.session.session_id()) {
+                if g.focused_live() {
                     continue;
                 }
                 let now = now_s();

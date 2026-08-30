@@ -1142,8 +1142,8 @@ pub fn low_precision_text(on: bool) -> String {
 pub fn approvals_text(mode: ApprovalMode) -> String {
     format!(
         "**Approvals** {}\n\n\
-         ask  — prompt write/edit/bash/run_code/mcp (y allow, a always this tool, n deny)\n\
-         auto — workspace write/edit pass; bash/run_code/mcp still prompt\n\
+         ask  — prompt write/edit/bash/run_code/CallDynamicTool (1 allow, 2 always, 3 deny)\n\
+         auto — workspace write/edit pass; bash/run_code/CallDynamicTool still prompt\n\
          yolo — never prompt (`--print` is always yolo)\n\
          `/approvals ask|auto|yolo`  alias `/yolo`",
         mode.as_str()

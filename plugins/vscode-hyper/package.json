@@ -1,0 +1,88 @@
+{
+  "name": "hyper",
+  "displayName": "Hyper",
+  "description": "grok-hyper in the editor: same sidecar loop as hyper web. No second tool loop.",
+  "version": "0.1.0",
+  "publisher": "wu1w",
+  "license": "Apache-2.0",
+  "engines": {
+    "vscode": "^1.85.0"
+  },
+  "categories": ["Other"],
+  "activationEvents": [
+    "onView:hyper.chat",
+    "onCommand:hyper.newChat",
+    "onCommand:hyper.abort"
+  ],
+  "main": "./out/extension.js",
+  "contributes": {
+    "viewsContainers": {
+      "activitybar": [
+        {
+          "id": "hyper",
+          "title": "Hyper",
+          "icon": "media/icon.svg"
+        }
+      ]
+    },
+    "views": {
+      "hyper": [
+        {
+          "type": "webview",
+          "id": "hyper.chat",
+          "name": "Chat"
+        }
+      ]
+    },
+    "commands": [
+      {
+        "command": "hyper.newChat",
+        "title": "Hyper: 新建聊天",
+        "icon": "$(add)"
+      },
+      {
+        "command": "hyper.abort",
+        "title": "Hyper: 停止本轮",
+        "icon": "$(debug-stop)"
+      }
+    ],
+    "menus": {
+      "view/title": [
+        {
+          "command": "hyper.newChat",
+          "when": "view == hyper.chat",
+          "group": "navigation"
+        },
+        {
+          "command": "hyper.abort",
+          "when": "view == hyper.chat",
+          "group": "navigation"
+        }
+      ]
+    },
+    "configuration": {
+      "title": "Hyper",
+      "properties": {
+        "hyper.command": {
+          "type": "string",
+          "default": "hyper",
+          "description": "hyper 可执行文件。默认 PATH 上的 hyper，也可用绝对路径。"
+        }
+      }
+    }
+  },
+  "scripts": {
+    "compile": "tsc -p .",
+    "watch": "tsc -watch -p ."
+  },
+  "files": [
+    "out",
+    "media",
+    "README.md"
+  ],
+  "devDependencies": {
+    "@types/node": "^20.14.0",
+    "@types/vscode": "^1.85.0",
+    "typescript": "^5.4.0"
+  }
+}

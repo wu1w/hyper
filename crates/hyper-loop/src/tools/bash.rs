@@ -110,7 +110,6 @@ pub async fn bash(
     if command.is_empty() {
         return ToolResponse::text(&call.id, "Error: No `command` provided.", ToolState::Error);
     }
-
     let cwd = if let Some(raw) = arg_str(&call.arguments, "working_directory")
         .or_else(|| arg_str(&call.arguments, "workdir"))
         .or_else(|| arg_str(&call.arguments, "cwd"))
@@ -122,11 +121,23 @@ pub async fn bash(
     } else {
         ws.root().to_path_buf()
     };
-    // Only an explicit wait becomes an inner kill. Default is coordinator
-    // cancel (`code_mode.timeout_s`): a 120s floor here used to kill long
-    // tests before offload when that timeout was raised past 120s.
-    let timeout = resolved_block_until(&call.arguments);
-
+    let (command, skipped_tree_diff) = match rewrite_skip_whole_tree_git_diff(&command) {
+        GitDiffRewrite::Keep => (command, false),
+        GitDiffRewrite::SkipAll => {
+            return ToolResponse::text(&call.id, TREE_DIFF_HINT, ToolState::Success);
+        }
+        GitDiffRewrite::Rest(rest) => (rest, true),
+    };
+    let (command, skipped_tree_list) =
+        match rewrite_skip_whole_tree_listing(&command, ws.root(), &cwd) {
+            GitDiffRewrite::Keep => (command, false),
+            GitDiffRewrite::SkipAll => {
+                return ToolResponse::text(&call.id, TREE_LIST_HINT, ToolState::Success);
+            }
+            GitDiffRewrite::Rest(rest) => (rest, true),
+        };
+    // Cursor contract: `block_until_ms` waits then backgrounds. Inner bash
+    // only dies on cancel; the coordinator offloads at that deadline.
     let mut child = match spawn_shell(&command, &cwd) {
         Ok(c) => c,
         Err(e) => {
@@ -171,31 +182,19 @@ pub async fn bash(
                 ToolState::Interrupted,
             )
         }
-        _ = async {
-            if let Some(d) = timeout {
-                tokio::time::sleep(d).await;
-            } else {
-                std::future::pending::<()>().await;
-            }
-        } => {
-            kill_group(&child);
-            let _ = child.start_kill();
-            let _ = child.wait().await;
-            drain(out_task).await;
-            drain(err_task).await;
-            ToolResponse::text(
-                &call.id,
-                "Error: Shell timed out (block_until_ms).",
-                ToolState::Interrupted,
-            )
-        }
         status = child.wait() => {
             drain(out_task).await;
             drain(err_task).await;
             let stdout = take_text(&out_buf);
             let stderr = take_text(&err_buf);
             let code = status.ok().and_then(|s| s.code()).unwrap_or(-1);
-            let text = format_shell(code, &stdout, &stderr);
+            let mut text = format_shell(code, &stdout, &stderr);
+            if skipped_tree_diff {
+                text = format!("{TREE_DIFF_HINT}\n\n{text}");
+            }
+            if skipped_tree_list {
+                text = format!("{TREE_LIST_HINT}\n\n{text}");
+            }
             let state = if code == 0 {
                 ToolState::Success
             } else {
@@ -204,6 +203,700 @@ pub async fn bash(
             folded_response(&call.id, text, state, limits, blobs)
         }
     }
+}
+
+/// Whole-tree `git diff` dumped 1MB of dist/vendor on Feishu and hung the next hop.
+const TREE_DIFF_HINT: &str = "[workset] already has git status. Whole-tree `git diff` / `git show` / `git log -p` was skipped (dist/vendor dumps blow the window). Diff a specific path: git diff -- path.";
+const TREE_LIST_HINT: &str = "Do not `find` / `ls -R` / `tree` / `git ls-files` / `fd` / `rg --files` the workspace root (it dumps vendor/dist). Search for a symbol, or walk a subdirectory.";
+
+#[derive(Debug, PartialEq, Eq)]
+enum GitDiffRewrite {
+    Keep,
+    SkipAll,
+    Rest(String),
+}
+
+fn rewrite_drop_segments(command: &str, drop: impl Fn(&str) -> bool) -> GitDiffRewrite {
+    let segs = split_cmd_segments(command);
+    if segs.is_empty() {
+        return GitDiffRewrite::Keep;
+    }
+    let nonempty: Vec<&str> = segs
+        .iter()
+        .map(|s| s.trim())
+        .filter(|s| !s.is_empty())
+        .collect();
+    let kept: Vec<&str> = nonempty.iter().copied().filter(|s| !drop(s)).collect();
+    if kept.len() == nonempty.len() {
+        GitDiffRewrite::Keep
+    } else if kept.is_empty() {
+        GitDiffRewrite::SkipAll
+    } else {
+        GitDiffRewrite::Rest(kept.join(" && "))
+    }
+}
+
+fn rewrite_skip_whole_tree_git_diff(command: &str) -> GitDiffRewrite {
+    rewrite_drop_segments(command, is_whole_tree_git_diff_segment)
+}
+
+fn rewrite_skip_whole_tree_listing(command: &str, ws_root: &Path, cwd: &Path) -> GitDiffRewrite {
+    rewrite_drop_segments(command, |s| is_whole_tree_listing_segment(s, ws_root, cwd))
+}
+
+fn split_cmd_segments(command: &str) -> Vec<String> {
+    let mut segs = Vec::new();
+    let mut cur = String::new();
+    let mut quote: Option<char> = None;
+    let mut chars = command.chars().peekable();
+    while let Some(c) = chars.next() {
+        match quote {
+            Some(q) if c == q => {
+                quote = None;
+                cur.push(c);
+            }
+            Some(_) => cur.push(c),
+            None if c == '\'' || c == '"' => {
+                quote = Some(c);
+                cur.push(c);
+            }
+            None if c == '&' && chars.peek() == Some(&'&') => {
+                chars.next();
+                segs.push(std::mem::take(&mut cur));
+            }
+            None if c == ';' => {
+                segs.push(std::mem::take(&mut cur));
+            }
+            None => cur.push(c),
+        }
+    }
+    segs.push(cur);
+    segs
+}
+
+fn is_whole_tree_git_diff_segment(seg: &str) -> bool {
+    let tokens = shell_tokens(seg);
+    let Some((sub, args)) = git_subcommand(&tokens) else {
+        return false;
+    };
+    match sub {
+        "diff" | "difftool" | "show" => git_dump_without_path(args, false),
+        "log" => {
+            let patch = args
+                .iter()
+                .any(|a| matches!(a.as_str(), "-p" | "-u" | "--patch" | "--full-diff"));
+            patch && git_dump_without_path(args, true)
+        }
+        _ => false,
+    }
+}
+
+fn is_whole_tree_listing_segment(seg: &str, ws_root: &Path, cwd: &Path) -> bool {
+    let tokens = shell_tokens(seg);
+    let Some((i, cmd)) = first_shell_cmd(&tokens) else {
+        return false;
+    };
+    let args = tokens.get(i + 1..).unwrap_or(&[]);
+    match cmd_basename(cmd) {
+        "find" | "gfind" => find_is_workspace_dump(args, ws_root, cwd),
+        "ls" | "gls" => ls_is_recursive_root(args, ws_root, cwd),
+        "tree" => tree_is_workspace_root(args, ws_root, cwd),
+        "git" => git_is_whole_tree_index_dump(&tokens),
+        "fd" | "fdfind" => fd_is_workspace_dump(args, ws_root, cwd),
+        "rg" | "ripgrep" => rg_files_is_root_dump(args, ws_root, cwd),
+        _ => false,
+    }
+}
+
+fn first_shell_cmd(tokens: &[String]) -> Option<(usize, &str)> {
+    let mut i = 0;
+    while i < tokens.len() && tokens[i].contains('=') && !tokens[i].starts_with('-') {
+        i += 1;
+    }
+    tokens.get(i).map(|c| (i, c.as_str()))
+}
+
+fn cmd_basename(cmd: &str) -> &str {
+    Path::new(cmd)
+        .file_name()
+        .and_then(|s| s.to_str())
+        .unwrap_or(cmd)
+}
+
+/// `cat` / `head` / `tail` / `nl` / `sed -n Np` of a single file, no pipes.
+/// Used to fold Shell dumps of a path Search already showed.
+pub(crate) fn cat_like_path(command: &str) -> Option<String> {
+    let segs: Vec<String> = split_cmd_segments(command)
+        .into_iter()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .collect();
+    if segs.len() != 1 {
+        return None;
+    }
+    let raw = &segs[0];
+    if raw.contains('|') || raw.contains('>') || raw.contains('<') {
+        return None;
+    }
+    let tokens = shell_tokens(raw);
+    let Some((i, cmd)) = first_shell_cmd(&tokens) else {
+        return None;
+    };
+    let args = tokens.get(i + 1..).unwrap_or(&[]);
+    match cmd_basename(cmd) {
+        "cat" | "head" | "tail" | "more" | "less" | "bat" | "nl" => single_dump_file(args),
+        "sed" | "gsed" => sed_n_print_path(args),
+        _ => None,
+    }
+}
+
+fn single_dump_file(args: &[String]) -> Option<String> {
+    let mut files = Vec::new();
+    let mut j = 0;
+    while j < args.len() {
+        let a = args[j].as_str();
+        if a == "--" {
+            files.extend(args.get(j + 1..).unwrap_or(&[]).iter().cloned());
+            break;
+        }
+        if a.starts_with('-') {
+            if matches!(a, "-n" | "-c" | "-q" | "-v" | "--lines" | "--bytes") {
+                j = j.saturating_add(2);
+                continue;
+            }
+            j += 1;
+            continue;
+        }
+        files.push(a.to_string());
+        j += 1;
+    }
+    one_dump_path(files)
+}
+
+fn one_dump_path(mut files: Vec<String>) -> Option<String> {
+    if files.len() != 1 {
+        return None;
+    }
+    let p = files.remove(0);
+    if p == "-" || p.is_empty() {
+        return None;
+    }
+    Some(p)
+}
+
+/// `sed -n '1,40p' file` / `sed -n -e '20p' file`. In-place and `s///` stay Keep.
+fn sed_n_print_path(args: &[String]) -> Option<String> {
+    let mut quiet = false;
+    let mut print_script = false;
+    let mut files = Vec::new();
+    let mut j = 0;
+    while j < args.len() {
+        let a = args[j].as_str();
+        if a == "--" {
+            files.extend(args.get(j + 1..).unwrap_or(&[]).iter().cloned());
+            break;
+        }
+        if a == "-i" || a == "--in-place" || (a.starts_with("-i") && a != "-n" && a != "-e") {
+            return None;
+        }
+        if a == "-n" || a == "--quiet" || a == "--silent" {
+            quiet = true;
+            j += 1;
+            continue;
+        }
+        if a == "-e" || a == "--expression" {
+            let Some(script) = args.get(j + 1) else {
+                return None;
+            };
+            if !is_sed_print_script(script) {
+                return None;
+            }
+            print_script = true;
+            j += 2;
+            continue;
+        }
+        if a == "-f" || a == "--file" || a.starts_with('-') {
+            return None;
+        }
+        if !print_script && is_sed_print_script(a) {
+            print_script = true;
+            j += 1;
+            continue;
+        }
+        files.push(a.to_string());
+        j += 1;
+    }
+    if !quiet || !print_script {
+        return None;
+    }
+    one_dump_path(files)
+}
+
+fn is_sed_print_script(raw: &str) -> bool {
+    let t = raw
+        .trim()
+        .trim_matches('\'')
+        .trim_matches('"')
+        .trim()
+        .trim_end_matches(';')
+        .trim();
+    let Some(range) = t.strip_suffix('p').or_else(|| t.strip_suffix('P')) else {
+        return false;
+    };
+    if range.is_empty() {
+        return false;
+    }
+    let parts: Vec<&str> = range.split(',').collect();
+    (1..=2).contains(&parts.len())
+        && parts
+            .iter()
+            .all(|p| !p.is_empty() && p.chars().all(|c| c.is_ascii_digit()))
+}
+
+fn path_is_workspace_root(raw: &str, ws_root: &Path, cwd: &Path) -> bool {
+    let t = raw.trim();
+    if t.is_empty() || t == "." || t == "./" || t == ".\\" {
+        return paths_same(cwd, ws_root);
+    }
+    let p = if Path::new(t).is_absolute() {
+        PathBuf::from(t)
+    } else {
+        cwd.join(t)
+    };
+    paths_same(&p, ws_root)
+}
+
+fn paths_same(a: &Path, b: &Path) -> bool {
+    if a == b {
+        return true;
+    }
+    match (a.canonicalize(), b.canonicalize()) {
+        (Ok(x), Ok(y)) => x == y,
+        _ => false,
+    }
+}
+
+fn find_is_workspace_dump(args: &[String], ws_root: &Path, cwd: &Path) -> bool {
+    let mut i = 0;
+    while i < args.len() {
+        let a = args[i].as_str();
+        if matches!(a, "-H" | "-L" | "-P") {
+            i += 1;
+            continue;
+        }
+        if a == "-D" || a == "-O" {
+            i = i.saturating_add(2);
+            continue;
+        }
+        if a.starts_with("-O") && a.len() > 2 {
+            i += 1;
+            continue;
+        }
+        break;
+    }
+    let mut paths = Vec::new();
+    while i < args.len() {
+        let a = args[i].as_str();
+        if a.starts_with('-') || a == "!" || a == "(" || a == ")" {
+            break;
+        }
+        paths.push(a);
+        i += 1;
+    }
+    if paths.is_empty() {
+        paths.push(".");
+    }
+    if !paths
+        .iter()
+        .any(|p| path_is_workspace_root(p, ws_root, cwd))
+    {
+        return false;
+    }
+    find_expr_is_broad(&args.get(i..).unwrap_or(&[]))
+}
+
+fn find_expr_is_broad(expr: &[String]) -> bool {
+    if expr.is_empty() {
+        return true;
+    }
+    const NAME: &[&str] = &[
+        "-name",
+        "-iname",
+        "-lname",
+        "-ilname",
+        "-path",
+        "-ipath",
+        "-wholename",
+        "-iwholename",
+        "-regex",
+        "-iregex",
+    ];
+    let mut i = 0;
+    let mut saw_specific = false;
+    while i < expr.len() {
+        let a = expr[i].as_str();
+        if NAME.contains(&a) {
+            let val = expr.get(i + 1).map(|s| s.as_str()).unwrap_or("*");
+            if name_is_star_glob(val) {
+                return true;
+            }
+            saw_specific = true;
+            i = i.saturating_add(2);
+            continue;
+        }
+        i += 1;
+    }
+    !saw_specific
+}
+
+fn name_is_star_glob(val: &str) -> bool {
+    let v = val.trim();
+    v == "*" || v == "*.*" || v.starts_with("*.")
+}
+
+fn ls_is_recursive_root(args: &[String], ws_root: &Path, cwd: &Path) -> bool {
+    let mut recursive = false;
+    let mut paths = Vec::new();
+    let mut i = 0;
+    while i < args.len() {
+        let a = args[i].as_str();
+        if a == "--" {
+            paths.extend(args.get(i + 1..).unwrap_or(&[]).iter().map(|s| s.as_str()));
+            break;
+        }
+        if a == "--recursive" {
+            recursive = true;
+            i += 1;
+            continue;
+        }
+        if a.starts_with("--") {
+            i += 1;
+            continue;
+        }
+        if a.starts_with('-') && a.chars().any(|c| c == 'R') {
+            recursive = true;
+            i += 1;
+            continue;
+        }
+        if a.starts_with('-') {
+            i += 1;
+            continue;
+        }
+        paths.push(a);
+        i += 1;
+    }
+    if !recursive {
+        return false;
+    }
+    if paths.is_empty() {
+        return path_is_workspace_root(".", ws_root, cwd);
+    }
+    paths
+        .iter()
+        .any(|p| path_is_workspace_root(p, ws_root, cwd))
+}
+
+fn tree_is_workspace_root(args: &[String], ws_root: &Path, cwd: &Path) -> bool {
+    let mut i = 0;
+    let mut paths = Vec::new();
+    while i < args.len() {
+        let a = args[i].as_str();
+        if matches!(a, "-L" | "-I" | "--ignore" | "-H" | "-o" | "--output") {
+            i = i.saturating_add(2);
+            continue;
+        }
+        if a.starts_with('-') {
+            i += 1;
+            continue;
+        }
+        paths.push(a);
+        i += 1;
+    }
+    if paths.is_empty() {
+        return path_is_workspace_root(".", ws_root, cwd);
+    }
+    paths
+        .iter()
+        .any(|p| path_is_workspace_root(p, ws_root, cwd))
+}
+
+fn git_is_whole_tree_index_dump(tokens: &[String]) -> bool {
+    let Some((sub, args)) = git_subcommand(tokens) else {
+        return false;
+    };
+    matches!(sub, "ls-files" | "ls-tree") && git_index_dump_without_path(args)
+}
+
+fn git_index_dump_without_path(args: &[String]) -> bool {
+    let mut paths = Vec::new();
+    let mut i = 0;
+    while i < args.len() {
+        let a = args[i].as_str();
+        if a == "--" {
+            paths.extend(args.get(i + 1..).unwrap_or(&[]).iter().map(|s| s.as_str()));
+            break;
+        }
+        if a.starts_with('-') {
+            i += 1;
+            continue;
+        }
+        paths.push(a);
+        i += 1;
+    }
+    if paths.is_empty() {
+        return true;
+    }
+    paths.iter().all(|p| pathspec_is_tree_star(p))
+}
+
+fn pathspec_is_tree_star(raw: &str) -> bool {
+    let p = raw.trim().trim_start_matches("./").replace('\\', "/");
+    p == "*"
+        || p == "*.*"
+        || p.starts_with("*.")
+        || p == "**"
+        || p == "**/*"
+        || p.strip_prefix("**/")
+            .is_some_and(|rest| rest == "*" || rest == "*.*" || rest.starts_with("*."))
+}
+
+fn fd_is_workspace_dump(args: &[String], ws_root: &Path, cwd: &Path) -> bool {
+    let mut pattern: Option<&str> = None;
+    let mut paths = Vec::new();
+    let mut i = 0;
+    while i < args.len() {
+        let a = args[i].as_str();
+        if a == "--" {
+            let rest = args.get(i + 1..).unwrap_or(&[]);
+            if pattern.is_none() && !rest.is_empty() {
+                pattern = Some(rest[0].as_str());
+                paths.extend(rest.get(1..).unwrap_or(&[]).iter().map(|s| s.as_str()));
+            } else {
+                paths.extend(rest.iter().map(|s| s.as_str()));
+            }
+            break;
+        }
+        if fd_flag_takes_value(a) {
+            i = i.saturating_add(2);
+            continue;
+        }
+        if a.starts_with('-') {
+            i += 1;
+            continue;
+        }
+        if pattern.is_none() {
+            pattern = Some(a);
+        } else {
+            paths.push(a);
+        }
+        i += 1;
+    }
+    let root = paths.is_empty()
+        || paths
+            .iter()
+            .any(|p| path_is_workspace_root(p, ws_root, cwd));
+    if !root {
+        return false;
+    }
+    match pattern {
+        None => true,
+        Some(p) => p == "." || p == "./" || name_is_star_glob(p),
+    }
+}
+
+fn fd_flag_takes_value(a: &str) -> bool {
+    matches!(
+        a,
+        "-d" | "--max-depth"
+            | "-e"
+            | "--extension"
+            | "-E"
+            | "--exclude"
+            | "-t"
+            | "--type"
+            | "-S"
+            | "--size"
+            | "-x"
+            | "--exec"
+            | "-X"
+            | "--exec-batch"
+            | "-j"
+            | "--threads"
+            | "-g"
+            | "--glob"
+            | "--changed-within"
+            | "--changed-before"
+            | "--max-results"
+            | "--search-path"
+            | "--ignore-file"
+    )
+}
+
+fn rg_files_is_root_dump(args: &[String], ws_root: &Path, cwd: &Path) -> bool {
+    if !args.iter().any(|a| a == "--files") {
+        return false;
+    }
+    let mut paths = Vec::new();
+    let mut i = 0;
+    while i < args.len() {
+        let a = args[i].as_str();
+        if a == "--" {
+            paths.extend(args.get(i + 1..).unwrap_or(&[]).iter().map(|s| s.as_str()));
+            break;
+        }
+        if rg_flag_takes_value(a) {
+            i = i.saturating_add(2);
+            continue;
+        }
+        if a.starts_with('-') {
+            i += 1;
+            continue;
+        }
+        paths.push(a);
+        i += 1;
+    }
+    paths.is_empty()
+        || paths
+            .iter()
+            .any(|p| path_is_workspace_root(p, ws_root, cwd))
+}
+
+fn rg_flag_takes_value(a: &str) -> bool {
+    matches!(
+        a,
+        "-g" | "--glob"
+            | "-t"
+            | "--type"
+            | "-T"
+            | "--type-not"
+            | "-A"
+            | "--after-context"
+            | "-B"
+            | "--before-context"
+            | "-C"
+            | "--context"
+            | "-m"
+            | "--max-count"
+            | "-j"
+            | "--threads"
+            | "--max-filesize"
+            | "--max-depth"
+            | "-f"
+            | "--file"
+            | "-e"
+            | "--regexp"
+    )
+}
+
+fn git_dump_without_path(args: &[String], ignore_compact: bool) -> bool {
+    const COMPACT: &[&str] = &[
+        "--stat",
+        "--shortstat",
+        "--numstat",
+        "--name-only",
+        "--name-status",
+        "--check",
+        "--dirstat",
+        "--summary",
+        "--raw",
+        "--no-patch",
+        "-s",
+    ];
+    if !ignore_compact && args.iter().any(|a| COMPACT.contains(&a.as_str())) {
+        return false;
+    }
+    let mut after_dd = false;
+    for a in args {
+        if a == "--" {
+            after_dd = true;
+            continue;
+        }
+        if after_dd {
+            return false;
+        }
+        if a.starts_with('-') {
+            continue;
+        }
+        if looks_like_git_rev(a) {
+            continue;
+        }
+        return false;
+    }
+    true
+}
+
+fn git_subcommand(tokens: &[String]) -> Option<(&str, &[String])> {
+    let mut i = 0;
+    while i < tokens.len() && tokens[i].contains('=') && !tokens[i].starts_with('-') {
+        i += 1;
+    }
+    if tokens.get(i).map(|s| s.as_str()) != Some("git") {
+        return None;
+    }
+    i += 1;
+    while i < tokens.len() {
+        let t = tokens[i].as_str();
+        if t == "-C" || t == "-c" {
+            i = i.saturating_add(2);
+            continue;
+        }
+        if t.starts_with('-') {
+            i += 1;
+            continue;
+        }
+        return Some((t, tokens.get(i + 1..).unwrap_or(&[])));
+    }
+    None
+}
+
+fn looks_like_git_rev(tok: &str) -> bool {
+    let t = tok.trim();
+    if t.is_empty() {
+        return false;
+    }
+    if matches!(
+        t,
+        "HEAD" | "@" | "FETCH_HEAD" | "ORIG_HEAD" | "MERGE_HEAD" | "CHERRY_PICK_HEAD"
+    ) {
+        return true;
+    }
+    if t.contains(':') {
+        return false;
+    }
+    if t.starts_with("HEAD") || t.starts_with('@') || t.starts_with("refs/") {
+        return true;
+    }
+    if t.contains("..") {
+        return true;
+    }
+    let hex = t.chars().all(|c| c.is_ascii_hexdigit());
+    hex && t.len() >= 7 && t.len() <= 40
+}
+
+fn shell_tokens(command: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut cur = String::new();
+    let mut quote: Option<char> = None;
+    for c in command.chars() {
+        match quote {
+            Some(q) if c == q => quote = None,
+            Some(_) => cur.push(c),
+            None if c == '\'' || c == '"' => quote = Some(c),
+            None if c.is_whitespace() || matches!(c, '|' | ';' | '&' | '<' | '>') => {
+                if !cur.is_empty() {
+                    out.push(std::mem::take(&mut cur));
+                }
+                if !c.is_whitespace() {
+                    break;
+                }
+            }
+            None => cur.push(c),
+        }
+    }
+    if !cur.is_empty() {
+        out.push(cur);
+    }
+    out
 }
 
 fn spawn_shell(command: &str, cwd: &Path) -> std::io::Result<tokio::process::Child> {
@@ -246,6 +939,7 @@ fn spawn_shell(command: &str, cwd: &Path) -> std::io::Result<tokio::process::Chi
     cmd.spawn()
 }
 
+#[cfg_attr(not(test), allow(dead_code))]
 fn resolved_block_until(args: &serde_json::Value) -> Option<Duration> {
     arg_u32(args, "block_until_ms")
         .or_else(|| arg_u32(args, "timeout"))
@@ -584,6 +1278,242 @@ mod tests {
     }
 
     #[test]
+    fn whole_tree_git_diff_is_skipped() {
+        assert_eq!(
+            rewrite_skip_whole_tree_git_diff("git diff"),
+            GitDiffRewrite::SkipAll
+        );
+        assert_eq!(
+            rewrite_skip_whole_tree_git_diff("git diff HEAD"),
+            GitDiffRewrite::SkipAll
+        );
+        assert_eq!(
+            rewrite_skip_whole_tree_git_diff("git diff --cached"),
+            GitDiffRewrite::SkipAll
+        );
+        assert_eq!(
+            rewrite_skip_whole_tree_git_diff(
+                "git status && git log -8 --oneline && git diff --stat HEAD && git diff HEAD"
+            ),
+            GitDiffRewrite::Rest(
+                "git status && git log -8 --oneline && git diff --stat HEAD".into()
+            )
+        );
+        assert_eq!(
+            rewrite_skip_whole_tree_git_diff("git diff --stat HEAD"),
+            GitDiffRewrite::Keep
+        );
+        assert_eq!(
+            rewrite_skip_whole_tree_git_diff("git diff HEAD -- crates/hyper-loop/src/sticky.rs"),
+            GitDiffRewrite::Keep
+        );
+        assert_eq!(
+            rewrite_skip_whole_tree_git_diff("git diff crates/hyper-loop/src/sticky.rs"),
+            GitDiffRewrite::Keep
+        );
+        assert_eq!(
+            rewrite_skip_whole_tree_git_diff("echo hi"),
+            GitDiffRewrite::Keep
+        );
+        assert_eq!(
+            rewrite_skip_whole_tree_git_diff("git show HEAD"),
+            GitDiffRewrite::SkipAll
+        );
+        assert_eq!(
+            rewrite_skip_whole_tree_git_diff("git show HEAD:crates/hyper-loop/src/sticky.rs"),
+            GitDiffRewrite::Keep
+        );
+        assert_eq!(
+            rewrite_skip_whole_tree_git_diff("git log -8 --oneline"),
+            GitDiffRewrite::Keep
+        );
+        assert_eq!(
+            rewrite_skip_whole_tree_git_diff("git log -p"),
+            GitDiffRewrite::SkipAll
+        );
+        assert_eq!(
+            rewrite_skip_whole_tree_git_diff("git log -p -- crates/hyper-loop/src/sticky.rs"),
+            GitDiffRewrite::Keep
+        );
+    }
+
+    #[tokio::test]
+    async fn whole_tree_git_diff_does_not_spawn() {
+        let (ws, dir) = scratch();
+        let started = std::time::Instant::now();
+        let out = bash(
+            &ws,
+            &call(json!({"command": "git diff HEAD"})),
+            CancelFlag::new(),
+            ToolLimits::default(),
+            None,
+        )
+        .await;
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(2),
+            "whole-tree git diff must not run: {:?}",
+            started.elapsed()
+        );
+        assert_eq!(out.state, ToolState::Success, "{}", out.joined_text());
+        let text = out.joined_text();
+        assert!(text.contains("Whole-tree"), "{text}");
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn whole_tree_listing_is_skipped() {
+        let ws = Path::new("/ws");
+        let cwd = Path::new("/ws");
+        let sub = Path::new("/ws/crates");
+        assert_eq!(
+            rewrite_skip_whole_tree_listing("find .", ws, cwd),
+            GitDiffRewrite::SkipAll
+        );
+        assert_eq!(
+            rewrite_skip_whole_tree_listing("find . -name '*.rs'", ws, cwd),
+            GitDiffRewrite::SkipAll
+        );
+        assert_eq!(
+            rewrite_skip_whole_tree_listing("find . -name sticky.rs", ws, cwd),
+            GitDiffRewrite::Keep
+        );
+        assert_eq!(
+            rewrite_skip_whole_tree_listing("find crates/hyper-loop -name '*.rs'", ws, cwd),
+            GitDiffRewrite::Keep
+        );
+        assert_eq!(
+            rewrite_skip_whole_tree_listing("find .", ws, sub),
+            GitDiffRewrite::Keep
+        );
+        assert_eq!(
+            rewrite_skip_whole_tree_listing("find /ws", ws, sub),
+            GitDiffRewrite::SkipAll
+        );
+        assert_eq!(
+            rewrite_skip_whole_tree_listing("ls -R", ws, cwd),
+            GitDiffRewrite::SkipAll
+        );
+        assert_eq!(
+            rewrite_skip_whole_tree_listing("ls -la", ws, cwd),
+            GitDiffRewrite::Keep
+        );
+        assert_eq!(
+            rewrite_skip_whole_tree_listing("ls -R crates", ws, cwd),
+            GitDiffRewrite::Keep
+        );
+        assert_eq!(
+            rewrite_skip_whole_tree_listing("tree", ws, cwd),
+            GitDiffRewrite::SkipAll
+        );
+        assert_eq!(
+            rewrite_skip_whole_tree_listing("tree crates/foo", ws, cwd),
+            GitDiffRewrite::Keep
+        );
+        assert_eq!(
+            rewrite_skip_whole_tree_listing("echo hi && find .", ws, cwd),
+            GitDiffRewrite::Rest("echo hi".into())
+        );
+        assert_eq!(
+            rewrite_skip_whole_tree_listing("git ls-files", ws, cwd),
+            GitDiffRewrite::SkipAll
+        );
+        assert_eq!(
+            rewrite_skip_whole_tree_listing("git ls-files '*.rs'", ws, cwd),
+            GitDiffRewrite::SkipAll
+        );
+        assert_eq!(
+            rewrite_skip_whole_tree_listing("git ls-files crates/hyper-loop", ws, cwd),
+            GitDiffRewrite::Keep
+        );
+        assert_eq!(
+            rewrite_skip_whole_tree_listing("fd", ws, cwd),
+            GitDiffRewrite::SkipAll
+        );
+        assert_eq!(
+            rewrite_skip_whole_tree_listing("fd -e rs", ws, cwd),
+            GitDiffRewrite::SkipAll
+        );
+        assert_eq!(
+            rewrite_skip_whole_tree_listing("fd TREE_LIST_HINT", ws, cwd),
+            GitDiffRewrite::Keep
+        );
+        assert_eq!(
+            rewrite_skip_whole_tree_listing("fd . crates/hyper-loop", ws, cwd),
+            GitDiffRewrite::Keep
+        );
+        assert_eq!(
+            rewrite_skip_whole_tree_listing("rg --files", ws, cwd),
+            GitDiffRewrite::SkipAll
+        );
+        assert_eq!(
+            rewrite_skip_whole_tree_listing("rg --files crates/hyper-loop", ws, cwd),
+            GitDiffRewrite::Keep
+        );
+        assert_eq!(
+            rewrite_skip_whole_tree_listing("rg TREE_LIST_HINT", ws, cwd),
+            GitDiffRewrite::Keep
+        );
+    }
+
+    #[test]
+    fn cat_like_path_detects_simple_dumps() {
+        assert_eq!(
+            cat_like_path("cat src/lib.rs").as_deref(),
+            Some("src/lib.rs")
+        );
+        assert_eq!(
+            cat_like_path("head -n 20 src/lib.rs").as_deref(),
+            Some("src/lib.rs")
+        );
+        assert_eq!(
+            cat_like_path("tail -20 src/lib.rs").as_deref(),
+            Some("src/lib.rs")
+        );
+        assert!(cat_like_path("cat src/lib.rs | wc").is_none());
+        assert!(cat_like_path("cat a.rs b.rs").is_none());
+        assert!(cat_like_path("python3 r92_test.py").is_none());
+        assert!(cat_like_path("cat src/lib.rs && echo ok").is_none());
+        assert_eq!(
+            cat_like_path("nl -ba src/lib.rs").as_deref(),
+            Some("src/lib.rs")
+        );
+        assert_eq!(
+            cat_like_path("sed -n '1,40p' src/lib.rs").as_deref(),
+            Some("src/lib.rs")
+        );
+        assert_eq!(
+            cat_like_path("sed -n -e '20p' src/lib.rs").as_deref(),
+            Some("src/lib.rs")
+        );
+        assert!(cat_like_path("sed -i -n '1p' src/lib.rs").is_none());
+        assert!(cat_like_path("sed -n 's/foo/bar/p' src/lib.rs").is_none());
+        assert!(cat_like_path("sed '1,20p' src/lib.rs").is_none());
+    }
+
+    #[tokio::test]
+    async fn whole_tree_find_does_not_spawn() {
+        let (ws, dir) = scratch();
+        let started = std::time::Instant::now();
+        let out = bash(
+            &ws,
+            &call(json!({"command": "find . -exec sleep 30 {} +"})),
+            CancelFlag::new(),
+            ToolLimits::default(),
+            None,
+        )
+        .await;
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(2),
+            "workspace-root find must not run: {:?}",
+            started.elapsed()
+        );
+        assert_eq!(out.state, ToolState::Success, "{}", out.joined_text());
+        let text = out.joined_text();
+        assert!(text.contains("`find`"), "{text}");
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
     fn missing_timeout_does_not_hard_kill() {
         assert!(resolved_block_until(&json!({})).is_none());
         assert!(resolved_block_until(&json!({"block_until_ms": 0})).is_none());
@@ -599,6 +1529,40 @@ mod tests {
             resolved_block_until(&json!({"timeout_ms": 80})),
             Some(std::time::Duration::from_millis(80))
         );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn block_until_ms_does_not_hard_kill() {
+        let (ws, dir) = scratch();
+        let started = std::time::Instant::now();
+        let out = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            bash(
+                &ws,
+                &call(json!({
+                    "command": "sleep 0.25; echo survived",
+                    "block_until_ms": 50
+                })),
+                CancelFlag::new(),
+                ToolLimits::default(),
+                None,
+            ),
+        )
+        .await
+        .expect("bash hung");
+        assert_eq!(out.state, ToolState::Success, "{}", out.joined_text());
+        assert!(
+            out.joined_text().contains("survived"),
+            "{}",
+            out.joined_text()
+        );
+        assert!(
+            started.elapsed() >= std::time::Duration::from_millis(200),
+            "inner bash returned before sleep finished: {:?}",
+            started.elapsed()
+        );
+        let _ = std::fs::remove_dir_all(dir);
     }
 
     #[tokio::test]

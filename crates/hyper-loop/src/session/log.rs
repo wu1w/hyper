@@ -121,6 +121,26 @@ impl SessionLog {
         self.write_event(event)
     }
 
+    /// Rewrite `events[0].workspace`. Resume / `bind_store` read this field;
+    /// in-memory sidecar changes alone do not survive restart.
+    pub fn set_workspace(&mut self, path: impl AsRef<Path>) -> Result<()> {
+        let ws = path.as_ref().display().to_string();
+        match self.events.first_mut() {
+            Some(SessionEvent::Start(s)) => {
+                if s.workspace == ws {
+                    return Ok(());
+                }
+                s.workspace = ws;
+            }
+            _ => return Err(Error::msg("missing session/start")),
+        }
+        rewrite_jsonl(&self.path, &self.events)?;
+        if let Some(index) = &self.index {
+            let _ = index.reindex_session(&self.id, &self.events);
+        }
+        Ok(())
+    }
+
     /// Copy this JSONL to `start.id`, replace events[0], then append `session/fork`.
     /// Depth/`policy` events stay in the new file. `/think` `/fast` must not call this.
     pub fn fork(&self, start: SessionStart) -> Result<Self> {
@@ -237,15 +257,30 @@ fn write_jsonl(path: &Path, events: &[SessionEvent]) -> Result<()> {
     let mut file = opts.open(path)?;
     set_file_mode(path)?;
     file.lock_exclusive()?;
-    let result = (|| {
-        for event in events {
-            file.write_all(encode_line(event)?.as_bytes())?;
-        }
-        file.sync_all()?;
-        Ok(())
-    })();
+    let result = write_events_locked(&mut file, events);
     let _ = file.unlock();
     result
+}
+
+fn rewrite_jsonl(path: &Path, events: &[SessionEvent]) -> Result<()> {
+    let mut opts = OpenOptions::new();
+    opts.write(true).truncate(true).create(true);
+    #[cfg(unix)]
+    opts.mode(0o600);
+    let mut file = opts.open(path)?;
+    set_file_mode(path)?;
+    file.lock_exclusive()?;
+    let result = write_events_locked(&mut file, events);
+    let _ = file.unlock();
+    result
+}
+
+fn write_events_locked(file: &mut File, events: &[SessionEvent]) -> Result<()> {
+    for event in events {
+        file.write_all(encode_line(event)?.as_bytes())?;
+    }
+    file.sync_all()?;
+    Ok(())
 }
 
 fn read_jsonl(path: &Path) -> Result<Vec<SessionEvent>> {

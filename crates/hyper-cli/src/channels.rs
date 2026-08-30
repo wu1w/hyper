@@ -4,7 +4,10 @@ use std::process::ExitCode;
 use std::sync::Arc;
 
 use anyhow::{Context, Result};
-use hyper_loop::channel::{reply_parts, reply_text, run_channels, ContentPart, NativePayload};
+use hyper_loop::channel::{
+    push_steer, reply_parts, reply_text, run_channels, spawn_im_pump, ContentPart, NativePayload,
+    SteerSlot,
+};
 use hyper_loop::config::Config;
 use hyper_loop::session::SessionMode;
 use hyper_loop::slash::{low_precision_text, mcp_text, parse_slash_with_periphery, skills_text};
@@ -35,7 +38,7 @@ pub async fn run(cli: Cli) -> Result<ExitCode> {
     let effort_locked =
         cli.fast || cli.think.is_some() || matches!(mode, SessionMode::Think | SessionMode::Chat);
 
-    run_channels(cfg.channels.clone(), move |env: NativePayload| {
+    run_channels(cfg.channels.clone(), move |env: NativePayload, cancel, steer| {
         let cfg = cfg_h.clone();
         let workspace = workspace.clone();
         let policy = policy.clone();
@@ -49,6 +52,8 @@ pub async fn run(cli: Cli) -> Result<ExitCode> {
                 agents_md,
                 agents_md_head,
                 env,
+                cancel,
+                steer,
             )
             .await
         }
@@ -67,6 +72,8 @@ async fn handle_inbound(
     agents_md: bool,
     agents_md_head: bool,
     env: NativePayload,
+    cancel: hyper_loop::CancelFlag,
+    steer: SteerSlot,
 ) -> hyper_loop::Result<Vec<ContentPart>> {
     let home = Config::home_dir().ok();
     let skills = hyper_loop::skills::SkillCatalog::load(
@@ -190,10 +197,20 @@ async fn handle_inbound(
     }
     hyper_loop::agent::apply_unattended_policy(&mut opts, &cfg);
 
+    let (emit, pump) = spawn_im_pump(&cfg, &env);
     let completer = TransportCompleter::connect(&cfg, policy).await?;
     let mut agent = Agent::new(completer, opts)?;
+    agent.set_emit(emit);
+    agent.set_cancel(cancel);
+    agent.set_steer(steer.clone());
     let out = agent.run_message(msg).await?;
-    Ok(reply_parts(&out.text, &ws, &out.channel_files))
+    for note in out.pending_steer {
+        push_steer(&steer, note);
+    }
+    let parts = reply_parts(&out.text, &ws, &out.channel_files);
+    drop(agent);
+    let _ = pump.await;
+    Ok(parts)
 }
 
 fn local_slash_text(cmd: &hyper_loop::SlashCmd) -> Option<String> {

@@ -94,6 +94,9 @@ pub fn is_sticky_note(text: &str) -> bool {
         || inner.starts_with("[style]")
         || inner.starts_with("[out]")
         || inner.starts_with("[workset]")
+        || inner.starts_with("[rules]")
+        || inner.starts_with("[im]")
+        || inner.starts_with("[history]")
         || inner.starts_with("MEMORY hot")
         || inner.starts_with("MEMORY hosts")
         || inner.starts_with("MEMORY.md")
@@ -139,6 +142,15 @@ fn stub_body(inner: &str) -> String {
     if inner.starts_with("[workset]") {
         return "[workset] applied".into();
     }
+    if inner.starts_with("[rules]") {
+        return "[rules] applied".into();
+    }
+    if inner.starts_with("[im]") {
+        return "[im] applied".into();
+    }
+    if inner.starts_with("[history]") {
+        return "[history] applied".into();
+    }
     "applied".into()
 }
 
@@ -160,11 +172,92 @@ pub fn stub_live_out_notes(messages: &mut [ChatMessage]) -> usize {
     stub_notes(messages, StubWhen::Now, |inner| inner.starts_with("[out]"))
 }
 
-/// Fresh `[workset]` card each user turn.
+/// Fresh `[workset]` / `[rules]` cards each user turn.
 pub fn stub_live_workset_notes(messages: &mut [ChatMessage]) -> usize {
     stub_notes(messages, StubWhen::Now, |inner| {
-        inner.starts_with("[workset]")
+        inner.starts_with("[workset]") || inner.starts_with("[rules]")
     })
+}
+
+/// Fresh `[history]` card each user turn.
+pub fn stub_live_history_notes(messages: &mut [ChatMessage]) -> usize {
+    stub_notes(messages, StubWhen::Now, |inner| {
+        inner.starts_with("[history]")
+    })
+}
+
+/// Recency closer on IM `instructions`. Language lock belongs here, not in
+/// `DEFAULT_AGENT_MD` (desktop CoT can stay English). Chinese last so grok
+/// actually reasons in CJK; the English lines still cover English inbound.
+pub const IM_SYSTEM_LOCK_ZH: &str = "用户写中文时，思考过程必须是中文，禁止英文推理。";
+pub const IM_SYSTEM_LOCK: &str = "\
+This is a messaging channel. Think and reply in the user's language. \
+If they wrote Chinese, reasoning must be Chinese, not English. \
+用户写中文时，思考过程必须是中文，禁止英文推理。";
+
+/// Resume uses frozen `session/start.system`. Feishu chats keep one JSONL for
+/// days; without this, a lock added after the first message never reaches grok.
+pub fn ensure_im_system_lock(system: &mut String) {
+    if system.contains(IM_SYSTEM_LOCK_ZH) {
+        return;
+    }
+    if !system.is_empty() && !system.ends_with('\n') {
+        system.push('\n');
+    }
+    if system.contains("This is a messaging channel. Think and reply in the user's language.") {
+        system.push_str(IM_SYSTEM_LOCK_ZH);
+        return;
+    }
+    system.push_str(IM_SYSTEM_LOCK);
+}
+
+pub fn ensure_im_system_lock_on_messages(messages: &mut [ChatMessage]) {
+    let Some(sys) = messages.first_mut() else {
+        return;
+    };
+    if sys.role != "system" {
+        return;
+    }
+    match sys.content.as_mut() {
+        Some(content) => ensure_im_system_lock(content),
+        None => sys.content = Some(IM_SYSTEM_LOCK.to_string()),
+    }
+}
+
+/// IM liveness card. Re-injected each real user turn.
+pub const IM_CARD: &str = "\
+[im] Messaging channel. Think and speak in the user's language. \
+Tool hops keep visible text empty. The hop without tools is the answer. \
+If they already named the path, Write it; do not Glob to confirm. \
+Do not Search paraphrases of one symbol. After a Search hit, use that span; do not Read or Shell cat the whole file. \
+When Write and Shell are both needed, send them in the same hop. \
+Do not Glob a filename Search already located. \
+Do not Shell git diff / find / ls -R / tree of the whole tree; [workset] already has git status. Do not Glob **/*.";
+
+pub const IM_CARD_ZH: &str = "\
+[im] 即时消息。思考过程和回复都必须用中文。不要用英文写思考。工具跳可见正文留空；没有工具的那一跳才是回复。用户已给出路径就直接 Write，不要 Glob 确认。同一符号只 Search 一次，命中后用 Search 给出的片段，不要整文件 Read 或 cat。不要 Glob 已经 Search 到的同名文件。需要写文件和跑命令时同一跳并行 Write 和 Shell。[workset] 已有 git 状态，不要对整仓 git diff、find、ls -R、tree 或 Glob **/*。";
+
+pub fn im_card(inbound: &str) -> &'static str {
+    if inbound.chars().any(is_cjk) {
+        IM_CARD_ZH
+    } else {
+        IM_CARD
+    }
+}
+
+fn is_cjk(c: char) -> bool {
+    matches!(
+        c,
+        '\u{4E00}'..='\u{9FFF}'
+            | '\u{3400}'..='\u{4DBF}'
+            | '\u{3000}'..='\u{303F}'
+            | '\u{3040}'..='\u{30FF}'
+            | '\u{FF00}'..='\u{FFEF}'
+    )
+}
+
+pub fn stub_live_im_notes(messages: &mut [ChatMessage]) -> usize {
+    stub_notes(messages, StubWhen::Now, |inner| inner.starts_with("[im]"))
 }
 
 /// User explicitly named an MCP server. Don't wait two turns.
@@ -386,6 +479,53 @@ mod tests {
     }
 
     #[test]
+    fn im_card_follows_inbound_script() {
+        assert!(im_card("帮我改标题").contains("都必须用中文"));
+        assert!(im_card("帮我改标题").contains("同一符号只 Search 一次"));
+        assert!(im_card("帮我改标题").contains("不要整文件 Read 或 cat"));
+        assert!(im_card("帮我改标题").contains("不要 Glob 已经 Search 到的同名文件"));
+        assert!(im_card("帮我改标题").contains("不要对整仓 git diff、find、ls -R、tree"));
+        assert!(im_card("fix the title").contains("Do not Search paraphrases"));
+        assert!(im_card("fix the title").contains("Do not Glob a filename Search already located"));
+        assert!(im_card("fix the title").contains("do not Read or Shell cat the whole file"));
+        assert!(im_card("fix the title")
+            .contains("Do not Shell git diff / find / ls -R / tree of the whole tree"));
+        assert!(!im_card("fix the title").contains("都必须用中文"));
+    }
+
+    #[test]
+    fn im_card_stubs_immediately() {
+        let mut msgs = vec![
+            ChatMessage::system("sys"),
+            ChatMessage::user("u1"),
+            ChatMessage::hidden_user(IM_CARD),
+            ChatMessage::assistant("ok"),
+        ];
+        stub_live_im_notes(&mut msgs);
+        assert!(msgs[2].content.as_deref().unwrap().contains("[im] applied"));
+    }
+
+    #[test]
+    fn history_card_stubs_immediately() {
+        let mut msgs = vec![
+            ChatMessage::system("sys"),
+            ChatMessage::user("u1"),
+            ChatMessage::hidden_user("[history]\nfeishu · 审计\n  Shell 不是沙箱"),
+            ChatMessage::assistant("ok"),
+        ];
+        stub_live_history_notes(&mut msgs);
+        assert!(
+            msgs[2]
+                .content
+                .as_deref()
+                .unwrap()
+                .contains("[history] applied"),
+            "{:?}",
+            msgs[2].content
+        );
+    }
+
+    #[test]
     fn out_card_stubs_immediately() {
         let mut msgs = vec![
             ChatMessage::system("sys"),
@@ -413,5 +553,27 @@ mod tests {
             ),
         ];
         assert!(live_has_plan_note(&msgs));
+    }
+
+    #[test]
+    fn ensure_im_system_lock_appends_chinese_on_stale_english() {
+        let mut s = "You are grok-hyper.\nThis is a messaging channel. Think and reply in the user's language. If they wrote Chinese, reasoning must be Chinese, not English.\n".to_string();
+        ensure_im_system_lock(&mut s);
+        assert!(s.contains(IM_SYSTEM_LOCK_ZH), "{s}");
+        assert_eq!(s.matches(IM_SYSTEM_LOCK_ZH).count(), 1);
+        ensure_im_system_lock(&mut s);
+        assert_eq!(s.matches(IM_SYSTEM_LOCK_ZH).count(), 1);
+    }
+
+    #[test]
+    fn ensure_im_system_lock_on_messages_patches_system() {
+        let mut msgs = vec![
+            ChatMessage::system("old feishu system"),
+            ChatMessage::user("在吗"),
+        ];
+        ensure_im_system_lock_on_messages(&mut msgs);
+        let sys = msgs[0].content.as_deref().unwrap();
+        assert!(sys.contains(IM_SYSTEM_LOCK_ZH), "{sys}");
+        assert!(sys.contains("old feishu system"), "{sys}");
     }
 }

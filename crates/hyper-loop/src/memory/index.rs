@@ -168,6 +168,8 @@ fn walk_index(index: &MemoryIndex, root: &Path, dir: &Path) -> Result<()> {
 fn kind_for(rel: &str) -> &'static str {
     if rel.starts_with("digest/") {
         "digest"
+    } else if rel.starts_with("memory/chats/") {
+        "chat"
     } else if rel.starts_with("memory/") {
         "daily"
     } else {

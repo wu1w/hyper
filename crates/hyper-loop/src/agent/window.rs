@@ -239,7 +239,7 @@ impl<C: Completer> Agent<C> {
     }
 
     pub(crate) fn try_compact(&mut self) -> bool {
-        if self.log.is_some() {
+        let compacted = if self.log.is_some() {
             let plan = self.log.as_ref().and_then(|log| plan_compact(log.events()));
             let Some(plan) = plan else {
                 return false;
@@ -257,13 +257,20 @@ impl<C: Completer> Agent<C> {
             true
         } else {
             false
+        };
+        if compacted {
+            self.refresh_workset_cards();
+            let user = self.last_real_user().to_string();
+            self.refresh_history_cards(&user);
         }
+        compacted
     }
 
     pub(crate) fn after_compact(&mut self) {
         self.handler.reset_repeat(&self.session_id);
         self.observed_paths.clear();
         self.read_paths.clear();
+        crate::lock_unpoison(&self.read_full).clear();
     }
 }
 

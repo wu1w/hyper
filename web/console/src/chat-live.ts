@@ -63,7 +63,15 @@ export function applyHistoryIncoming(
  * overlay can be dropped without a blank transcript.
  */
 export function coversLive(events: SessionEvent[], live: LiveBuf): boolean {
-  if (!live.content) return true;
+  if (!live.content) {
+    if (!live.think) return true;
+    // Prepare hints are host chrome. Drop them once this turn already hopped,
+    // so a history refetch does not resurrect「正在连接模型」between tools.
+    if (isPrepareHint(live.think)) return turnHasHop(events);
+    // Final reply already in events: leftover CoT overlay is not the answer.
+    if (lastAssistantInCurrentTurn(events)) return true;
+    return false;
+  }
   const a = lastAssistantInCurrentTurn(events);
   if (!a) return false;
   if (a.includes(live.content)) return true;
@@ -72,8 +80,28 @@ export function coversLive(events: SessionEvent[], live: LiveBuf): boolean {
   return a.length > 0;
 }
 
+function turnHasHop(events: SessionEvent[]): boolean {
+  let lastUser = -1;
+  for (let i = events.length - 1; i >= 0; i--) {
+    if (events[i].type === "user") {
+      lastUser = i;
+      break;
+    }
+  }
+  for (let i = lastUser + 1; i < events.length; i++) {
+    const t = events[i].type;
+    if (t === "assistant" || t === "tool") return true;
+  }
+  return false;
+}
+
 export function nextLive(events: SessionEvent[], live: LiveBuf): LiveBuf {
   return coversLive(events, live) ? { think: "", content: "" } : live;
+}
+
+/** Pulse think only before this hop has tools or spoken tokens. */
+export function thinkOverlayLive(opts: { hasTools: boolean; hasContent: boolean }): boolean {
+  return !opts.hasTools && !opts.hasContent;
 }
 
 function firstSentence(s: string): { head: string; rest: string } {
@@ -95,6 +123,56 @@ export function isPrepareHint(think: string): boolean {
 }
 
 export const CONNECT_HINT = "正在连接模型…\n";
+export const PREPARE_HINT = "正在准备工作区…\n";
+
+export type RunPhase =
+  | "idle"
+  | "waiting"
+  | "thinking"
+  | "writing"
+  | "tool"
+  | "permit"
+  | "clarify"
+  | "stopping"
+  | "retrying"
+  | "preparing";
+
+export function runPhase(opts: {
+  busy: boolean;
+  aborting?: boolean;
+  live: LiveBuf;
+  events: SessionEvent[];
+  permit?: unknown;
+  clarify?: unknown;
+}): RunPhase {
+  if (opts.clarify) return "clarify";
+  if (opts.permit) return "permit";
+  if (opts.aborting) return "stopping";
+  if (!opts.busy) {
+    // stop 往往早于最后一跳正文。思考 overlay 不能把芯片钉在「思考中」。
+    if (opts.live.content) return "writing";
+    return "idle";
+  }
+  const lifecycle = [...opts.events].reverse().find((event) =>
+    event.type === "tool/lifecycle" || event.type === "step" || event.type === "run"
+  );
+  if (lifecycle?.type === "tool/lifecycle") {
+    if (lifecycle.phase === "started") return "tool";
+    if (lifecycle.phase === "error") return "retrying";
+  }
+  if (lifecycle?.type === "step" && lifecycle.phase === "started") {
+    if (opts.live.think) return "thinking";
+    return "waiting";
+  }
+  if (opts.live.content) return "writing";
+  if (opts.live.think.includes("网络不稳") || opts.live.think.includes("正在重连")) return "retrying";
+  if (isPrepareHint(opts.live.think)) return "preparing";
+  if (opts.live.think) return "thinking";
+  const last = opts.events[opts.events.length - 1];
+  if (last?.type === "tool") return "tool";
+  if (last?.type === "assistant" && (last.tool_calls?.length ?? 0) > 0) return "tool";
+  return "waiting";
+}
 
 function isRestatementSentence(user: string, sentence: string): boolean {
   const u = user.trim();
@@ -123,7 +201,7 @@ function isRestatementSentence(user: string, sentence: string): boolean {
  * the model never sees this.
  */
 export function stripThinkRestatement(user: string, think: string): string {
-  let rest = think.trim();
+  let rest = stripLeakedToolJson(think).trim();
   if (!user.trim() || !rest) return rest;
   for (let i = 0; i < 4 && rest; i++) {
     const { head, rest: tail } = firstSentence(rest);
@@ -131,6 +209,49 @@ export function stripThinkRestatement(user: string, think: string): string {
     rest = tail;
   }
   return rest;
+}
+
+const WRITE_TOOL_NAME =
+  /"name"\s*:\s*"(Write|StrReplace|Delete|write|str_replace|strreplace|delete|Edit)"/;
+
+/** Display-only: drop leaked Write/StrReplace JSON fences from the think panel. */
+export function stripLeakedToolJson(think: string): string {
+  if (!think) return think;
+  let out = "";
+  let i = 0;
+  while (i < think.length) {
+    const start = think.indexOf("```", i);
+    if (start < 0) {
+      out += holdBareWriteJson(think.slice(i));
+      break;
+    }
+    out += think.slice(i, start);
+    const after = start + 3;
+    const nl = think.indexOf("\n", after);
+    if (nl < 0) break;
+    const lang = think.slice(after, nl).trim();
+    const close = think.indexOf("```", nl + 1);
+    if (close < 0) break;
+    const inner = think.slice(nl + 1, close).trim();
+    const jsonish = !lang || /^json$/i.test(lang);
+    if (jsonish && WRITE_TOOL_NAME.test(inner) && (inner.startsWith("{") || inner.startsWith("["))) {
+      i = close + 3;
+      continue;
+    }
+    out += think.slice(start, close + 3);
+    i = close + 3;
+  }
+  return out;
+}
+
+function holdBareWriteJson(tail: string): string {
+  const trimmed = tail.trimEnd();
+  const nl = trimmed.lastIndexOf("\n");
+  const lineAt = nl < 0 ? 0 : nl + 1;
+  const line = trimmed.slice(lineAt).trimStart();
+  if (!(line.startsWith("{") || line.startsWith("["))) return tail;
+  if (WRITE_TOOL_NAME.test(line)) return tail.slice(0, lineAt);
+  return tail;
 }
 
 const TOOL_MARKUP = ["<tool_calls>", "<tool_call>", "<tool_results>", "<tool_result>"] as const;
@@ -183,4 +304,68 @@ export function stripLeakedToolMarkup(text: string): string {
   }
   if (cut < 0) return text;
   return text.slice(0, cut).trimEnd();
+}
+
+export type DiffLine = { kind: "ctx" | "add" | "del"; text: string };
+
+export type EditDiffView = {
+  kind: "replace" | "write";
+  path: string;
+  lines: DiffLine[];
+};
+
+const DIFF_LINE_CAP = 240;
+
+function capDiffLines(lines: DiffLine[]): DiffLine[] {
+  if (lines.length <= DIFF_LINE_CAP) return lines;
+  const extra = lines.length - DIFF_LINE_CAP;
+  return [...lines.slice(0, DIFF_LINE_CAP), { kind: "ctx", text: `… ${extra} more lines` }];
+}
+
+/** Shared prefix/suffix hunk so StrReplace reads like Cursor, not a full Myers diff. */
+export function editDiffLines(oldStr: string, newStr: string): DiffLine[] {
+  const a = oldStr.split("\n");
+  const b = newStr.split("\n");
+  let i = 0;
+  while (i < a.length && i < b.length && a[i] === b[i]) i++;
+  let ja = a.length - 1;
+  let jb = b.length - 1;
+  while (ja >= i && jb >= i && a[ja] === b[jb]) {
+    ja--;
+    jb--;
+  }
+  const out: DiffLine[] = [];
+  for (let k = 0; k < i; k++) out.push({ kind: "ctx", text: a[k] });
+  for (let k = i; k <= ja; k++) out.push({ kind: "del", text: a[k] });
+  for (let k = i; k <= jb; k++) out.push({ kind: "add", text: b[k] });
+  for (let k = ja + 1; k < a.length; k++) out.push({ kind: "ctx", text: a[k] });
+  return out;
+}
+
+export function editDiffFromTool(name: string, args: string): EditDiffView | null {
+  const key = (name || "").toLowerCase().replace(/_/g, "");
+  let obj: Record<string, unknown>;
+  try {
+    obj = JSON.parse(args || "{}") as Record<string, unknown>;
+  } catch {
+    return null;
+  }
+  if (!obj || typeof obj !== "object" || Array.isArray(obj)) return null;
+  const str = (k: string) => (typeof obj[k] === "string" ? obj[k] : "");
+  const path = str("path");
+  if (key === "strreplace" || key === "edit") {
+    if (!("old_string" in obj) && !("new_string" in obj)) return null;
+    return {
+      kind: "replace",
+      path,
+      lines: capDiffLines(editDiffLines(str("old_string"), str("new_string"))),
+    };
+  }
+  if (key === "write") {
+    if (!("contents" in obj) && !path) return null;
+    const contents = str("contents");
+    const lines = contents.split("\n").map((text) => ({ kind: "add" as const, text }));
+    return { kind: "write", path, lines: capDiffLines(lines) };
+  }
+  return null;
 }

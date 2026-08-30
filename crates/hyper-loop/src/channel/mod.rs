@@ -9,11 +9,15 @@ mod dingtalk;
 mod envelope;
 mod feishu;
 pub(crate) mod ilink_cdn;
+mod im_md;
 mod inbound;
+pub(crate) mod interaction;
 mod mailbox;
 mod manager;
 mod outbound;
+mod pair;
 mod poll_lock;
+mod progress;
 mod qq;
 pub mod qrcode;
 mod router;
@@ -26,8 +30,10 @@ pub(crate) mod xfer;
 
 pub use catalog::{catalog_json, endpoint_kind, CATALOG};
 pub use envelope::{ChannelAddress, ContentPart, NativePayload};
-pub use inbound::{keep_client_watched, serve_endpoint, serve_qq, ClientWatch};
-pub use mailbox::{push_steer, take_steer, BusyDecision, BusyPolicy, Inbound, Mailbox, SteerSlot};
+pub use inbound::{keep_client_watched, serve_endpoint, serve_qq, spawn_im_pump, ClientWatch};
+pub use mailbox::{
+    has_steer, push_steer, take_steer, BusyDecision, BusyPolicy, Inbound, Mailbox, SteerSlot,
+};
 pub use manager::{ChannelHandler, ChannelManager, IngestResult};
 pub use outbound::{deliver, outbound_notification, parts_to_text, reply_parts, reply_text};
 pub use qrcode::{fetch_qrcode, poll_qrcode};
@@ -97,9 +103,9 @@ impl Default for ChannelEndpoint {
             enabled: false,
             allow_from: Vec::new(),
             deny_from: Vec::new(),
-            require_mention: false,
-            dm_policy: "open".into(),
-            group_policy: "open".into(),
+            require_mention: true,
+            dm_policy: "allowlist".into(),
+            group_policy: "mention".into(),
             reply_url: String::new(),
             bind: String::new(),
             secret: String::new(),
@@ -167,7 +173,8 @@ pub fn remove_channel_endpoint(list: &mut Vec<ChannelEndpoint>, id: &str) {
 #[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
 #[serde(default)]
 pub struct ChannelsConfig {
-    /// Hermes `/busy` default for every session.
+    /// Busy follow-up policy. `steer` is the responsive default; `/queue`
+    /// remains available when the user explicitly wants a later turn.
     pub busy: String,
     /// Surfaces allowed to enqueue. `cli` and `sidecar` are always implied.
     pub enabled: Vec<String>,
@@ -177,7 +184,7 @@ pub struct ChannelsConfig {
 impl Default for ChannelsConfig {
     fn default() -> Self {
         Self {
-            busy: "interrupt".into(),
+            busy: "steer".into(),
             enabled: vec!["cli".into(), "sidecar".into()],
             endpoints: Vec::new(),
         }
@@ -186,7 +193,7 @@ impl Default for ChannelsConfig {
 
 impl ChannelsConfig {
     pub fn busy_policy(&self) -> BusyPolicy {
-        self.busy.parse().unwrap_or(BusyPolicy::Interrupt)
+        self.busy.parse().unwrap_or(BusyPolicy::Steer)
     }
 
     pub fn list_json(&self) -> serde_json::Value {
@@ -219,11 +226,77 @@ impl ChannelsConfig {
                 && (e.id.eq_ignore_ascii_case(channel) || e.kind.eq_ignore_ascii_case(channel))
         })
     }
+
+    /// Resolve the exact adapter instance first, then fall back to the legacy
+    /// platform kind. This keeps two bots of the same kind isolated.
+    pub fn endpoint_for_payload(&self, env: &NativePayload) -> Option<&ChannelEndpoint> {
+        env.meta
+            .get("endpoint_id")
+            .and_then(serde_json::Value::as_str)
+            .and_then(|id| self.endpoint_for(id))
+            .or_else(|| self.endpoint_for(&env.channel))
+    }
+}
+
+pub(crate) fn stamp_endpoint(env: &mut NativePayload, ep: &ChannelEndpoint) {
+    env.meta.insert(
+        "endpoint_id".into(),
+        serde_json::Value::String(ep.id.clone()),
+    );
+    if env.channel.is_empty() {
+        env.channel = if ep.kind.is_empty() {
+            ep.id.clone()
+        } else {
+            ep.kind.clone()
+        };
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn default_busy_is_steer() {
+        assert_eq!(ChannelsConfig::default().busy_policy(), BusyPolicy::Steer);
+        assert_eq!(
+            ChannelsConfig {
+                busy: "nope".into(),
+                ..ChannelsConfig::default()
+            }
+            .busy_policy(),
+            BusyPolicy::Steer
+        );
+    }
+
+    #[test]
+    fn payload_endpoint_id_beats_shared_platform_kind() {
+        let cfg = ChannelsConfig {
+            endpoints: vec![
+                ChannelEndpoint {
+                    id: "work-bot".into(),
+                    kind: "feishu".into(),
+                    enabled: true,
+                    ..ChannelEndpoint::default()
+                },
+                ChannelEndpoint {
+                    id: "personal-bot".into(),
+                    kind: "feishu".into(),
+                    enabled: true,
+                    ..ChannelEndpoint::default()
+                },
+            ],
+            ..ChannelsConfig::default()
+        };
+        let mut env = NativePayload::text_only("feishu", "hi");
+        env.sender_id = "u1".into();
+        stamp_endpoint(&mut env, &cfg.endpoints[1]);
+        assert_eq!(
+            cfg.endpoint_for_payload(&env).map(|ep| ep.id.as_str()),
+            Some("personal-bot")
+        );
+        assert_eq!(env.route_key(), "personal-bot:dm:u1");
+    }
 
     #[test]
     fn round_trip_save_keeps_secret_and_bot_token() {

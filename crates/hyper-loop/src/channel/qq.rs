@@ -2,9 +2,10 @@
 //!
 //! Phone「连接中」clears only after IDENTIFY → READY on this socket.
 
+use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::Arc;
-use std::time::Duration;
+use std::sync::{Arc, Mutex as StdMutex, OnceLock};
+use std::time::{Duration, Instant};
 
 use base64::engine::general_purpose::STANDARD;
 use base64::Engine;
@@ -226,6 +227,7 @@ async fn run_once(
                     let sid = payload["d"]["session_id"].as_str().unwrap_or("");
                     eprintln!("hyper qq ready session={sid}");
                 } else if let Some(mut env) = native_from_event(ep, t, &payload["d"]) {
+                    super::stamp_endpoint(&mut env, ep);
                     super::xfer::hydrate_http_parts(&mut env.content_parts).await;
                     env.text = super::xfer::query_text_of(&env.content_parts);
                     if env.content_parts.is_empty() {
@@ -267,6 +269,21 @@ fn first_str(vals: &[&Value]) -> String {
         }
     }
     String::new()
+}
+
+fn qq_is_mentioned(event: &str, d: &Value) -> bool {
+    match event {
+        "GROUP_AT_MESSAGE_CREATE" | "AT_MESSAGE_CREATE" => true,
+        "C2C_MESSAGE_CREATE" | "DIRECT_MESSAGE_CREATE" => false,
+        _ => {
+            d.get("mentions")
+                .and_then(Value::as_array)
+                .is_some_and(|a| !a.is_empty())
+                || d["content"]
+                    .as_str()
+                    .is_some_and(|c| c.contains("<@") || c.contains("@everyone"))
+        }
+    }
 }
 
 fn native_from_event(ep: &ChannelEndpoint, t: &str, d: &Value) -> Option<NativePayload> {
@@ -376,7 +393,7 @@ fn native_from_event(ep: &ChannelEndpoint, t: &str, d: &Value) -> Option<NativeP
     env.meta
         .insert("is_group".into(), json!(msg_type == "group"));
     env.meta
-        .insert("is_mentioned".into(), json!(msg_type != "c2c"));
+        .insert("is_mentioned".into(), json!(qq_is_mentioned(t, d)));
     if let Some(id) = d["id"].as_str() {
         env.meta.insert("msg_id".into(), json!(id));
     }
@@ -401,7 +418,7 @@ pub async fn send(
     let http = crate::llm_http::env_aware_client(20, TOKEN_URL)?;
     let token = access_token(&http, &app_id, &secret).await?;
     let bases = api_bases(ep);
-    let text = super::xfer::spoken_text(parts);
+    let text = super::im_md::separated_plain(&super::xfer::spoken_text(parts));
     if !text.trim().is_empty() {
         send_typed(
             &http,
@@ -434,6 +451,24 @@ pub async fn send(
     Ok(())
 }
 
+const TYPING_DEBOUNCE: Duration = Duration::from_secs(50);
+
+fn typing_due(openid: &str) -> bool {
+    static LAST: OnceLock<StdMutex<HashMap<String, Instant>>> = OnceLock::new();
+    let last = LAST.get_or_init(|| StdMutex::new(HashMap::new()));
+    let Ok(mut g) = last.lock() else {
+        return true;
+    };
+    let now = Instant::now();
+    if g.get(openid)
+        .is_some_and(|t| now.duration_since(*t) < TYPING_DEBOUNCE)
+    {
+        return false;
+    }
+    g.insert(openid.to_string(), now);
+    true
+}
+
 /// Hermes `_keep_typing`: C2C input_notify, 60s bubble, refresh before expiry.
 pub async fn send_typing(ep: Option<&ChannelEndpoint>, env: &NativePayload) -> Result<()> {
     let Some(ep) = ep else {
@@ -454,6 +489,14 @@ pub async fn send_typing(ep: Option<&ChannelEndpoint>, env: &NativePayload) -> R
         .unwrap_or("")
         .is_empty()
     {
+        return Ok(());
+    }
+    let openid = env
+        .meta
+        .get("user_openid")
+        .and_then(Value::as_str)
+        .unwrap_or(&env.sender_id);
+    if !openid.is_empty() && !typing_due(openid) {
         return Ok(());
     }
     let Some((app_id, secret)) = credentials(ep) else {
@@ -712,5 +755,56 @@ mod tests {
         env.meta.insert("group_openid".into(), json!("g1"));
         assert_eq!(messages_path(&env).unwrap(), "/v2/groups/g1/messages");
         assert_eq!(files_path(&env).unwrap(), "/v2/groups/g1/files");
+        assert!(!c2c_typing_ok(&env));
+    }
+
+    #[test]
+    fn c2c_typing_needs_msg_id() {
+        let mut env = NativePayload::default();
+        env.channel = "qq".into();
+        env.meta.insert("message_type".into(), json!("c2c"));
+        env.meta.insert("user_openid".into(), json!("u1"));
+        assert!(!c2c_typing_ok(&env));
+        env.meta.insert("msg_id".into(), json!("m1"));
+        assert!(c2c_typing_ok(&env));
+        env.meta.insert("message_type".into(), json!("group"));
+        assert!(!c2c_typing_ok(&env));
+    }
+
+    #[test]
+    fn group_at_is_mentioned_c2c_is_not() {
+        let ep = ChannelEndpoint {
+            kind: "qq".into(),
+            ..ChannelEndpoint::default()
+        };
+        let c2c = native_from_event(
+            &ep,
+            "C2C_MESSAGE_CREATE",
+            &json!({
+                "author": {"user_openid": "u1", "username": "will"},
+                "content": "删掉这个",
+                "id": "m1",
+            }),
+        )
+        .unwrap();
+        assert!(!c2c.is_mentioned());
+        assert!(!c2c.is_group());
+        let group = native_from_event(
+            &ep,
+            "GROUP_AT_MESSAGE_CREATE",
+            &json!({
+                "author": {"member_openid": "u1", "username": "will"},
+                "content": "删掉这个",
+                "id": "m2",
+                "group_openid": "g1",
+            }),
+        )
+        .unwrap();
+        assert!(group.is_mentioned());
+        assert!(group.is_group());
+        assert!(!qq_is_mentioned(
+            "GROUP_MESSAGE_CREATE",
+            &json!({"content": "删掉这个"})
+        ));
     }
 }

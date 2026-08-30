@@ -273,6 +273,87 @@ pub struct ToolEvent {
     pub media: Vec<StoredMedia>,
 }
 
+/// Host-authored context that is model-visible but is not a real user turn.
+/// Older logs stored these cards as `<tool_response>`-wrapped `user` events;
+/// keeping a distinct type makes routing, titles and UI turn geometry honest.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ContextEvent {
+    #[serde(default = "default_context_kind")]
+    pub kind: String,
+    pub text: String,
+}
+
+fn default_context_kind() -> String {
+    "runtime".into()
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum RunPhase {
+    Accepted,
+    Started,
+    Completed,
+    Aborted,
+    Error,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RunLifecycleEvent {
+    pub run_id: String,
+    pub turn_id: String,
+    pub phase: RunPhase,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
+    pub at_ms: u64,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum StepPhase {
+    Started,
+    Completed,
+    Error,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct StepLifecycleEvent {
+    pub run_id: String,
+    pub turn_id: String,
+    pub step_id: u32,
+    pub phase: StepPhase,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub prompt_tokens: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub completion_tokens: Option<u64>,
+    pub at_ms: u64,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ToolLifecyclePhase {
+    Scheduled,
+    Started,
+    Completed,
+    Error,
+    Interrupted,
+    Skipped,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ToolLifecycleEvent {
+    pub run_id: String,
+    pub turn_id: String,
+    pub step_id: u32,
+    pub tool_call_id: String,
+    pub name: String,
+    pub phase: ToolLifecyclePhase,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub summary: Option<String>,
+    pub at_ms: u64,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct StoredMedia {
     pub kind: String,
@@ -342,6 +423,14 @@ pub enum SessionEvent {
     Assistant(AssistantEvent),
     #[serde(rename = "tool")]
     Tool(ToolEvent),
+    #[serde(rename = "context")]
+    Context(ContextEvent),
+    #[serde(rename = "run")]
+    Run(RunLifecycleEvent),
+    #[serde(rename = "step")]
+    Step(StepLifecycleEvent),
+    #[serde(rename = "tool/lifecycle")]
+    ToolLifecycle(ToolLifecycleEvent),
     #[serde(rename = "policy")]
     Policy(PolicyEvent),
     #[serde(rename = "session/fork")]
@@ -363,6 +452,72 @@ impl SessionEvent {
         Self::User(UserEvent {
             text: text.into(),
             media: Vec::new(),
+        })
+    }
+
+    pub fn context(kind: impl Into<String>, text: impl Into<String>) -> Self {
+        Self::Context(ContextEvent {
+            kind: kind.into(),
+            text: text.into(),
+        })
+    }
+
+    pub fn run(
+        run_id: impl Into<String>,
+        turn_id: impl Into<String>,
+        phase: RunPhase,
+        reason: Option<String>,
+    ) -> Self {
+        Self::Run(RunLifecycleEvent {
+            run_id: run_id.into(),
+            turn_id: turn_id.into(),
+            phase,
+            reason: reason.filter(|s| !s.is_empty()),
+            at_ms: event_now_ms(),
+        })
+    }
+
+    pub fn step(
+        run_id: impl Into<String>,
+        turn_id: impl Into<String>,
+        step_id: u32,
+        phase: StepPhase,
+        reason: Option<String>,
+        usage: Option<(u64, u64)>,
+    ) -> Self {
+        let (prompt_tokens, completion_tokens) = usage
+            .map(|(p, c)| (Some(p), Some(c)))
+            .unwrap_or((None, None));
+        Self::Step(StepLifecycleEvent {
+            run_id: run_id.into(),
+            turn_id: turn_id.into(),
+            step_id,
+            phase,
+            reason: reason.filter(|s| !s.is_empty()),
+            prompt_tokens,
+            completion_tokens,
+            at_ms: event_now_ms(),
+        })
+    }
+
+    pub fn tool_lifecycle(
+        run_id: impl Into<String>,
+        turn_id: impl Into<String>,
+        step_id: u32,
+        tool_call_id: impl Into<String>,
+        name: impl Into<String>,
+        phase: ToolLifecyclePhase,
+        summary: Option<String>,
+    ) -> Self {
+        Self::ToolLifecycle(ToolLifecycleEvent {
+            run_id: run_id.into(),
+            turn_id: turn_id.into(),
+            step_id,
+            tool_call_id: tool_call_id.into(),
+            name: name.into(),
+            phase,
+            summary: summary.filter(|s| !s.is_empty()),
+            at_ms: event_now_ms(),
         })
     }
 
@@ -540,6 +695,10 @@ impl SessionEvent {
             Self::User(_) => "user",
             Self::Assistant(_) => "assistant",
             Self::Tool(_) => "tool",
+            Self::Context(_) => "context",
+            Self::Run(_) => "run",
+            Self::Step(_) => "step",
+            Self::ToolLifecycle(_) => "tool/lifecycle",
             Self::Policy(_) => "policy",
             Self::Fork(_) => "session/fork",
             Self::Compact(_) => "session/compact",
@@ -549,6 +708,13 @@ impl SessionEvent {
             Self::Subagent(_) => "subagent",
         }
     }
+}
+
+fn event_now_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis().min(u64::MAX as u128) as u64)
+        .unwrap_or(0)
 }
 
 pub fn policy_for_effort(effort: Effort) -> ThinkPolicy {

@@ -65,7 +65,7 @@ function parseSteps(s: string): number | null {
 const PRICE_CLIFF = 200_000;
 const SESSION_URL = "https://cli-chat-proxy.grok.com/v1";
 const XAI_URL = "https://api.x.ai/v1";
-const CURSOR_TOOLS = "Read / Write / StrReplace / Shell / Grep / Glob / WebSearch / WebFetch / TodoWrite / AskQuestion / Task";
+const CURSOR_TOOLS = "Read / Write / StrReplace / Delete / Glob / Grep / ReadLints / EditNotebook / Shell / WebSearch / WebFetch / GenerateImage / TodoWrite / AskQuestion / SwitchMode / Task / AwaitShell";
 
 type AuthMode = "session" | "api_key" | "custom";
 
@@ -438,7 +438,7 @@ export function CronPage({ active = true, busy = false }: { active?: boolean; bu
     if (busy) {
       const ok = await uiConfirm(
         "正在回复其他消息",
-        "立即运行会按忙碌策略处理（默认打断当前轮）。仍要现在运行？",
+        "立即运行会按忙碌策略处理（默认在安全边界转向当前轮）。仍要现在运行？",
         { okLabel: "运行" },
       );
       if (!ok) return;
@@ -544,7 +544,7 @@ export function HeartbeatPage({ active = true, busy = false }: { active?: boolea
     if (busy) {
       const ok = await uiConfirm(
         "正在回复其他消息",
-        "立即运行会按忙碌策略处理（默认打断当前轮）。仍要现在运行？",
+        "立即运行会按忙碌策略处理（默认在安全边界转向当前轮）。仍要现在运行？",
         { okLabel: "运行" },
       );
       if (!ok) return;
@@ -658,7 +658,7 @@ export function FilesPage({
   const [picking, setPicking] = useState(false);
   const [browse, setBrowse] = useState<WsBrowse | null>(null);
   const [browseErr, setBrowseErr] = useState("");
-  const locked = busy || applying || picking;
+  const locked = applying || picking;
 
   const load = async () => {
     const [tree, ws] = await Promise.all([
@@ -757,7 +757,7 @@ export function FilesPage({
     <div className={`page${previewMax ? " pv-maxed" : ""}`}>
       <PageHead
         title="文件"
-        hint="工作区文件夹。换目录后 Read / Write / StrReplace 都跟过来。"
+        hint="工作区文件夹。换目录后 Read / Write / StrReplace 都跟过来，并写入当前会话 JSONL。"
         actions={
           <>
             {sel ? (
@@ -773,6 +773,11 @@ export function FilesPage({
         }
       />
       <div className="page-body" style={{ display: "flex", flexDirection: "column" }}>
+        {busy ? (
+          <div className="sub" style={{ margin: "0 0 8px" }}>
+            当前会话正在跑一轮，换目录会失败。先等它结束或点停止，再打开；选定后会写入本会话，重启也不会回到旧目录。
+          </div>
+        ) : null}
         <div className="toolbar">
           <input
             className="input inline mono"
@@ -1254,23 +1259,29 @@ export function ToolsPage({ active = true }: { active?: boolean }) {
     view?: { function?: { name: string; description: string } };
     computer?: { function?: { name: string; description: string } };
     computer_enabled?: boolean;
+    code_search_enabled?: boolean;
+    media_enabled?: boolean;
     skill?: { function?: { name: string; description: string } };
     mcp?: { function?: { name: string; description: string } };
     web?: { function?: { name?: string; description?: string } };
   }>({});
   const [webCfg, setWebCfg] = useState<WebCfg | null>(null);
-  const [computerOn, setComputerOn] = useState(true);
+  const [computerOn, setComputerOn] = useState(false);
+  const [searchOn, setSearchOn] = useState(false);
   const [computerMsg, setComputerMsg] = useState("");
+  const [searchMsg, setSearchMsg] = useState("");
   useEffect(() => {
     if (!active) return;
     api<typeof j>("/tools").then((t) => {
       setJ(t);
       if (typeof t.computer_enabled === "boolean") setComputerOn(t.computer_enabled);
+      if (typeof t.code_search_enabled === "boolean") setSearchOn(t.code_search_enabled);
     });
-    api<{ web?: WebCfg; features?: { computer_use?: boolean } }>("/config")
+    api<{ web?: WebCfg; features?: { computer_use?: boolean; code_search?: boolean } }>("/config")
       .then((c) => {
         setWebCfg(c.web ?? null);
         if (typeof c.features?.computer_use === "boolean") setComputerOn(c.features.computer_use);
+        if (typeof c.features?.code_search === "boolean") setSearchOn(c.features.code_search);
       })
       .catch(() => setWebCfg(null));
   }, [active]);
@@ -1282,6 +1293,16 @@ export function ToolsPage({ active = true }: { active?: boolean }) {
       setComputerMsg("已保存，下一轮对话生效");
     } catch (e) {
       setComputerMsg(failMsg(e));
+    }
+  };
+  const saveSearch = async (v: boolean) => {
+    setSearchMsg("");
+    try {
+      await api("/config", { method: "POST", body: JSON.stringify({ code_search: v }) });
+      setSearchOn(v);
+      setSearchMsg("已保存，下一轮对话生效");
+    } catch (e) {
+      setSearchMsg(failMsg(e));
     }
   };
   const frozen = j.frozen || [];
@@ -1320,8 +1341,8 @@ export function ToolsPage({ active = true }: { active?: boolean }) {
               view
             </h2>
             <div className="sub">{j.view?.function?.description || "媒体预览"}</div>
-            <span className="pill ok" style={{ marginTop: 8, display: "inline-block" }}>
-              追加 blob
+            <span className="pill idle" style={{ marginTop: 8, display: "inline-block" }}>
+              media.enabled 才挂
             </span>
           </div>
           <div className="card">
@@ -1367,6 +1388,27 @@ export function ToolsPage({ active = true }: { active?: boolean }) {
               在运行 hyper 的这台电脑上执行，不是浏览器里。macOS 需「屏幕录制」+「辅助功能」；点击/打字在 ask/auto 下会审批。Task 子代理看不到也不会执行。下一轮对话生效。
             </div>
             {computerMsg ? <div className="sub" style={{ marginTop: 6 }}>{computerMsg}</div> : null}
+          </div>
+          <div className="card">
+            <h2>
+              <Icon name="search" />
+              Search
+            </h2>
+            <div className="sub">工作区 FTS。冻结 17 里已有 Grep / Glob / Read，默认不挂。</div>
+            <div className="switch-row" style={{ marginTop: 8 }}>
+              <span className={`pill ${searchOn ? "ok" : "idle"}`}>
+                {searchOn ? "已启用" : "未启用"}
+              </span>
+              <Switch
+                checked={searchOn}
+                onChange={(v) => void saveSearch(v)}
+                label="启用 Search"
+              />
+            </div>
+            <div className="sub" style={{ marginTop: 8 }}>
+              打开后下一轮 tools[] 在冻结 17 后面追加 Search。grok-4.6 的 Cursor 分布是 Grep。
+            </div>
+            {searchMsg ? <div className="sub" style={{ marginTop: 6 }}>{searchMsg}</div> : null}
           </div>
           <div className="card">
             <h2>
@@ -1882,13 +1924,13 @@ export function SettingsPage({ active = true }: { active?: boolean }) {
               <input
                 className="input mono"
                 inputMode="numeric"
-                placeholder="80"
+                placeholder="500"
                 value={maxSteps}
                 onChange={(e) => setMaxSteps(e.target.value)}
                 spellCheck={false}
               />
               <div className="sub" style={{ marginTop: 6 }}>
-                手填整数。每轮工具循环上限，默认 80，超长任务可加大。范围 1–10000。下一轮生效。
+                手填整数。每轮工具循环上限，默认 500，与 IM 相同。范围 1–10000。下一轮生效。
               </div>
             </div>
             <div className="sub" style={{ marginTop: 10 }}>

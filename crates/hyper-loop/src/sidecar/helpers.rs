@@ -11,7 +11,9 @@ use crate::policy::ThinkPolicy;
 use crate::prompt::{coding_prompt, periphery_section, session_prompt};
 use crate::session::{tools_hash, SessionMode, SessionStart, SlashCmd};
 use crate::skills::SkillCatalog;
-use crate::tools_schema::{agent_tools, code_tools, computer_use_tool, mcp_tool, view_tool};
+use crate::tools_schema::{
+    agent_tools, code_tools, computer_use_tool, dynamic_mcp_tools, search_tool, view_tool,
+};
 
 use super::types::{PolicyCaps, RpcError};
 
@@ -33,6 +35,74 @@ pub(crate) struct TurnStartParams {
     pub(crate) text: String,
     #[serde(default)]
     pub(crate) content_parts: Vec<ContentPart>,
+    #[serde(default)]
+    pub(crate) editor: Option<EditorParams>,
+}
+
+#[derive(Clone, Debug, Default, Deserialize)]
+pub(crate) struct EditorParams {
+    #[serde(default)]
+    pub(crate) active: Option<String>,
+    #[serde(default)]
+    pub(crate) files: Vec<EditorFileParam>,
+}
+
+#[derive(Clone, Debug, Default, Deserialize)]
+pub(crate) struct EditorFileParam {
+    #[serde(default)]
+    pub(crate) path: String,
+    #[serde(default)]
+    pub(crate) line: Option<u32>,
+    #[serde(default)]
+    pub(crate) selection: Option<String>,
+}
+
+impl EditorParams {
+    pub(crate) fn into_files(self) -> Vec<crate::sidecar::EditorFile> {
+        let mut files: Vec<crate::sidecar::EditorFile> = self
+            .files
+            .into_iter()
+            .filter_map(|f| {
+                let path = f.path.trim().replace('\\', "/");
+                if path.is_empty() {
+                    None
+                } else {
+                    Some(crate::sidecar::EditorFile {
+                        path,
+                        line: f.line.filter(|n| *n > 0),
+                        selection: f.selection.and_then(|s| {
+                            let t = s.trim();
+                            if t.is_empty() {
+                                None
+                            } else {
+                                Some(t.chars().take(800).collect())
+                            }
+                        }),
+                    })
+                }
+            })
+            .collect();
+        if let Some(active) = self.active {
+            let active = active.trim().replace('\\', "/");
+            if !active.is_empty() {
+                if let Some(i) = files.iter().position(|f| f.path == active) {
+                    let f = files.remove(i);
+                    files.insert(0, f);
+                } else {
+                    files.insert(
+                        0,
+                        crate::sidecar::EditorFile {
+                            path: active,
+                            line: None,
+                            selection: None,
+                        },
+                    );
+                }
+            }
+        }
+        files.truncate(12);
+        files
+    }
 }
 
 impl TurnStartParams {
@@ -126,7 +196,10 @@ pub(crate) fn sidecar_agent_surface(
     let cfg = Config::load_file_or_default();
     let mcp = McpRegistry::load(home, workspace, &cfg.mcp);
     if !mcp.servers.is_empty() {
-        tools.push(mcp_tool());
+        tools.extend(dynamic_mcp_tools());
+    }
+    if cfg.features.code_search {
+        tools.push(search_tool());
     }
     if cfg.media.enabled {
         tools.push(view_tool());

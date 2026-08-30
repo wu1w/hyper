@@ -643,14 +643,21 @@ fn workspace_busy_err() -> (StatusCode, String) {
     )
 }
 
+fn session_workspace_busy(g: &Inner) -> bool {
+    // Only the focused session. A parked chat must not block this folder change.
+    g.focused_live()
+}
+
 fn apply_workspace(g: &mut Inner, path: PathBuf) -> Result<Value, (StatusCode, String)> {
-    if g.session.turn_in_flight() || g.any_live() {
+    if session_workspace_busy(g) {
         return Err(workspace_busy_err());
     }
+    g.session
+        .set_workspace(path.clone())
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))?;
     persist_cfg(g, |cfg| {
         cfg.console.workspace = path.display().to_string();
     })?;
-    g.session.set_workspace(path);
     sync_cron_from_disk(g);
     push_state(g);
     Ok(json!({
@@ -666,7 +673,7 @@ async fn workspace_get(State(st): State<AppState>) -> Json<Value> {
         "ok": true,
         "workspace": g.session.workspace().display().to_string(),
         "parent": parent_dir(g.session.workspace()),
-        "turn_in_flight": g.session.turn_in_flight() || g.any_live(),
+        "turn_in_flight": session_workspace_busy(&g),
         "saved": g.cfg.console.workspace,
         "shortcuts": workspace_shortcuts(),
     }))
@@ -678,7 +685,7 @@ async fn workspace_post(
 ) -> Result<Json<Value>, (StatusCode, String)> {
     let current = {
         let g = st.inner.lock().await;
-        if g.session.turn_in_flight() || g.any_live() {
+        if session_workspace_busy(&g) {
             return Err(workspace_busy_err());
         }
         g.session.workspace().to_path_buf()
@@ -695,7 +702,7 @@ async fn workspace_post(
 async fn workspace_pick(State(st): State<AppState>) -> Result<Json<Value>, (StatusCode, String)> {
     {
         let g = st.inner.lock().await;
-        if g.session.turn_in_flight() || g.any_live() {
+        if session_workspace_busy(&g) {
             return Err(workspace_busy_err());
         }
     }
@@ -840,6 +847,8 @@ struct ConfigPatch {
     web_tavily_api_key: Option<String>,
     #[serde(default)]
     computer_use: Option<bool>,
+    #[serde(default)]
+    code_search: Option<bool>,
     /// session | api_key | custom。只改默认 base_url；不读、不回显 grok login 密钥。
     #[serde(default)]
     auth_mode: Option<String>,
@@ -943,8 +952,11 @@ async fn config_post(
         if let Some(v) = p.computer_use {
             cfg.features.computer_use = v;
         }
+        if let Some(v) = p.code_search {
+            cfg.features.code_search = v;
+        }
     })?;
-    if p.computer_use.is_some() {
+    if p.computer_use.is_some() || p.code_search.is_some() {
         g.session.refresh_surface();
     }
     let model = g.cfg.server.model.clone();
@@ -1503,10 +1515,12 @@ async fn tools_get(State(st): State<AppState>) -> Json<Value> {
     Json(json!({
         "ok": true,
         "frozen": agent_tools(),
-        "note": "OpenAI tools[] stays frozen (Read/Write/StrReplace/Shell/…). view, ComputerUse, mcp, and memory_search may be appended after that prefix; skill is never in tools[] (hidden cards / slash). Session start tools_hash includes whatever was appended at open.",
+        "note": "OpenAI tools[] is the frozen Cursor 17. Search / view / ComputerUse hang only when features.code_search, media.enabled, or features.computer_use are on. MCP three-piece hangs when servers exist. skill is never in tools[].",
         "view": view_tool(),
         "computer": computer_use_tool(),
         "computer_enabled": g.cfg.features.computer_use,
+        "code_search_enabled": g.cfg.features.code_search,
+        "media_enabled": g.cfg.media.enabled,
         "skill": skill_tool(),
         "mcp": mcp_tool(),
         "web": web,
@@ -1633,6 +1647,15 @@ mod tests {
         }))
         .unwrap();
         assert_eq!(patch.computer_use, Some(false));
+    }
+
+    #[test]
+    fn config_patch_accepts_code_search() {
+        let patch: ConfigPatch = serde_json::from_value(json!({
+            "code_search": true
+        }))
+        .unwrap();
+        assert_eq!(patch.code_search, Some(true));
     }
 
     #[test]

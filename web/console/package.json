@@ -7,7 +7,7 @@
     "dev": "vite",
     "build": "vite build",
     "preview": "vite preview",
-    "test": "node --experimental-strip-types --test src/chat-live.test.ts"
+    "test": "node --experimental-strip-types --test src/chat-live.test.ts src/tree.test.ts src/artifacts.test.ts src/md.test.ts"
   },
   "dependencies": {
     "@aiden0z/pptx-renderer": "^1.2.4",

@@ -21,6 +21,7 @@ mod channels;
 mod dsh_install;
 mod office;
 mod sidecar;
+mod vscode_install;
 
 #[derive(Parser, Debug)]
 #[command(
@@ -121,6 +122,13 @@ enum Command {
         #[arg(long)]
         skip_dsh: bool,
         /// Print paths; do not copy, build, or call dsh/npm.
+        #[arg(long)]
+        dry_run: bool,
+    },
+    /// Install Hyper as a VS Code / Cursor extension (optional; loop is still `hyper --sidecar`).
+    #[command(name = "vscode-install")]
+    VscodeInstall {
+        /// Print paths; do not copy or compile.
         #[arg(long)]
         dry_run: bool,
     },
@@ -230,6 +238,9 @@ async fn real_main() -> Result<ExitCode> {
             skip_dsh,
             dry_run,
         }),
+        Some(Command::VscodeInstall { dry_run }) => {
+            vscode_install::run(vscode_install::VscodeInstallOpts { dry_run })
+        }
         Some(Command::Web {
             bind,
             allow_lan,
@@ -705,6 +716,16 @@ mod clap_tests {
                 assert_eq!(profile, "hyper");
             }
             other => panic!("expected DshInstall, got {other:?}"),
+        }
+        assert!(cli.prompt.is_empty());
+    }
+
+    #[test]
+    fn vscode_install_is_not_swallowed_as_a_prompt() {
+        let cli = Cli::try_parse_from(["hyper", "vscode-install", "--dry-run"]).expect("parse");
+        match cli.command {
+            Some(Command::VscodeInstall { dry_run }) => assert!(dry_run),
+            other => panic!("expected VscodeInstall, got {other:?}"),
         }
         assert!(cli.prompt.is_empty());
     }

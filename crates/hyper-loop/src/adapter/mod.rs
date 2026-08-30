@@ -367,7 +367,7 @@ mod tests {
         let tools = agent_tools();
         let body = build_chat_body(&spec(&caps, &policy, &msgs, Some(&tools)));
         assert!(find_key(&body, "reasoning_effort").is_none(), "{body}");
-        assert_eq!(body["tools"].as_array().unwrap().len(), 13);
+        assert_eq!(body["tools"].as_array().unwrap().len(), 17);
         assert!(!contains_null(&body));
     }
 

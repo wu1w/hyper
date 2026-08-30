@@ -357,6 +357,28 @@ tr.sel td { background: var(--brand-soft); }
   display: flex; flex-direction: column;
   position: relative;
 }
+.ex-pane {
+  display: flex; flex-direction: column;
+  min-height: 0; height: 100%;
+}
+.ex-pane[hidden] { display: none; }
+.ex-pane .ex-root {
+  flex: 1 1 auto;
+  min-width: 0;
+  padding: 0;
+}
+.ex-root-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex: 0 0 auto;
+  padding: 0 8px 8px;
+}
+.ex-root { min-width: 0; font-family: var(--mono); font-weight: 500; font-size: 11px; color: var(--label-3); }
+.ex-scroll { flex: 1; overflow: auto; padding: 0 6px 12px; min-height: 0; }
+.ex-empty { padding: 12px 8px; }
+.ex-chev { width: 11px; height: 11px; flex: 0 0 11px; color: var(--label-3); }
+.tree-row.dirty { color: var(--warn); }
 .thread-inner, .composer-inner {
   width: 100%;
   max-width: min(56rem, 100%);
@@ -636,6 +658,8 @@ tr.sel td { background: var(--brand-soft); }
   padding: 4px 8px; border-radius: 6px;
   font-size: 12px; color: var(--label-2); text-align: left;
 }
+.step-bar { display: flex; align-items: center; gap: 2px; min-width: 0; }
+.step-bar .step-head { flex: 1 1 auto; }
 .step-head:hover { background: var(--hover); }
 .step-head .ico { width: 12px; height: 12px; flex: 0 0 12px; color: var(--label-3); }
 .step-name { flex: 0 0 auto; font-weight: 600; font-size: 11px; color: var(--label-2); }
@@ -657,12 +681,46 @@ tr.sel td { background: var(--brand-soft); }
   margin: 2px 4px 10px 27px; min-width: 0;
   animation: rise 0.16s var(--ease-out);
 }
+.edit-diff {
+  font-family: var(--mono);
+  font-size: 11px;
+  line-height: 1.45;
+  border: 0.5px solid var(--border-2);
+  border-radius: 6px;
+  overflow: auto;
+  max-height: 320px;
+  margin: 0 0 6px;
+  background: var(--paper-1);
+}
+.edit-diff-line {
+  display: flex;
+  gap: 8px;
+  white-space: pre;
+  padding: 0 8px;
+}
+.edit-diff-line.del { background: var(--danger-soft); color: var(--danger); }
+.edit-diff-line.add { background: var(--ok-soft); color: var(--ok); }
+.edit-diff-line.ctx { color: var(--label-3); }
+.edit-diff-gutter {
+  flex: 0 0 12px;
+  user-select: none;
+  opacity: 0.75;
+}
+.edit-diff-text { flex: 1 1 auto; min-width: 0; }
+.edit-diff-path {
+  display: block; width: 100%; border: 0; background: var(--hover);
+  font-family: var(--mono); font-size: 10.5px; color: var(--label-2);
+  text-align: left; padding: 4px 8px; cursor: pointer;
+}
+.edit-diff-path:hover { color: var(--brand); }
+.edit-diff-path:disabled { cursor: default; }
 .step-full.think-full {
   padding: 2px 0 2px 10px;
   border-left: 2px solid var(--brand);
   font-size: 12px; line-height: 1.6; color: var(--label-2);
   white-space: pre-wrap; overflow-wrap: anywhere;
 }
+.step.think.think-done { opacity: 0.45; }
 .step-full .pre.step-pre { max-height: 240px; margin: 0 0 6px; }
 
 .jump-anchor { position: relative; height: 0; z-index: 6; }
@@ -925,7 +983,7 @@ button.att-card { cursor: zoom-in; border: 0.5px solid var(--border-2); }
   position: absolute; left: 0; top: 0; bottom: 0; width: 6px;
   cursor: col-resize; z-index: 2;
 }
-.dt-tabs { display: flex; gap: 2px; margin-left: 8px; }
+.dt-tabs { display: flex; gap: 2px; margin-left: 8px; flex: 1; min-width: 0; flex-wrap: wrap; }
 .dt-tab {
   border: 0; background: transparent; color: var(--label-3);
   font-size: 11px; padding: 4px 8px; border-radius: 6px; cursor: pointer;
@@ -1062,7 +1120,7 @@ button.att-card { cursor: zoom-in; border: 0.5px solid var(--border-2); }
 .pv-grid input { width: 100%; border: 0; background: transparent; color: inherit; font: inherit; }
 .dt-head {
   padding: 10px 12px 8px 16px; font-size: 12px; font-weight: 700; color: var(--label-2);
-  display: flex; align-items: center; gap: 8px;
+  display: flex; align-items: center; flex-wrap: wrap; gap: 8px;
 }
 .dt-close { margin-left: auto; }
 
@@ -1387,7 +1445,8 @@ th.tick input, td.tick input {
   flex: 0 0 auto;
 }
 .agent-fail { margin-top: 8px; color: var(--danger); }
-.details.agent-open .dt-scroll.agent-fill {
+.details.agent-open .dt-scroll.agent-fill,
+.dt-scroll.tree-fill {
   display: flex;
   flex-direction: column;
   min-height: 0;

@@ -190,7 +190,7 @@ impl StreamPaint {
     pub(super) fn push_raw(&mut self, reasoning: &str, content: &str, has_tools: bool) {
         let (think, text) = visible_raw(reasoning, content);
         // Lifecycle SSE (`response.created` / empty prefill) must not wipe
-        // CONNECT_HINT — that is what made the console look stuck.
+        // PREPARE_HINT — that is what made the console look stuck.
         if think.is_empty() && text.is_empty() && !has_tools {
             return;
         }
@@ -249,7 +249,8 @@ impl StreamPaint {
     }
 
     fn emit_think(&mut self, full: &str) {
-        emit_suffix(&mut self.think_n, full, |d| self.sink.reasoning(d));
+        let vis = crate::think_visible::visible_think(full);
+        emit_suffix(&mut self.think_n, &vis, |d| self.sink.reasoning(d));
     }
 
     fn emit_text(&mut self, full: &str) {
@@ -459,6 +460,26 @@ mod tests {
         assert!(!state.text_streamed());
         paint.finish("", "done", false);
         assert!(state.text_streamed());
+    }
+
+    #[test]
+    fn leaked_write_json_is_not_reasoning_paint() {
+        let events = paint_events(&[(
+            "I'll write.\n```json\n{\"name\": \"Write\", \"path\": \"a.txt\", \"contents\": \"R97_OK\\n\"}\n```\nThen native Write.",
+            "",
+            true,
+        )]);
+        let think = texts(&events, DeltaChannel::Reasoning);
+        assert!(think.contains("I'll write."), "{think}");
+        assert!(think.contains("Then native Write."), "{think}");
+        assert!(!think.contains("R97_OK"), "{think}");
+        assert!(!think.contains("```"), "{think}");
+    }
+
+    #[test]
+    fn unclosed_write_json_fence_is_held() {
+        let events = paint_events(&[("I'll write.\n```json\n{\"name\": \"Write\"", "", false)]);
+        assert_eq!(texts(&events, DeltaChannel::Reasoning), "I'll write.\n");
     }
 
     #[test]

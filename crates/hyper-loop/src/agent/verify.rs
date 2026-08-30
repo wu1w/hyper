@@ -22,10 +22,22 @@ const CODE_EXT: &[&str] = &[
 
 pub fn is_code_path(path: &str) -> bool {
     let p = normalize(path);
+    if is_overlay_path(&p) {
+        return false;
+    }
     let Some((_, ext)) = p.rsplit_once('.') else {
         return false;
     };
     CODE_EXT.iter().any(|e| ext.eq_ignore_ascii_case(e))
+}
+
+/// Workspace overlay (overnight scripts, todos, session-local files) is not
+/// product source. Cargo/ruff/[refs] on it is think waste.
+fn is_overlay_path(p: &str) -> bool {
+    p == ".grok-hyper"
+        || p.starts_with(".grok-hyper/")
+        || p.contains("/.grok-hyper/")
+        || p.ends_with("/.grok-hyper")
 }
 
 /// tests/ or test/ directory component, or a test-named file.
@@ -41,6 +53,10 @@ pub fn is_test_path(path: &str) -> bool {
         }
     }
     file.starts_with("test_")
+        || file == "tests.rs"
+        || file == "tests.ts"
+        || file == "tests.js"
+        || file == "tests.py"
         || file.contains("_test.")
         || file.contains(".test.")
         || file.contains(".spec.")
@@ -456,6 +472,11 @@ mod tests {
         assert!(!is_code_path("notes.md"));
         assert!(!is_code_path("drafts/memo.txt"));
         assert!(!is_code_path("config.example.toml"));
+        assert!(!is_code_path(".grok-hyper/overnight/score_all.py"));
+        assert!(!is_code_path(
+            "/Users/william/grok-hyper/.grok-hyper/overnight/a.py"
+        ));
+        assert!(is_code_path("pkg/a.py"));
     }
 
     #[test]

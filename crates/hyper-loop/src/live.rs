@@ -17,7 +17,9 @@ mod tests {
     use crate::policy::{Effort, ThinkPolicy};
     use crate::session::{SessionLog, SessionMode};
     use crate::template::{is_hidden_user_text, wrap_tool_response, ChatMessage};
-    use crate::tools_schema::{agent_tools, mcp_tool, memory_search_tool, recall_tool, skill_tool};
+    use crate::tools_schema::{
+        agent_tools, dynamic_mcp_tools, memory_search_tool, recall_tool, skill_tool,
+    };
 
     fn live_cfg() -> Config {
         let (mut cfg, _) = Config::load_or_init().unwrap();
@@ -329,7 +331,7 @@ mod tests {
     async fn live_mcp_is_called() {
         let (http, cfg, model) = client().await;
         let mut tools = agent_tools();
-        tools.push(mcp_tool());
+        tools.extend(dynamic_mcp_tools());
         let system = format!(
             "{}{}",
             crate::prompt::coding_prompt("/tmp/ws"),
@@ -337,15 +339,13 @@ mod tests {
         );
         let messages = vec![
             ChatMessage::system(system),
-            ChatMessage::user(
-                "Call mcp with server echo and method list. Do not call bash or read.",
-            ),
+            ChatMessage::user("Call GetDynamicTools for server echo. Do not call Shell or Read."),
         ];
         let v = chat(&http, &cfg, &model, &messages, &tools).await;
         let names = tool_names(&v["choices"][0]["message"]);
         assert!(
-            names.iter().any(|n| n == "mcp"),
-            "27B did not call mcp: {names:?} {}",
+            names.iter().any(|n| n == "GetDynamicTools"),
+            "model did not call GetDynamicTools: {names:?} {}",
             v["choices"][0]["message"]
         );
     }
@@ -416,7 +416,7 @@ mod tests {
         tools.push(memory_search_tool());
         tools.push(skill_tool());
         tools.push(recall_tool());
-        tools.push(mcp_tool());
+        tools.extend(dynamic_mcp_tools());
         let system = format!(
             "{}{}",
             crate::prompt::coding_prompt("/tmp/ws"),

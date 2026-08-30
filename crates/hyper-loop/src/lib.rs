@@ -41,6 +41,7 @@ pub mod sticky;
 pub mod stutter;
 pub mod subagent;
 pub mod template;
+mod think_visible;
 pub mod tokenize;
 pub mod tool_calls;
 pub mod tools;

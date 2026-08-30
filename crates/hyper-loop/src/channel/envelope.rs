@@ -237,6 +237,22 @@ impl NativePayload {
         }
     }
 
+    /// Same route as `self`, text-only. Leftover IM steer after the last
+    /// tool hop becomes the next session_worker turn (sidecar `push_queue`).
+    pub fn follow_up_text(&self, text: impl Into<String>) -> Self {
+        let text = text.into();
+        Self {
+            channel: self.channel.clone(),
+            sender_id: self.sender_id.clone(),
+            sender_name: self.sender_name.clone(),
+            session_id: self.session_id.clone(),
+            content_parts: vec![ContentPart::text(&text)],
+            text: text.clone(),
+            prompt: text,
+            meta: self.meta.clone(),
+        }
+    }
+
     pub fn parts(&self) -> Vec<ContentPart> {
         if !self.content_parts.is_empty() {
             return self.content_parts.clone();
@@ -301,25 +317,65 @@ impl NativePayload {
         bool_meta(&self.meta, "is_mentioned") || bool_meta(&self.meta, "is_reply_to_bot")
     }
 
+    /// Feishu card button / Telegram callback. Not a typed user message.
+    pub fn is_choice_click(&self) -> bool {
+        bool_meta(&self.meta, "choice_click")
+            || string_meta(&self.meta, "callback_query_id").is_some_and(|id| !id.is_empty())
+    }
+
+    pub fn mark_choice_click(&mut self) {
+        self.meta
+            .insert("choice_click".into(), serde_json::json!(true));
+    }
+
     pub fn chat_id(&self) -> String {
         string_meta(&self.meta, "chat_id")
             .or_else(|| string_meta(&self.meta, "conversation_id"))
             .unwrap_or_else(|| self.sender_id.clone())
     }
 
+    /// One inbound user message → one progress bubble (Telegram/Feishu edit).
+    pub fn progress_bubble_key(&self) -> String {
+        let chat = self.chat_id();
+        let inbound = string_meta(&self.meta, "message_id");
+        match (
+            chat.is_empty(),
+            inbound.as_deref(),
+            self.session_id.as_str(),
+        ) {
+            (_, Some(mid), _) if !mid.is_empty() && chat.is_empty() => mid.to_string(),
+            (_, Some(mid), _) if !mid.is_empty() => format!("{chat}:{mid}"),
+            (true, _, sid) if !sid.is_empty() => sid.to_string(),
+            (false, _, sid) if !sid.is_empty() => format!("{chat}:{sid}"),
+            _ => chat,
+        }
+    }
+
     pub fn reply_url(&self) -> Option<String> {
         string_meta(&self.meta, "reply_url").or_else(|| string_meta(&self.meta, "session_webhook"))
     }
 
-    /// QwenPaw `resolve_session_id` default, with a group split.
+    /// Stable conversation identity. Endpoint and thread/topic dimensions keep
+    /// two bots or two Feishu/Slack threads in the same chat from sharing one
+    /// agent transcript.
     pub fn route_key(&self) -> String {
-        let ch = if self.channel.is_empty() {
-            "webhook"
-        } else {
-            self.channel.as_str()
-        };
+        let ch = string_meta(&self.meta, "endpoint_id").unwrap_or_else(|| {
+            if self.channel.is_empty() {
+                "webhook"
+            } else {
+                self.channel.as_str()
+            }
+            .to_string()
+        });
+        let thread = ["thread_id", "root_id", "topic_id", "message_thread_id"]
+            .into_iter()
+            .find_map(|key| string_meta(&self.meta, key))
+            .filter(|s| !s.is_empty());
         if self.is_group() {
-            format!("{ch}:g:{}", self.chat_id())
+            match thread {
+                Some(thread) => format!("{ch}:g:{}:t:{thread}", self.chat_id()),
+                None => format!("{ch}:g:{}", self.chat_id()),
+            }
         } else {
             let who = if self.sender_id.is_empty() {
                 self.chat_id()
@@ -383,12 +439,17 @@ fn string_meta(meta: &Map<String, Value>, key: &str) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serde_json::json;
 
     #[test]
     fn text_alias_becomes_parts() {
         let p = NativePayload::text_only("telegram", "hello");
         assert_eq!(p.query_text(), "hello");
         assert!(p.media_parts().is_empty());
+        assert!(!p.is_choice_click());
+        let mut click = NativePayload::text_only("feishu", "2");
+        click.mark_choice_click();
+        assert!(click.is_choice_click());
     }
 
     #[test]
@@ -421,5 +482,55 @@ mod tests {
         let m = NativePayload::merge(vec![a, b]).unwrap();
         assert!(m.query_text().contains('a'));
         assert_eq!(m.media_parts().len(), 1);
+    }
+
+    #[test]
+    fn progress_bubble_key_prefers_inbound_message_id() {
+        let mut env = NativePayload::text_only("telegram", "hi");
+        env.meta.insert("chat_id".into(), json!("9"));
+        env.session_id = "sess".into();
+        assert_eq!(env.progress_bubble_key(), "9:sess");
+        env.meta.insert("message_id".into(), json!(42));
+        assert_eq!(env.progress_bubble_key(), "9:42");
+        let mut hook = NativePayload::text_only("webhook", "hi");
+        hook.session_id = "overnight-im-hb-1".into();
+        assert_eq!(hook.progress_bubble_key(), "overnight-im-hb-1");
+    }
+
+    #[test]
+    fn follow_up_text_keeps_route_and_drops_media() {
+        let mut src = NativePayload::text_only("webhook", "long task");
+        src.session_id = "s1".into();
+        src.sender_id = "u1".into();
+        src.content_parts.push(ContentPart::Image {
+            image_url: "https://x/i.png".into(),
+            url: String::new(),
+            mime: String::new(),
+        });
+        let f = src.follow_up_text("also add tests");
+        assert_eq!(f.session_id, "s1");
+        assert_eq!(f.sender_id, "u1");
+        assert_eq!(f.channel, "webhook");
+        assert_eq!(f.query_text(), "also add tests");
+        assert!(f.media_parts().is_empty());
+    }
+
+    #[test]
+    fn route_key_is_scoped_by_endpoint_and_group_thread() {
+        let mut env = NativePayload::text_only("feishu", "hi");
+        env.sender_id = "u1".into();
+        env.meta.insert("endpoint_id".into(), json!("work-bot"));
+        assert_eq!(env.route_key(), "work-bot:dm:u1");
+
+        env.meta.insert("is_group".into(), json!(true));
+        env.meta.insert("chat_id".into(), json!("group-7"));
+        env.meta.insert("thread_id".into(), json!("thread-2"));
+        assert_eq!(
+            env.route_key(),
+            "work-bot:g:group-7:t:thread-2",
+            "threads in a shared room must not collide"
+        );
+        env.meta.insert("endpoint_id".into(), json!("personal-bot"));
+        assert_eq!(env.route_key(), "personal-bot:g:group-7:t:thread-2");
     }
 }

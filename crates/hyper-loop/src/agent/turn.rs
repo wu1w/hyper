@@ -9,10 +9,11 @@ use super::{Agent, AgentOutcome, Completer, ModelTurn};
 use crate::channel::take_steer;
 use crate::error::Result;
 use crate::paw_loop::{fs_tool_path, GateCtx, GateDecision, ToolFingerprint};
-use crate::session::{PolicyReason, SessionEvent};
+use crate::session::{PolicyReason, RunPhase, SessionEvent, StepPhase};
 use crate::sticky;
 use crate::template::{is_hidden_user_text, wrap_tool_response, ChatMessage};
-use crate::tool_calls::ToolState;
+use crate::tool_calls::{ToolCall, ToolState};
+use crate::tools_schema::dispatch_name;
 
 impl<C: Completer> Agent<C> {
     pub async fn run(&mut self, prompt: &str) -> Result<AgentOutcome> {
@@ -40,6 +41,15 @@ impl<C: Completer> Agent<C> {
 
     /// Drive an already-hydrated transcript (last message is the live user).
     pub async fn drive(&mut self) -> Result<AgentOutcome> {
+        self.begin_run();
+        let result = self.drive_inner().await;
+        if let Err(err) = &result {
+            self.end_run(RunPhase::Error, Some(err.to_string()));
+        }
+        result
+    }
+
+    async fn drive_inner(&mut self) -> Result<AgentOutcome> {
         // Per user turn, not per Agent lifetime. Sidecar/CLI construct a new
         // Agent each RPC, but in-process reuse (TUI, soak, channels) must not
         // inherit iteration/timeout/doom from the previous prompt.
@@ -48,6 +58,12 @@ impl<C: Completer> Agent<C> {
         self.last_spoken = None;
         self.tool_evidence.clear();
         self.read_paths.clear();
+        self.search_calls
+            .store(0, std::sync::atomic::Ordering::Relaxed);
+        crate::lock_unpoison(&self.search_queries).clear();
+        self.grep_calls
+            .store(0, std::sync::atomic::Ordering::Relaxed);
+        crate::lock_unpoison(&self.read_full).clear();
         self.channel_files.clear();
         self.observed_paths = observed_from_messages(&self.messages, &self.workspace);
         let user = self.last_real_user().to_string();
@@ -78,6 +94,9 @@ impl<C: Completer> Agent<C> {
                     }
                     return self.finish(text, None, steps);
                 }
+                if is_quiet_repeat_stop(&reason) {
+                    return self.finish(text, Some(reason), steps);
+                }
                 self.note(&reason);
                 return self.finish(text, Some(reason), steps);
             }
@@ -98,14 +117,30 @@ impl<C: Completer> Agent<C> {
                 Some(tools_owned.as_slice())
             };
 
+            self.current_step = steps.saturating_add(1);
+            self.emit_step(StepPhase::Started, None, None);
             self.arm_speculate();
             let completed = self.complete_or_abort(tools).await;
             self.completer.set_speculate(None);
-            let Some(mut turn) = completed? else {
+            let completed = match completed {
+                Ok(turn) => turn,
+                Err(err) => {
+                    self.emit_step(StepPhase::Error, Some(err.to_string()), None);
+                    return Err(err);
+                }
+            };
+            let Some(mut turn) = completed else {
+                self.emit_step(StepPhase::Error, Some("aborted".into()), None);
                 self.drop_speculate();
                 return self.finish(String::new(), Some("aborted".into()), steps);
             };
             steps += 1;
+            self.current_step = steps;
+            self.emit_step(
+                StepPhase::Completed,
+                None,
+                Some((turn.prompt_tokens, turn.completion_tokens)),
+            );
             prompt_tokens += turn.prompt_tokens;
             completion_tokens += turn.completion_tokens;
 
@@ -115,23 +150,40 @@ impl<C: Completer> Agent<C> {
                 // concise side observation and more room to choose a course.
                 self.note("[watchdog] think cap; soft nudge and one roomy retry");
                 self.drop_speculate();
+                self.current_step = steps.saturating_add(1);
+                self.emit_step(StepPhase::Started, Some("watchdog retry".into()), None);
                 self.arm_speculate();
                 let widened = self.retry_with_runaway_room(tools).await;
                 self.completer.set_speculate(None);
                 if self.cancel.is_cancelled() {
+                    self.emit_step(
+                        StepPhase::Error,
+                        Some("watchdog retry aborted".into()),
+                        None,
+                    );
                     self.drop_speculate();
                     return self.finish(String::new(), Some("aborted".into()), steps);
                 }
                 match widened {
                     Some(t) => {
                         steps += 1;
+                        self.current_step = steps;
+                        self.emit_step(
+                            StepPhase::Completed,
+                            Some("watchdog retry".into()),
+                            Some((t.prompt_tokens, t.completion_tokens)),
+                        );
                         prompt_tokens += t.prompt_tokens;
                         completion_tokens += t.completion_tokens;
                         if !t.watchdog_hit || !t.content.is_empty() || !t.tool_calls.is_empty() {
                             turn = t;
                         }
                     }
-                    None => {}
+                    None => self.emit_step(
+                        StepPhase::Error,
+                        Some("watchdog retry produced no turn".into()),
+                        None,
+                    ),
                 }
                 if turn.watchdog_hit && turn.content.is_empty() && turn.tool_calls.is_empty() {
                     self.drop_speculate();
@@ -143,12 +195,22 @@ impl<C: Completer> Agent<C> {
                 }
             }
 
+            if turn.tool_calls.is_empty() {
+                if let Some(calls) = lift_leaked_tool_json(&turn.content) {
+                    turn.tool_calls = calls;
+                    turn.content.clear();
+                }
+            }
+
             if !turn.reasoning.is_empty()
                 && self.print
                 && !self.stdio.think_streamed()
                 && turn.tool_calls.is_empty()
             {
-                eprintln!("[think]\n{}", turn.reasoning.trim());
+                let vis = crate::think_visible::visible_think(turn.reasoning.trim());
+                if !vis.trim().is_empty() {
+                    eprintln!("[think]\n{vis}");
+                }
             }
 
             if turn.parse_fail {
@@ -163,6 +225,7 @@ impl<C: Completer> Agent<C> {
                 continue;
             }
 
+            self.emit_tools_scheduled(&turn.tool_calls);
             self.push_assistant(&turn);
             if turn.tool_calls.is_empty() && crate::stutter::is_substantial_reply(&turn.content) {
                 self.last_spoken = Some(turn.content.clone());
@@ -213,6 +276,9 @@ impl<C: Completer> Agent<C> {
                     if is_physics_stop(&reason) {
                         self.note(&reason);
                         return self.finish(turn.content, None, steps);
+                    }
+                    if is_quiet_repeat_stop(&reason) {
+                        return self.finish(turn.content, Some(reason), steps);
                     }
                     let stop_reason = if reason.is_empty() {
                         None
@@ -349,9 +415,10 @@ impl<C: Completer> Agent<C> {
     }
 
     pub(crate) fn push_hidden_user(&mut self, text: impl AsRef<str>) {
-        let wrapped = wrap_tool_response(text.as_ref());
+        let raw = text.as_ref();
+        let wrapped = wrap_tool_response(raw);
         self.messages.push(ChatMessage::user(wrapped.clone()));
-        self.log_event(SessionEvent::user(wrapped));
+        self.log_event(SessionEvent::context("runtime", raw));
     }
 
     pub(crate) fn remember_tool_output(&mut self, text: &str) {
@@ -495,7 +562,7 @@ impl<C: Completer> Agent<C> {
             }
             return;
         }
-        let forward = !matches!(event, SessionEvent::User(_));
+        let forward = !matches!(event, SessionEvent::User(_) | SessionEvent::Context(_));
         if event.is_ephemeral() {
             if forward {
                 if let Some(sink) = &self.emit {
@@ -512,6 +579,51 @@ impl<C: Completer> Agent<C> {
         if let Some(log) = self.log.as_mut() {
             let _ = log.append(event);
         }
+    }
+
+    fn begin_run(&mut self) {
+        let id = uuid::Uuid::new_v4().simple().to_string();
+        self.run_id = Some(id.clone());
+        self.turn_id = Some(id.clone());
+        self.current_step = 0;
+        self.log_event(SessionEvent::run(
+            id.clone(),
+            id.clone(),
+            RunPhase::Accepted,
+            None,
+        ));
+        self.log_event(SessionEvent::run(id.clone(), id, RunPhase::Started, None));
+    }
+
+    pub(crate) fn lifecycle_ids(&self) -> Option<(String, String)> {
+        Some((self.run_id.clone()?, self.turn_id.clone()?))
+    }
+
+    pub(crate) fn emit_step(
+        &mut self,
+        phase: StepPhase,
+        reason: Option<String>,
+        usage: Option<(u64, u64)>,
+    ) {
+        let Some((run_id, turn_id)) = self.lifecycle_ids() else {
+            return;
+        };
+        self.log_event(SessionEvent::step(
+            run_id,
+            turn_id,
+            self.current_step,
+            phase,
+            reason,
+            usage,
+        ));
+    }
+
+    fn end_run(&mut self, phase: RunPhase, reason: Option<String>) {
+        let Some(run_id) = self.run_id.take() else {
+            return;
+        };
+        let turn_id = self.turn_id.take().unwrap_or_else(|| run_id.clone());
+        self.log_event(SessionEvent::run(run_id, turn_id, phase, reason));
     }
 
     pub(crate) fn finish(
@@ -539,6 +651,12 @@ impl<C: Completer> Agent<C> {
         let reason = stop_reason.clone().unwrap_or_else(|| "stop".into());
         self.log_event(SessionEvent::stop(reason));
         let aborted = stop_reason.as_deref() == Some("aborted");
+        let run_phase = if aborted {
+            RunPhase::Aborted
+        } else {
+            RunPhase::Completed
+        };
+        self.end_run(run_phase, stop_reason.clone());
         let mut text = if aborted || !text.trim().is_empty() {
             text
         } else {
@@ -551,6 +669,9 @@ impl<C: Completer> Agent<C> {
         {
             text = im_no_reply_text(stop_reason.as_deref());
         }
+        if !aborted {
+            self.maybe_write_chat_recap(&text);
+        }
         Ok(AgentOutcome {
             text,
             stop_reason,
@@ -559,8 +680,39 @@ impl<C: Completer> Agent<C> {
             pending_steer: take_steer(&self.steer),
             streamed_text: self.stdio.text_streamed(),
             channel_files: std::mem::take(&mut self.channel_files),
+            plan_mode: self.plan_mode,
+            clarify_mode: self.clarify_mode,
         })
     }
+
+    fn maybe_write_chat_recap(&self, text: &str) {
+        if self.child.is_some() || !self.persist_session {
+            return;
+        }
+        if crate::session::is_probe_session(&self.session_id) || self.channel == "subagent" {
+            return;
+        }
+        let spoken = text.trim();
+        if spoken.chars().count() < 40 {
+            return;
+        }
+        let Some(mem) = &self.memory else {
+            return;
+        };
+        let user = self
+            .log
+            .as_ref()
+            .and_then(|l| {
+                l.events().iter().rev().find_map(|e| match e {
+                    SessionEvent::User(u) if !is_hidden_user_text(&u.text) => Some(u.text.clone()),
+                    _ => None,
+                })
+            })
+            .unwrap_or_else(|| self.last_real_user().to_string());
+        let ws = self.workspace.root().display().to_string();
+        let _ = mem.write_chat_recap(&self.session_id, &self.channel, &ws, &user, spoken);
+    }
+
     pub(crate) fn note(&self, line: &str) {
         if self.print {
             self.stdio.close_think();
@@ -626,4 +778,137 @@ pub(crate) fn is_physics_stop(reason: &str) -> bool {
         || reason.contains("time limit")
         || reason.contains("Token budget")
         || reason.contains("call budget")
+}
+
+/// Cursor identical-call halt. Ends the turn without a `[trajectory]` lecture.
+pub(crate) fn is_quiet_repeat_stop(reason: &str) -> bool {
+    reason.starts_with(crate::paw_loop::REPEAT_STOP)
+}
+
+/// Grok sometimes paints a Write/StrReplace as a JSON fence instead of a
+/// native tool call. Recover that as a real hop so the file actually lands.
+pub(crate) fn lift_leaked_tool_json(content: &str) -> Option<Vec<ToolCall>> {
+    let raw = json_tool_body(content)?;
+    let v: Value = serde_json::from_str(raw).ok()?;
+    let objs: Vec<Value> = match v {
+        Value::Array(a) if (1..=4).contains(&a.len()) => a,
+        Value::Object(_) => vec![v],
+        _ => return None,
+    };
+    let mut calls = Vec::with_capacity(objs.len());
+    for (i, obj) in objs.iter().enumerate() {
+        calls.push(leaked_obj_to_call(obj, i)?);
+    }
+    Some(calls)
+}
+
+fn json_tool_body(content: &str) -> Option<&str> {
+    let t = content.trim();
+    if let Some(rest) = t.strip_prefix("```") {
+        let rest = rest
+            .strip_prefix("json")
+            .or_else(|| rest.strip_prefix("JSON"))
+            .unwrap_or(rest);
+        let rest = rest
+            .strip_prefix('\n')
+            .or_else(|| rest.strip_prefix("\r\n"))?;
+        let inner = rest.trim_end().strip_suffix("```")?.trim();
+        if inner.starts_with('{') || inner.starts_with('[') {
+            return Some(inner);
+        }
+        return None;
+    }
+    if (t.starts_with('{') && t.ends_with('}')) || (t.starts_with('[') && t.ends_with(']')) {
+        return Some(t);
+    }
+    None
+}
+
+fn leaked_obj_to_call(obj: &Value, i: usize) -> Option<ToolCall> {
+    let name = obj.get("name").and_then(Value::as_str)?;
+    let key = dispatch_name(name);
+    if !matches!(key, "write" | "edit" | "strreplace" | "delete") {
+        return None;
+    }
+    let arguments = if let Some(args) = obj.get("arguments") {
+        if args.is_object() {
+            args.clone()
+        } else if let Some(s) = args.as_str() {
+            serde_json::from_str(s).ok()?
+        } else {
+            return None;
+        }
+    } else {
+        let mut m = serde_json::Map::new();
+        for k in ["path", "contents", "old_string", "new_string"] {
+            if let Some(v) = obj.get(k) {
+                m.insert(k.to_string(), v.clone());
+            }
+        }
+        if m.is_empty() {
+            return None;
+        }
+        Value::Object(m)
+    };
+    let path = crate::tools::arg_str(&arguments, "path").unwrap_or_default();
+    if path.is_empty() {
+        return None;
+    }
+    if key == "write" && crate::tools::arg_str(&arguments, "contents").is_none() {
+        return None;
+    }
+    Some(ToolCall {
+        id: format!("lift-{i}"),
+        name: name.to_string(),
+        arguments,
+    })
+}
+
+#[cfg(test)]
+mod lift_tests {
+    use super::lift_leaked_tool_json;
+
+    #[test]
+    fn lifts_r96_write_fence() {
+        let calls = lift_leaked_tool_json(
+            "```json\n{\"name\": \"Write\", \"path\": \".grok-hyper/overnight/r96_ok.txt\", \"contents\": \"R96_OK\\n\"}\n```",
+        )
+        .expect("fence");
+        assert_eq!(calls.len(), 1);
+        assert_eq!(crate::tools_schema::dispatch_name(&calls[0].name), "write");
+        assert_eq!(
+            crate::tools::arg_str(&calls[0].arguments, "path").as_deref(),
+            Some(".grok-hyper/overnight/r96_ok.txt")
+        );
+        assert_eq!(
+            crate::tools::arg_str(&calls[0].arguments, "contents").as_deref(),
+            Some("R96_OK\n")
+        );
+    }
+
+    #[test]
+    fn ignores_prose_and_non_write_json() {
+        assert!(
+            lift_leaked_tool_json("已写入 `.grok-hyper/overnight/r96_ok.txt`。 DESKTOP_R96")
+                .is_none()
+        );
+        assert!(lift_leaked_tool_json("```json\n{\"foo\": 1}\n```").is_none());
+        assert!(lift_leaked_tool_json(
+            "```json\n{\"name\": \"Search\", \"query\": \"fold_idle_search\"}\n```"
+        )
+        .is_none());
+        assert!(lift_leaked_tool_json(
+            "先说明一下。\n```json\n{\"name\": \"Write\", \"path\": \"a.txt\", \"contents\": \"x\"}\n```\nDESKTOP_R96"
+        )
+        .is_none());
+    }
+
+    #[test]
+    fn lifts_strreplace_fence() {
+        let calls = lift_leaked_tool_json(
+            "{\"name\":\"StrReplace\",\"path\":\"a.rs\",\"old_string\":\"a\",\"new_string\":\"b\"}",
+        )
+        .expect("strreplace");
+        assert_eq!(crate::tools_schema::dispatch_name(&calls[0].name), "edit");
+    }
 }

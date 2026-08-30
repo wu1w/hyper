@@ -4,9 +4,10 @@
 //! frames are pbbp2 protobuf wrapping a JSON `im.message.receive_v1` payload.
 //! Text JSON frames are also accepted. Never log `app_secret` or WS tickets.
 
-use std::collections::HashMap;
-use std::sync::{Arc, Mutex as StdMutex};
-use std::time::{Duration, Instant};
+use std::collections::{HashMap, HashSet, VecDeque};
+use std::path::PathBuf;
+use std::sync::{Arc, Mutex as StdMutex, OnceLock};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use futures::stream::SplitSink;
 use futures::{SinkExt, StreamExt};
@@ -27,6 +28,35 @@ const LARK_BASE: &str = "https://open.larksuite.com";
 const TOKEN_TTL: Duration = Duration::from_secs(50 * 60);
 const RECONNECT_WAIT: Duration = Duration::from_secs(2);
 const PING_INTERVAL: Duration = Duration::from_secs(30);
+/// Replay only recent downtime, not the whole chat history on first boot.
+const CATCHUP_MAX_AGE_MS: u64 = 30 * 60 * 1000;
+/// Drop WS/catch-up duplicates of the same inbound `message_id` in one process.
+const INBOUND_SEEN_CAP: usize = 2048;
+
+fn feishu_trace(msg: impl std::fmt::Display) {
+    let line = format!("{msg}");
+    eprintln!("{line}");
+    let _ = std::io::Write::flush(&mut std::io::stderr());
+    let Ok(home) = crate::config::Config::home_dir() else {
+        return;
+    };
+    let path = home.join("logs").join("feishu.log");
+    if let Some(dir) = path.parent() {
+        let _ = std::fs::create_dir_all(dir);
+    }
+    if let Ok(mut f) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&path)
+    {
+        use std::io::Write;
+        let ts = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        let _ = writeln!(f, "{ts} {line}");
+    }
+}
 
 const PB_CONTROL: i32 = 0;
 const PB_DATA: i32 = 1;
@@ -241,7 +271,7 @@ pub async fn send(
     let http = crate::llm_http::env_aware_client(30, base)?;
     let text = super::xfer::spoken_text(parts);
     if !text.trim().is_empty() {
-        send_text(&http, env, base, &app_id, &secret, &text).await?;
+        promote_or_send_text(&http, env, base, &app_id, &secret, &text).await?;
     }
     for part in parts {
         if matches!(part, ContentPart::Text { .. }) {
@@ -254,6 +284,224 @@ pub async fn send(
         }
     }
     Ok(())
+}
+
+pub(crate) async fn send_choices(
+    ep: Option<&ChannelEndpoint>,
+    env: &NativePayload,
+    text: &str,
+    buttons: &[(String, String)],
+) -> Result<()> {
+    let Some(ep) = ep else {
+        return Ok(());
+    };
+    let Some((app_id, secret)) = credentials(ep) else {
+        return Err(Error::msg("feishu send: missing credentials"));
+    };
+    let base = open_base(ep);
+    let http = crate::llm_http::env_aware_client(30, base)?;
+    let card = feishu_choice_card(text, buttons);
+    send_im(&http, env, base, &app_id, &secret, "interactive", card)
+        .await
+        .map(|_| ())
+}
+
+fn feishu_choice_card(text: &str, buttons: &[(String, String)]) -> Value {
+    let actions: Vec<Value> = buttons
+        .iter()
+        .enumerate()
+        .map(|(i, (id, label))| {
+            let style = match (i, buttons.len()) {
+                (0, _) => "primary",
+                (i, n) if i + 1 == n && n >= 3 => "danger",
+                _ => "default",
+            };
+            json!({
+                "tag": "button",
+                "text": { "tag": "plain_text", "content": label },
+                "type": style,
+                "value": { "choice": id },
+            })
+        })
+        .collect();
+    json!({
+        "config": { "wide_screen_mode": true },
+        "elements": [
+            { "tag": "div", "text": { "tag": "lark_md", "content": text } },
+            { "tag": "action", "actions": actions },
+        ]
+    })
+}
+
+/// ACK / think / tool lines: one message, updated in place (Hermes-style).
+pub(crate) async fn send_progress(
+    ep: Option<&ChannelEndpoint>,
+    env: &NativePayload,
+    parts: &[ContentPart],
+) -> Result<()> {
+    let Some(ep) = ep else {
+        return Ok(());
+    };
+    let Some((app_id, secret)) = credentials(ep) else {
+        return Ok(());
+    };
+    let text = super::xfer::spoken_text(parts);
+    if text.trim().is_empty() {
+        return Ok(());
+    }
+    let base = open_base(ep);
+    let http = crate::llm_http::env_aware_client(15, base)?;
+    upsert_progress_text(&http, env, base, &app_id, &secret, &text).await
+}
+
+const TYPING_EMOJI: &str = "Typing";
+
+fn typing_message_id(env: &NativePayload) -> String {
+    js_str(env.meta.get("message_id").unwrap_or(&Value::Null))
+}
+
+fn typing_ok(env: &NativePayload) -> bool {
+    !typing_message_id(env).is_empty()
+}
+
+fn typing_create_body() -> Value {
+    json!({ "reaction_type": { "emoji_type": TYPING_EMOJI } })
+}
+
+fn typing_create_url(base: &str, message_id: &str) -> String {
+    format!(
+        "{base}/open-apis/im/v1/messages/{}/reactions",
+        urlencoding_seg(message_id)
+    )
+}
+
+fn typing_delete_url(base: &str, message_id: &str, reaction_id: &str) -> String {
+    format!(
+        "{base}/open-apis/im/v1/messages/{}/reactions/{}",
+        urlencoding_seg(message_id),
+        urlencoding_seg(reaction_id)
+    )
+}
+
+fn parse_reaction_id(data: &Value) -> Option<String> {
+    let id = js_str(&data["data"]["reaction_id"]);
+    if !id.is_empty() {
+        return Some(id);
+    }
+    let id = js_str(&data["reaction_id"]);
+    if id.is_empty() {
+        None
+    } else {
+        Some(id)
+    }
+}
+
+fn feishu_api_ok(data: &Value) -> bool {
+    match data.get("code") {
+        None => true,
+        Some(Value::Number(n)) => n.as_i64() == Some(0) || n.as_u64() == Some(0),
+        Some(Value::String(s)) => s.trim() == "0",
+        _ => false,
+    }
+}
+
+fn typing_reactions() -> &'static StdMutex<HashMap<String, String>> {
+    static C: OnceLock<StdMutex<HashMap<String, String>>> = OnceLock::new();
+    C.get_or_init(|| StdMutex::new(HashMap::new()))
+}
+
+fn cached_reaction(message_id: &str) -> Option<String> {
+    let Ok(g) = typing_reactions().lock() else {
+        return None;
+    };
+    g.get(message_id).cloned()
+}
+
+fn store_reaction(message_id: &str, reaction_id: String) {
+    let Ok(mut g) = typing_reactions().lock() else {
+        return;
+    };
+    g.insert(message_id.to_string(), reaction_id);
+}
+
+fn take_reaction(message_id: &str) -> Option<String> {
+    let Ok(mut g) = typing_reactions().lock() else {
+        return None;
+    };
+    g.remove(message_id)
+}
+
+/// Hermes: `Typing` reaction on the inbound message while the agent runs.
+/// Failures are silent. Call once per turn; [`stop_typing`] removes it.
+pub(crate) async fn send_typing(ep: Option<&ChannelEndpoint>, env: &NativePayload) {
+    if !typing_ok(env) {
+        return;
+    }
+    let Some(ep) = ep else {
+        return;
+    };
+    let Some((app_id, secret)) = credentials(ep) else {
+        return;
+    };
+    let mid = typing_message_id(env);
+    if cached_reaction(&mid).is_some() {
+        return;
+    }
+    let base = open_base(ep);
+    let Ok(http) = crate::llm_http::env_aware_client(8, base) else {
+        return;
+    };
+    let Ok(token) = tenant_token(&http, base, &app_id, &secret).await else {
+        return;
+    };
+    let url = typing_create_url(base, &mid);
+    let Ok(resp) = http
+        .post(&url)
+        .header("Authorization", format!("Bearer {token}"))
+        .json(&typing_create_body())
+        .send()
+        .await
+    else {
+        return;
+    };
+    let Ok(data) = resp.json::<Value>().await else {
+        return;
+    };
+    if !feishu_api_ok(&data) {
+        return;
+    }
+    if let Some(rid) = parse_reaction_id(&data) {
+        store_reaction(&mid, rid);
+    }
+}
+
+pub(crate) async fn stop_typing(ep: Option<&ChannelEndpoint>, env: &NativePayload) {
+    let Some(ep) = ep else {
+        return;
+    };
+    let mid = typing_message_id(env);
+    if mid.is_empty() {
+        return;
+    }
+    let Some(rid) = take_reaction(&mid) else {
+        return;
+    };
+    let Some((app_id, secret)) = credentials(ep) else {
+        return;
+    };
+    let base = open_base(ep);
+    let Ok(http) = crate::llm_http::env_aware_client(8, base) else {
+        return;
+    };
+    let Ok(token) = tenant_token(&http, base, &app_id, &secret).await else {
+        return;
+    };
+    let url = typing_delete_url(base, &mid, &rid);
+    let _ = http
+        .delete(&url)
+        .header("Authorization", format!("Bearer {token}"))
+        .send()
+        .await;
 }
 
 async fn run_once(
@@ -276,6 +524,23 @@ async fn run_once(
             let safe = msg.split('?').next().unwrap_or("ws error");
             Error::msg(format!("feishu ws connect: {safe}"))
         })?;
+    feishu_trace(format!("hyper feishu connected {host}"));
+    let api = FeishuApi {
+        http: http.clone(),
+        app_id: app_id.to_string(),
+        secret: secret.to_string(),
+        base: base.to_string(),
+    };
+    {
+        let ep = ep.clone();
+        let mgr = mgr.clone();
+        let api = api.clone();
+        tokio::spawn(async move {
+            if let Err(e) = catchup_missed(&ep, &mgr, &api).await {
+                feishu_trace(format!("hyper feishu catchup: {e}"));
+            }
+        });
+    }
     let (write, mut read) = ws.split();
     let write = Arc::new(Mutex::new(write));
     let ping_w = write.clone();
@@ -295,12 +560,6 @@ async fn run_once(
         }
     });
     let mut frags: HashMap<String, Vec<Option<Vec<u8>>>> = HashMap::new();
-    let api = FeishuApi {
-        http: http.clone(),
-        app_id: app_id.to_string(),
-        secret: secret.to_string(),
-        base: base.to_string(),
-    };
     while let Some(frame) = read.next().await {
         let frame = frame.map_err(|e| Error::msg(format!("feishu ws: {e}")))?;
         match frame {
@@ -344,7 +603,7 @@ async fn handle_text(
     if let Some(ack) = json_ack(&v) {
         let _ = write.lock().await.send(Message::Text(ack.into())).await;
     }
-    ingest_json(ep, mgr, api, &v).await;
+    spawn_ingest(ep, mgr, api, v);
 }
 
 async fn handle_binary(
@@ -386,19 +645,540 @@ async fn handle_binary(
             return;
         };
         match serde_json::from_slice::<Value>(&payload) {
-            Ok(v) => ingest_json(ep, mgr, api, &v).await,
+            Ok(v) => spawn_ingest(ep, mgr, api, v),
             Err(_) => eprintln!("hyper feishu: non-json frame, skipping"),
         }
     }
 }
 
+fn spawn_ingest(ep: &ChannelEndpoint, mgr: &ChannelManager, api: &FeishuApi, v: Value) {
+    let ep = ep.clone();
+    let mgr = mgr.clone();
+    let api = api.clone();
+    tokio::spawn(async move {
+        ingest_json(&ep, &mgr, &api, &v).await;
+    });
+}
+
 async fn ingest_json(ep: &ChannelEndpoint, mgr: &ChannelManager, api: &FeishuApi, v: &Value) {
+    if let Some(chat_id) = p2p_entered_chat_id(v) {
+        remember_p2p_chat(&chat_id);
+    }
     if let Some(mut env) = native_from_envelope(ep, v) {
+        super::stamp_endpoint(&mut env, ep);
+        remember_from_env(&env);
+        if !claim_inbound(&js_str(env.meta.get("message_id").unwrap_or(&Value::Null))) {
+            return;
+        }
+        feishu_trace(format!(
+            "hyper feishu inbound group={} sender={}",
+            env.is_group(),
+            env.sender_id
+        ));
         enrich_feishu_media(api, &mut env).await;
         if let Err(e) = mgr.ingest(env).await {
-            eprintln!("hyper feishu ingest: {e}");
+            feishu_trace(format!("hyper feishu ingest: {e}"));
         }
     }
+}
+
+#[derive(Clone, Debug, Default, serde::Serialize, serde::Deserialize)]
+struct CatchupStore {
+    chats: HashMap<String, ChatCursor>,
+}
+
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
+struct ChatCursor {
+    last_id: String,
+    #[serde(default)]
+    last_time: u64,
+    #[serde(default)]
+    is_group: bool,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum CatchupDecide {
+    InitCursor,
+    Skip,
+    Ingest,
+}
+
+static CATCHUP: StdMutex<Option<CatchupStore>> = StdMutex::new(None);
+
+struct InboundSeen {
+    set: HashSet<String>,
+    order: VecDeque<String>,
+}
+
+static INBOUND_SEEN: StdMutex<Option<InboundSeen>> = StdMutex::new(None);
+
+/// First caller for this Feishu `message_id` wins. Empty ids are not gated.
+fn claim_inbound(message_id: &str) -> bool {
+    if message_id.is_empty() {
+        return true;
+    }
+    let Ok(mut g) = INBOUND_SEEN.lock() else {
+        return true;
+    };
+    let seen = g.get_or_insert_with(|| InboundSeen {
+        set: HashSet::new(),
+        order: VecDeque::new(),
+    });
+    if !seen.set.insert(message_id.to_string()) {
+        return false;
+    }
+    seen.order.push_back(message_id.to_string());
+    while seen.order.len() > INBOUND_SEEN_CAP {
+        if let Some(old) = seen.order.pop_front() {
+            seen.set.remove(&old);
+        }
+    }
+    true
+}
+
+fn catchup_path() -> Option<PathBuf> {
+    crate::config::Config::home_dir()
+        .ok()
+        .map(|h| h.join("channels").join("feishu.catchup.json"))
+}
+
+fn load_catchup() -> CatchupStore {
+    let Some(p) = catchup_path() else {
+        return CatchupStore::default();
+    };
+    std::fs::read_to_string(p)
+        .ok()
+        .and_then(|s| serde_json::from_str(&s).ok())
+        .unwrap_or_default()
+}
+
+fn save_catchup(store: &CatchupStore) {
+    let Some(p) = catchup_path() else {
+        return;
+    };
+    if let Some(dir) = p.parent() {
+        let _ = std::fs::create_dir_all(dir);
+    }
+    if let Ok(s) = serde_json::to_string(store) {
+        let _ = std::fs::write(p, s);
+    }
+}
+
+fn with_catchup<R>(f: impl FnOnce(&mut CatchupStore) -> R) -> Option<R> {
+    let mut g = CATCHUP.lock().ok()?;
+    if g.is_none() {
+        *g = Some(load_catchup());
+    }
+    let store = g.as_mut()?;
+    let r = f(store);
+    save_catchup(store);
+    Some(r)
+}
+
+fn parse_time_ms(raw: &str) -> u64 {
+    let n: u64 = raw.trim().parse().unwrap_or(0);
+    if n == 0 {
+        return 0;
+    }
+    if n < 1_000_000_000_000 {
+        n.saturating_mul(1000)
+    } else {
+        n
+    }
+}
+
+fn unix_ms() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
+}
+
+fn catchup_decide(
+    cursor: Option<&ChatCursor>,
+    id: &str,
+    time_ms: u64,
+    now_ms: u64,
+) -> CatchupDecide {
+    if id.is_empty() {
+        return CatchupDecide::Skip;
+    }
+    let Some(c) = cursor else {
+        return CatchupDecide::InitCursor;
+    };
+    if id == c.last_id {
+        return CatchupDecide::Skip;
+    }
+    if time_ms > 0 && c.last_time > 0 && time_ms <= c.last_time {
+        return CatchupDecide::Skip;
+    }
+    if time_ms > 0 && now_ms > time_ms && now_ms.saturating_sub(time_ms) > CATCHUP_MAX_AGE_MS {
+        return CatchupDecide::Skip;
+    }
+    CatchupDecide::Ingest
+}
+
+fn remember_seen(chat_id: &str, is_group: bool, message_id: &str, create_time: &str) {
+    if chat_id.is_empty() || message_id.is_empty() {
+        return;
+    }
+    let t = parse_time_ms(create_time);
+    let _ = with_catchup(|store| {
+        let e = store
+            .chats
+            .entry(chat_id.to_string())
+            .or_insert(ChatCursor {
+                last_id: message_id.to_string(),
+                last_time: t,
+                is_group,
+            });
+        if t >= e.last_time {
+            e.last_id = message_id.to_string();
+            e.last_time = t;
+            e.is_group = is_group;
+        }
+    });
+}
+
+fn remember_from_env(env: &NativePayload) {
+    let chat_id = js_str(env.meta.get("chat_id").unwrap_or(&Value::Null));
+    let mid = js_str(env.meta.get("message_id").unwrap_or(&Value::Null));
+    let is_group = env
+        .meta
+        .get("is_group")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
+    let create_time = js_str(env.meta.get("create_time").unwrap_or(&Value::Null));
+    remember_seen(&chat_id, is_group, &mid, &create_time);
+}
+
+fn list_item_to_event(item: &Value, is_group: bool) -> Option<Value> {
+    let sender_type = js_str(&item["sender"]["sender_type"]);
+    if sender_type == "app" || sender_type == "bot" {
+        return None;
+    }
+    let id = js_str(&item["sender"]["id"]);
+    if id.is_empty() {
+        return None;
+    }
+    let chat_id = js_str(&item["chat_id"]);
+    let message_id = js_str(&item["message_id"]);
+    let msg_type = js_str(&item["msg_type"]);
+    Some(json!({
+        "sender": {
+            "sender_id": { "open_id": id },
+            "sender_type": sender_type
+        },
+        "message": {
+            "message_id": message_id,
+            "chat_id": chat_id,
+            "chat_type": if is_group { "group" } else { "p2p" },
+            "message_type": if msg_type.is_empty() { "text" } else { msg_type.as_str() },
+            "content": item["body"]["content"].clone(),
+            "create_time": js_str(&item["create_time"])
+        }
+    }))
+}
+
+fn catchup_floor_cursor(now_ms: u64, is_group: bool) -> ChatCursor {
+    ChatCursor {
+        last_id: String::new(),
+        last_time: now_ms.saturating_sub(CATCHUP_MAX_AGE_MS),
+        is_group,
+    }
+}
+
+fn parse_chat_list_items(data: &Value) -> Vec<(String, bool)> {
+    let Some(arr) = data
+        .get("data")
+        .and_then(|d| d.get("items"))
+        .and_then(Value::as_array)
+        .or_else(|| data.get("items").and_then(Value::as_array))
+    else {
+        return Vec::new();
+    };
+    let mut out = Vec::new();
+    for it in arr {
+        let chat_id = js_str(&it["chat_id"]);
+        if chat_id.is_empty() {
+            continue;
+        }
+        let mode = js_str(&it["chat_mode"]);
+        let is_group = !mode.eq_ignore_ascii_case("p2p");
+        out.push((chat_id, is_group));
+    }
+    out
+}
+
+fn parse_chat_list_next_page(data: &Value) -> Option<String> {
+    let has_more = data
+        .pointer("/data/has_more")
+        .or_else(|| data.get("has_more"))
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    if !has_more {
+        return None;
+    }
+    let token = data
+        .pointer("/data/page_token")
+        .or_else(|| data.get("page_token"))
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .trim();
+    if token.is_empty() {
+        None
+    } else {
+        Some(token.to_string())
+    }
+}
+
+fn list_chats_url(base: &str, page_token: Option<&str>) -> String {
+    let mut url = format!(
+        "{}/open-apis/im/v1/chats?page_size=100&user_id_type=open_id&sort_type=ByCreateTimeAsc",
+        base.trim_end_matches('/')
+    );
+    if let Some(token) = page_token.map(str::trim).filter(|s| !s.is_empty()) {
+        url.push_str("&page_token=");
+        url.push_str(&urlencoding_seg(token));
+    }
+    url
+}
+
+/// List API is groups the bot is in — never p2p. Stored cursors keep DMs.
+fn merge_catchup_targets(
+    stored: HashMap<String, ChatCursor>,
+    listed: &[(String, bool)],
+    now_ms: u64,
+) -> HashMap<String, ChatCursor> {
+    let mut chats = stored;
+    for (chat_id, is_group) in listed {
+        chats
+            .entry(chat_id.clone())
+            .or_insert_with(|| catchup_floor_cursor(now_ms, *is_group));
+    }
+    chats
+}
+
+fn remember_p2p_chat(chat_id: &str) {
+    if chat_id.is_empty() {
+        return;
+    }
+    let now_ms = unix_ms();
+    let _ = with_catchup(|store| {
+        store
+            .chats
+            .entry(chat_id.to_string())
+            .or_insert_with(|| catchup_floor_cursor(now_ms, false));
+    });
+}
+
+fn p2p_entered_chat_id(v: &Value) -> Option<String> {
+    let et = envelope_event_type(v).to_ascii_lowercase();
+    if !et.contains("p2p_chat_entered") {
+        return None;
+    }
+    let chat_id = first_str(&[
+        &v["event"]["chat_id"],
+        &v["event"]["chat"]["chat_id"],
+        &v["chat_id"],
+    ]);
+    if chat_id.is_empty() {
+        None
+    } else {
+        Some(chat_id)
+    }
+}
+
+async fn list_bot_chats(api: &FeishuApi, token: &str) -> Result<Vec<(String, bool)>> {
+    let mut out = Vec::new();
+    let mut page_token: Option<String> = None;
+    for _ in 0..20 {
+        let url = list_chats_url(&api.base, page_token.as_deref());
+        let resp = api
+            .http
+            .get(&url)
+            .header("Authorization", format!("Bearer {token}"))
+            .send()
+            .await?;
+        let status = resp.status();
+        let data: Value = resp.json().await.unwrap_or(Value::Null);
+        if !status.is_success() {
+            if out.is_empty() {
+                return Err(Error::msg(format!(
+                    "feishu list chats HTTP {status} msg={}",
+                    js_str(&data["msg"])
+                )));
+            }
+            break;
+        }
+        if let Some(n) = data.get("code").and_then(Value::as_i64) {
+            if n != 0 {
+                if out.is_empty() {
+                    return Err(Error::msg(format!(
+                        "feishu list chats code={n} msg={}",
+                        js_str(&data["msg"])
+                    )));
+                }
+                break;
+            }
+        }
+        out.extend(parse_chat_list_items(&data));
+        match parse_chat_list_next_page(&data) {
+            Some(next) => page_token = Some(next),
+            None => break,
+        }
+    }
+    Ok(out)
+}
+
+async fn catchup_missed(ep: &ChannelEndpoint, mgr: &ChannelManager, api: &FeishuApi) -> Result<()> {
+    let token = match tenant_token(&api.http, &api.base, &api.app_id, &api.secret).await {
+        Ok(t) => t,
+        Err(e) => {
+            feishu_trace(format!("hyper feishu catchup token: {e}"));
+            return Ok(());
+        }
+    };
+    let now_ms = unix_ms();
+    let stored = with_catchup(|s| s.chats.clone()).unwrap_or_default();
+    let listed = match list_bot_chats(api, &token).await {
+        Ok(listed) => listed,
+        Err(e) => {
+            feishu_trace(format!("hyper feishu catchup list chats: {e}"));
+            Vec::new()
+        }
+    };
+    let chats = merge_catchup_targets(stored, &listed, now_ms);
+    let _ = with_catchup(|s| {
+        for (id, cur) in &chats {
+            s.chats.entry(id.clone()).or_insert_with(|| cur.clone());
+        }
+    });
+    if chats.is_empty() {
+        feishu_trace("hyper feishu catchup idle (no stored chats; p2p seeds on inbound)");
+        return Ok(());
+    }
+    feishu_trace(format!(
+        "hyper feishu catchup {} chats ({} listed groups)",
+        chats.len(),
+        listed.len()
+    ));
+    for (chat_id, cursor) in chats {
+        if let Err(e) = catchup_chat(ep, mgr, api, &token, &chat_id, &cursor, now_ms).await {
+            feishu_trace(format!("hyper feishu catchup {chat_id}: {e}"));
+        }
+    }
+    Ok(())
+}
+
+async fn catchup_chat(
+    ep: &ChannelEndpoint,
+    mgr: &ChannelManager,
+    api: &FeishuApi,
+    token: &str,
+    chat_id: &str,
+    cursor: &ChatCursor,
+    now_ms: u64,
+) -> Result<()> {
+    let items = list_chat_messages(api, token, chat_id).await?;
+    let Some(newest) = items.first() else {
+        return Ok(());
+    };
+    let newest_id = js_str(&newest["message_id"]);
+    let newest_time = parse_time_ms(&js_str(&newest["create_time"]));
+    if catchup_decide(Some(cursor), &newest_id, newest_time, now_ms) == CatchupDecide::Skip
+        && items.iter().all(|it| {
+            let id = js_str(&it["message_id"]);
+            catchup_decide(
+                Some(cursor),
+                &id,
+                parse_time_ms(&js_str(&it["create_time"])),
+                now_ms,
+            ) != CatchupDecide::Ingest
+        })
+    {
+        remember_seen(
+            chat_id,
+            cursor.is_group,
+            &newest_id,
+            &js_str(&newest["create_time"]),
+        );
+        return Ok(());
+    }
+    let mut replay = Vec::new();
+    for item in items.iter().rev() {
+        let id = js_str(&item["message_id"]);
+        let t = parse_time_ms(&js_str(&item["create_time"]));
+        if catchup_decide(Some(cursor), &id, t, now_ms) != CatchupDecide::Ingest {
+            continue;
+        }
+        let Some(event) = list_item_to_event(item, cursor.is_group) else {
+            continue;
+        };
+        let Some(mut env) = native_from_event(ep, &event) else {
+            continue;
+        };
+        super::stamp_endpoint(&mut env, ep);
+        if !claim_inbound(&id) {
+            continue;
+        }
+        replay.push(env);
+    }
+    for env in replay {
+        feishu_trace(format!(
+            "hyper feishu catchup inbound group={} sender={}",
+            env.is_group(),
+            env.sender_id
+        ));
+        if let Err(e) = mgr.ingest(env).await {
+            feishu_trace(format!("hyper feishu catchup ingest: {e}"));
+        }
+    }
+    remember_seen(
+        chat_id,
+        cursor.is_group,
+        &newest_id,
+        &js_str(&newest["create_time"]),
+    );
+    Ok(())
+}
+
+async fn list_chat_messages(api: &FeishuApi, token: &str, chat_id: &str) -> Result<Vec<Value>> {
+    let url = list_messages_url(&api.base, chat_id);
+    let resp = api
+        .http
+        .get(&url)
+        .header("Authorization", format!("Bearer {token}"))
+        .send()
+        .await?;
+    let status = resp.status();
+    let data: Value = resp.json().await.unwrap_or(Value::Null);
+    if !status.is_success() {
+        return Err(Error::msg(format!(
+            "feishu list messages HTTP {status} msg={}",
+            js_str(&data["msg"])
+        )));
+    }
+    if let Some(n) = data.get("code").and_then(Value::as_i64) {
+        if n != 0 {
+            return Err(Error::msg(format!(
+                "feishu list messages code={n} msg={}",
+                js_str(&data["msg"])
+            )));
+        }
+    }
+    Ok(data["data"]["items"]
+        .as_array()
+        .cloned()
+        .unwrap_or_default())
+}
+
+fn list_messages_url(base: &str, chat_id: &str) -> String {
+    format!(
+        "{}/open-apis/im/v1/messages?container_id_type=chat&container_id={}&sort_type=ByCreateTimeDesc&page_size=20",
+        base.trim_end_matches('/'),
+        urlencoding_seg(chat_id)
+    )
 }
 
 fn json_ack(v: &Value) -> Option<String> {
@@ -416,39 +1196,18 @@ async fn ws_endpoint(
     app_id: &str,
     secret: &str,
 ) -> Result<String> {
-    let token = tenant_token(http, base, app_id, secret).await?;
-    let open_api = format!("{base}/open-apis/callback/ws/endpoint");
-    let bare = format!("{base}/callback/ws/endpoint");
-    match post_ws_url(http, &open_api, Some(&token), json!({})).await {
-        Ok(url) => return Ok(url),
-        Err(e) => eprintln!("hyper feishu: open-apis ws endpoint: {e}"),
-    }
-    match post_ws_url(http, &bare, Some(&token), json!({})).await {
-        Ok(url) => return Ok(url),
-        Err(e) => eprintln!("hyper feishu: callback ws endpoint: {e}"),
-    }
-    // Official SDK path (AppID/AppSecret). This is what actually returns the
-    // pbbp2 long-connection URL used by lark-oapi / QwenPaw / Hermes.
-    post_ws_url(
-        http,
-        &bare,
-        None,
-        json!({"AppID": app_id, "AppSecret": secret}),
-    )
-    .await
+    // Official lark-oapi path. Bearer + empty body on this URL is 404/9499.
+    let url = format!("{base}/callback/ws/endpoint");
+    post_ws_url(http, &url, json!({"AppID": app_id, "AppSecret": secret})).await
 }
 
-async fn post_ws_url(
-    http: &reqwest::Client,
-    url: &str,
-    bearer: Option<&str>,
-    body: Value,
-) -> Result<String> {
-    let mut req = http.post(url).json(&body);
-    if let Some(tok) = bearer {
-        req = req.header("Authorization", format!("Bearer {tok}"));
-    }
-    let resp = req.send().await?;
+async fn post_ws_url(http: &reqwest::Client, url: &str, body: Value) -> Result<String> {
+    let resp = http
+        .post(url)
+        .header("locale", "zh")
+        .json(&body)
+        .send()
+        .await?;
     let status = resp.status();
     let data: Value = resp.json().await.unwrap_or(Value::Null);
     if !status.is_success() {
@@ -540,17 +1299,256 @@ async fn send_text(
     app_id: &str,
     secret: &str,
     text: &str,
-) -> Result<()> {
-    send_im(
+) -> Result<String> {
+    match send_im(
         http,
         env,
         base,
         app_id,
         secret,
-        "text",
-        json!({"text": text}),
+        "post",
+        super::im_md::feishu_post(text),
     )
     .await
+    {
+        Ok(id) => Ok(id),
+        Err(e) if is_feishu_illegal_content(&e) => {
+            feishu_trace(format!("hyper feishu post illegal, fallback text: {e}"));
+            let mut env2 = env.clone();
+            env2.meta.remove("delivery_id");
+            send_im(
+                http,
+                &env2,
+                base,
+                app_id,
+                secret,
+                "text",
+                feishu_plain_text(text),
+            )
+            .await
+        }
+        Err(e) => Err(e),
+    }
+}
+
+/// Feishu text messages allow 20 PATCH edits (`230072`). Rotate before the
+/// cap so a long tool loop does not freeze or spam new bubbles.
+const FEISHU_EDIT_CAP: u32 = 20;
+const FEISHU_ROTATE_AT: u32 = 18;
+
+struct BubbleSlot {
+    mid: String,
+    patches: u32,
+}
+
+fn is_feishu_edit_exhausted(err: &Error) -> bool {
+    let s = err.to_string();
+    s.contains("230072") || s.contains("230075") || s.contains("number of times it can be edited")
+}
+
+fn is_feishu_illegal_content(err: &Error) -> bool {
+    let s = err.to_string();
+    s.contains("230001") || s.contains("content is illegal") || s.contains("invalid content")
+}
+
+fn feishu_plain_text(src: &str) -> serde_json::Value {
+    let t = super::im_md::separated_plain(src);
+    let t: String = if t.chars().count() > 8000 {
+        t.chars().take(8000).collect()
+    } else {
+        t
+    };
+    serde_json::json!({ "text": t })
+}
+
+fn should_rotate_feishu_bubble(patches: u32) -> bool {
+    patches >= FEISHU_ROTATE_AT
+}
+
+async fn promote_or_send_text(
+    http: &reqwest::Client,
+    env: &NativePayload,
+    base: &str,
+    app_id: &str,
+    secret: &str,
+    text: &str,
+) -> Result<()> {
+    // Final replies are a new message. Patching the progress bubble hides the
+    // answer at the bottom of the chat after a long Ask wait.
+    take_bubble(&env.progress_bubble_key());
+    send_text(http, env, base, app_id, secret, text)
+        .await
+        .map(|_| ())
+}
+
+async fn upsert_progress_text(
+    http: &reqwest::Client,
+    env: &NativePayload,
+    base: &str,
+    app_id: &str,
+    secret: &str,
+    text: &str,
+) -> Result<()> {
+    let key = env.progress_bubble_key();
+    if let Some(slot) = peek_slot(&key) {
+        if !should_rotate_feishu_bubble(slot.patches) {
+            match patch_text(http, base, app_id, secret, &slot.mid, text).await {
+                Ok(()) => {
+                    bump_bubble(&key);
+                    return Ok(());
+                }
+                Err(e) if is_feishu_edit_exhausted(&e) => {
+                    feishu_trace(format!("hyper feishu patch: {e}"));
+                }
+                Err(e) => {
+                    feishu_trace(format!("hyper feishu patch: {e}"));
+                    return Err(e);
+                }
+            }
+        }
+    }
+    let mid = send_text(http, env, base, app_id, secret, text).await?;
+    if !mid.is_empty() {
+        store_bubble(&key, mid);
+    }
+    Ok(())
+}
+
+fn bubbles() -> &'static StdMutex<HashMap<String, BubbleSlot>> {
+    static C: OnceLock<StdMutex<HashMap<String, BubbleSlot>>> = OnceLock::new();
+    C.get_or_init(|| StdMutex::new(HashMap::new()))
+}
+
+fn store_bubble(key: &str, mid: String) {
+    let Ok(mut g) = bubbles().lock() else {
+        return;
+    };
+    g.insert(key.to_string(), BubbleSlot { mid, patches: 0 });
+}
+
+fn peek_slot(key: &str) -> Option<BubbleSlot> {
+    let Ok(g) = bubbles().lock() else {
+        return None;
+    };
+    g.get(key).map(|s| BubbleSlot {
+        mid: s.mid.clone(),
+        patches: s.patches,
+    })
+}
+
+fn bump_bubble(key: &str) {
+    let Ok(mut g) = bubbles().lock() else {
+        return;
+    };
+    if let Some(s) = g.get_mut(key) {
+        s.patches = s.patches.saturating_add(1).min(FEISHU_EDIT_CAP);
+    }
+}
+
+fn take_bubble(key: &str) -> Option<String> {
+    let Ok(mut g) = bubbles().lock() else {
+        return None;
+    };
+    g.remove(key).map(|s| s.mid)
+}
+
+fn parse_sent_message_id(data: &Value) -> Option<String> {
+    let id = js_str(&data["data"]["message_id"]);
+    if id.is_empty() {
+        None
+    } else {
+        Some(id)
+    }
+}
+
+fn sent_chat_meta(data: &Value) -> Option<(String, String, String)> {
+    let chat_id = js_str(&data["data"]["chat_id"]);
+    if chat_id.is_empty() {
+        return None;
+    }
+    Some((
+        chat_id,
+        js_str(&data["data"]["message_id"]),
+        js_str(&data["data"]["create_time"]),
+    ))
+}
+
+fn remember_from_send(env: &NativePayload, data: &Value) {
+    if let Some((chat_id, mid, create_time)) = sent_chat_meta(data) {
+        remember_seen(&chat_id, env.is_group(), &mid, &create_time);
+        return;
+    }
+    remember_from_env(env);
+}
+
+fn patch_url(base: &str, message_id: &str) -> String {
+    format!(
+        "{base}/open-apis/im/v1/messages/{}",
+        urlencoding_seg(message_id)
+    )
+}
+
+async fn patch_text(
+    http: &reqwest::Client,
+    base: &str,
+    app_id: &str,
+    secret: &str,
+    message_id: &str,
+    text: &str,
+) -> Result<()> {
+    let content =
+        serde_json::to_string(&super::im_md::feishu_post(text)).unwrap_or_else(|_| "{}".into());
+    let body = json!({
+        "msg_type": "post",
+        "content": content,
+    });
+    let token = tenant_token(http, base, app_id, secret).await?;
+    let url = patch_url(base, message_id);
+    let resp = http
+        .put(&url)
+        .header("Authorization", format!("Bearer {token}"))
+        .json(&body)
+        .send()
+        .await?;
+    let status = resp.status();
+    let data: Value = resp.json().await.unwrap_or(Value::Null);
+    let code = data.get("code").and_then(Value::as_i64).unwrap_or(-1);
+    if status.is_success() && code == 0 {
+        return Ok(());
+    }
+    if status.as_u16() == 401 || code == 99991663 {
+        clear_token(app_id);
+    }
+    let err = Error::msg(format!(
+        "feishu patch HTTP {status} code={code} msg={}",
+        js_str(&data["msg"])
+    ));
+    if is_feishu_illegal_content(&err) {
+        let content =
+            serde_json::to_string(&feishu_plain_text(text)).unwrap_or_else(|_| "{}".into());
+        let body = json!({
+            "msg_type": "text",
+            "content": content,
+        });
+        let token = tenant_token(http, base, app_id, secret).await?;
+        let resp = http
+            .put(&url)
+            .header("Authorization", format!("Bearer {token}"))
+            .json(&body)
+            .send()
+            .await?;
+        let status = resp.status();
+        let data: Value = resp.json().await.unwrap_or(Value::Null);
+        let code = data.get("code").and_then(Value::as_i64).unwrap_or(-1);
+        if status.is_success() && code == 0 {
+            return Ok(());
+        }
+        return Err(Error::msg(format!(
+            "feishu patch HTTP {status} code={code} msg={}",
+            js_str(&data["msg"])
+        )));
+    }
+    Err(err)
 }
 
 async fn send_media(
@@ -575,6 +1573,7 @@ async fn send_media(
                 json!({"image_key": key}),
             )
             .await
+            .map(|_| ())
         }
         super::xfer::Kind::Audio => {
             let key = upload_file(http, base, app_id, secret, &blob, "stream").await?;
@@ -588,6 +1587,7 @@ async fn send_media(
                 json!({"file_key": key}),
             )
             .await
+            .map(|_| ())
         }
         super::xfer::Kind::Video => {
             let key = upload_file(http, base, app_id, secret, &blob, "mp4").await?;
@@ -601,6 +1601,7 @@ async fn send_media(
                 json!({"file_key": key}),
             )
             .await
+            .map(|_| ())
         }
         super::xfer::Kind::File => {
             let ft = feishu_file_type(&blob.name);
@@ -615,6 +1616,7 @@ async fn send_media(
                 json!({"file_key": key}),
             )
             .await
+            .map(|_| ())
         }
     }
 }
@@ -724,23 +1726,38 @@ async fn send_im(
     secret: &str,
     msg_type: &str,
     content: Value,
-) -> Result<()> {
-    let id_type = receive_id_type(env);
-    let receive_id = receive_id(env, &id_type);
-    if receive_id.is_empty() {
-        return Err(Error::msg("feishu send: missing chat_id / open_id"));
-    }
+) -> Result<String> {
     let content = serde_json::to_string(&content).unwrap_or_else(|_| "{}".into());
-    let body = json!({
-        "receive_id": receive_id,
-        "msg_type": msg_type,
-        "content": content,
-        "uuid": uuid::Uuid::new_v4().to_string(),
-    });
+    let id_type = receive_id_type(env);
+    let url = send_create_url(base, env, &id_type);
+    let stable_uuid = env
+        .meta
+        .get("delivery_id")
+        .and_then(Value::as_str)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string)
+        .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
+    let body = if send_is_reply(&url) {
+        json!({
+            "msg_type": msg_type,
+            "content": content,
+            "uuid": stable_uuid,
+        })
+    } else {
+        let receive_id = receive_id(env, &id_type);
+        if receive_id.is_empty() {
+            return Err(Error::msg("feishu send: missing chat_id / open_id"));
+        }
+        json!({
+            "receive_id": receive_id,
+            "msg_type": msg_type,
+            "content": content,
+            "uuid": stable_uuid,
+        })
+    };
     let mut last = Error::msg("feishu send failed");
     for _ in 0..2 {
         let token = tenant_token(http, base, app_id, secret).await?;
-        let url = format!("{base}/open-apis/im/v1/messages?receive_id_type={id_type}");
         let resp = match http
             .post(&url)
             .header("Authorization", format!("Bearer {token}"))
@@ -758,7 +1775,8 @@ async fn send_im(
         let data: Value = resp.json().await.unwrap_or(Value::Null);
         let code = data.get("code").and_then(Value::as_i64).unwrap_or(-1);
         if status.is_success() && code == 0 {
-            return Ok(());
+            remember_from_send(env, &data);
+            return Ok(parse_sent_message_id(&data).unwrap_or_default());
         }
         if status.as_u16() == 401 || code == 99991663 {
             clear_token(app_id);
@@ -772,6 +1790,22 @@ async fn send_im(
         break;
     }
     Err(last)
+}
+
+fn send_create_url(base: &str, env: &NativePayload, id_type: &str) -> String {
+    let reply = typing_message_id(env);
+    if reply.is_empty() {
+        format!("{base}/open-apis/im/v1/messages?receive_id_type={id_type}")
+    } else {
+        format!(
+            "{base}/open-apis/im/v1/messages/{}/reply",
+            urlencoding_seg(&reply)
+        )
+    }
+}
+
+fn send_is_reply(url: &str) -> bool {
+    url.contains("/reply")
 }
 
 fn receive_id_type(env: &NativePayload) -> String {
@@ -802,11 +1836,104 @@ fn native_from_envelope(ep: &ChannelEndpoint, v: &Value) -> Option<NativePayload
         return None;
     }
     let et = envelope_event_type(v);
-    if et.to_ascii_lowercase().contains("card") {
+    let et_l = et.to_ascii_lowercase();
+    if is_card_action(&et_l) {
+        return native_from_card_action(ep, v);
+    }
+    if et_l.contains("card") {
         return None;
     }
     let event = extract_event(v)?;
     native_from_event(ep, &event)
+}
+
+fn is_card_action(event_type: &str) -> bool {
+    event_type == "card.action.trigger"
+        || event_type.ends_with("card.action.trigger")
+        || event_type.contains("card.action.trigger")
+}
+
+fn native_from_card_action(ep: &ChannelEndpoint, v: &Value) -> Option<NativePayload> {
+    let event = v.get("event").unwrap_or(v);
+    let choice = card_choice(event);
+    if choice.is_empty() {
+        return None;
+    }
+    let open_id = first_str(&[
+        &event["operator"]["open_id"],
+        &event["operator"]["user_id"],
+        &event["operator"]["sender_id"]["open_id"],
+    ]);
+    if open_id.is_empty() {
+        return None;
+    }
+    let chat_id = first_str(&[
+        &event["context"]["open_chat_id"],
+        &event["context"]["chat_id"],
+        &event["message"]["chat_id"],
+        &event["open_chat_id"],
+    ]);
+    let message_id = first_str(&[
+        &v["header"]["event_id"],
+        &event["context"]["open_message_id"],
+        &event["open_message_id"],
+    ]);
+    let chat_type = first_str(&[
+        &event["context"]["chat_type"],
+        &event["message"]["chat_type"],
+        &event["host"],
+    ]);
+    let is_group = chat_type.to_ascii_lowercase().contains("group");
+    let receive_id_type = if is_group { "chat_id" } else { "open_id" };
+    let receive_id = if is_group {
+        chat_id.clone()
+    } else {
+        open_id.clone()
+    };
+    let mut env = NativePayload {
+        channel: if ep.kind.is_empty() {
+            "feishu".into()
+        } else {
+            ep.kind.clone()
+        },
+        sender_id: open_id,
+        sender_name: first_str(&[&event["operator"]["name"]]),
+        content_parts: vec![ContentPart::text(&choice)],
+        text: choice,
+        ..NativePayload::default()
+    };
+    env.meta.insert("chat_id".into(), json!(chat_id));
+    env.meta.insert("is_group".into(), json!(is_group));
+    env.meta.insert("is_mentioned".into(), json!(true));
+    env.mark_choice_click();
+    if !message_id.is_empty() {
+        env.meta.insert("message_id".into(), json!(message_id));
+    }
+    env.meta
+        .insert("receive_id_type".into(), json!(receive_id_type));
+    env.meta.insert("receive_id".into(), json!(receive_id));
+    Some(env)
+}
+
+fn card_choice(event: &Value) -> String {
+    let value = &event["action"]["value"];
+    let direct = first_str(&[
+        &value["choice"],
+        &value["id"],
+        &value["option"],
+        &event["action"]["option"],
+    ]);
+    if !direct.is_empty() {
+        return direct;
+    }
+    match value {
+        Value::String(s) => s.clone(),
+        Value::Object(map) => map
+            .values()
+            .find_map(|v| v.as_str().map(str::to_string))
+            .unwrap_or_default(),
+        _ => String::new(),
+    }
 }
 
 fn native_from_event(ep: &ChannelEndpoint, event: &Value) -> Option<NativePayload> {
@@ -861,6 +1988,10 @@ fn native_from_event(ep: &ChannelEndpoint, event: &Value) -> Option<NativePayloa
     env.meta.insert("chat_id".into(), json!(chat_id));
     env.meta.insert("is_group".into(), json!(is_group));
     env.meta.insert("message_id".into(), json!(message_id));
+    let create_time = js_str(&message["create_time"]);
+    if !create_time.is_empty() {
+        env.meta.insert("create_time".into(), json!(create_time));
+    }
     env.meta
         .insert("receive_id_type".into(), json!(receive_id_type));
     env.meta.insert("receive_id".into(), json!(receive_id));
@@ -1319,6 +2450,7 @@ fn pb_skip(buf: &[u8], i: &mut usize, wire: u32) -> Option<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::HashMap;
 
     fn ep_with(pairs: &[(&str, &str)]) -> ChannelEndpoint {
         let mut ep = ChannelEndpoint::default();
@@ -1374,6 +2506,151 @@ mod tests {
         assert_eq!(parse_text_content_str(r#"{"text":"hello"}"#), "hello");
         assert_eq!(parse_text_content_str(""), "");
         assert_eq!(parse_text_content_str("plain"), "plain");
+    }
+
+    #[test]
+    fn claim_inbound_drops_duplicate_ids() {
+        static N: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let n = N.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let id = format!("om_claim_{}_{}_{}", std::process::id(), unix_ms(), n);
+        assert!(claim_inbound(&id));
+        assert!(!claim_inbound(&id));
+        assert!(claim_inbound(&format!("{id}_b")));
+        assert!(claim_inbound(""));
+        assert!(claim_inbound(""));
+    }
+
+    #[test]
+    fn catchup_decide_skips_seen_stale_and_inits() {
+        let cur = ChatCursor {
+            last_id: "om_1".into(),
+            last_time: 1_700_000_000_000,
+            is_group: false,
+        };
+        let now = 1_700_000_000_000 + 60_000;
+        assert_eq!(
+            catchup_decide(None, "om_new", now, now),
+            CatchupDecide::InitCursor
+        );
+        assert_eq!(
+            catchup_decide(Some(&cur), "om_1", cur.last_time, now),
+            CatchupDecide::Skip
+        );
+        assert_eq!(
+            catchup_decide(Some(&cur), "om_old", cur.last_time - 1, now),
+            CatchupDecide::Skip
+        );
+        assert_eq!(
+            catchup_decide(Some(&cur), "om_ancient", now - CATCHUP_MAX_AGE_MS - 1, now),
+            CatchupDecide::Skip
+        );
+        assert_eq!(
+            catchup_decide(Some(&cur), "om_2", cur.last_time + 1, now),
+            CatchupDecide::Ingest
+        );
+    }
+
+    #[test]
+    fn catchup_floor_replays_recent_only() {
+        let now = 1_700_000_000_000 + CATCHUP_MAX_AGE_MS;
+        let cur = catchup_floor_cursor(now, false);
+        assert!(cur.last_id.is_empty());
+        assert_eq!(
+            catchup_decide(Some(&cur), "om_recent", now - 60_000, now),
+            CatchupDecide::Ingest
+        );
+        assert_eq!(
+            catchup_decide(Some(&cur), "om_old", cur.last_time.saturating_sub(1), now),
+            CatchupDecide::Skip
+        );
+    }
+
+    #[test]
+    fn parse_chat_list_items_p2p_and_group() {
+        let data = json!({
+            "code": 0,
+            "data": {
+                "items": [
+                    {"chat_id": "oc_dm", "chat_mode": "p2p"},
+                    {"chat_id": "oc_g", "chat_mode": "group"},
+                    {"chat_id": "", "chat_mode": "p2p"},
+                    {"chat_mode": "p2p"}
+                ]
+            }
+        });
+        assert_eq!(
+            parse_chat_list_items(&data),
+            vec![("oc_dm".into(), false), ("oc_g".into(), true)]
+        );
+        assert_eq!(parse_chat_list_next_page(&data), None);
+        let paged = json!({
+            "code": 0,
+            "data": {
+                "items": [{"chat_id": "oc_g", "chat_mode": "group"}],
+                "page_token": "tok_2",
+                "has_more": true
+            }
+        });
+        assert_eq!(parse_chat_list_next_page(&paged).as_deref(), Some("tok_2"));
+    }
+
+    #[test]
+    fn merge_catchup_keeps_stored_p2p_when_list_is_groups_or_empty() {
+        let now = 1_700_000_000_000u64;
+        let mut stored = HashMap::new();
+        stored.insert("oc_dm".into(), catchup_floor_cursor(now, false));
+        let listed = vec![("oc_g".into(), true)];
+        let merged = merge_catchup_targets(stored.clone(), &listed, now);
+        assert!(merged.contains_key("oc_dm"));
+        assert!(merged.contains_key("oc_g"));
+        assert!(!merged["oc_dm"].is_group);
+        assert!(merged["oc_g"].is_group);
+        let after_400 = merge_catchup_targets(stored, &[], now);
+        assert_eq!(after_400.len(), 1);
+        assert!(after_400.contains_key("oc_dm"));
+    }
+
+    #[test]
+    fn p2p_entered_event_yields_chat_id() {
+        let v = json!({
+            "header": {"event_type": "im.chat.access_event.bot_p2p_chat_entered_v1"},
+            "event": {"chat_id": "oc_new_dm", "operator_id": {"open_id": "ou_x"}}
+        });
+        assert_eq!(p2p_entered_chat_id(&v).as_deref(), Some("oc_new_dm"));
+        assert!(
+            p2p_entered_chat_id(&json!({"header": {"event_type": "im.message.receive_v1"}}))
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn list_item_user_text_becomes_native() {
+        let ep = ep_with(&[]);
+        let item = json!({
+            "message_id": "om_c",
+            "chat_id": "oc_dm",
+            "msg_type": "text",
+            "create_time": "1700000000000",
+            "sender": {"id": "ou_user", "sender_type": "user"},
+            "body": {"content": "{\"text\":\"补上刚才那条\"}"}
+        });
+        let event = list_item_to_event(&item, false).unwrap();
+        let env = native_from_event(&ep, &event).unwrap();
+        assert_eq!(env.text, "补上刚才那条");
+        assert_eq!(env.sender_id, "ou_user");
+        assert_eq!(env.meta["message_id"], json!("om_c"));
+        assert_eq!(env.meta["chat_id"], json!("oc_dm"));
+        assert_eq!(env.meta["is_group"], json!(false));
+        assert!(list_item_to_event(
+            &json!({
+                "message_id": "om_bot",
+                "chat_id": "oc_dm",
+                "sender": {"id": "cli_bot", "sender_type": "app"},
+                "body": {"content": "{\"text\":\"ack\"}"}
+            }),
+            false
+        )
+        .is_none());
     }
 
     #[test]
@@ -1482,6 +2759,66 @@ mod tests {
     }
 
     #[test]
+    fn native_ingests_card_action_choice() {
+        let ep = ep_with(&[]);
+        let v = json!({
+            "header": {"event_type": "card.action.trigger", "event_id": "ev_card_1"},
+            "event": {
+                "operator": {"open_id": "ou_user", "name": "William"},
+                "action": {"tag": "button", "value": {"choice": "2"}},
+                "context": {
+                    "open_chat_id": "oc_dm",
+                    "open_message_id": "om_card",
+                    "chat_type": "p2p"
+                }
+            }
+        });
+        let env = native_from_envelope(&ep, &v).expect("card action");
+        assert_eq!(env.sender_id, "ou_user");
+        assert_eq!(env.query_text(), "2");
+        assert!(env.is_choice_click());
+        assert_eq!(env.meta["is_mentioned"], json!(true));
+        assert_eq!(env.meta["is_group"], json!(false));
+        assert_eq!(env.meta["message_id"], json!("ev_card_1"));
+        let group = json!({
+            "header": {"event_type": "card.action.trigger", "event_id": "ev_g"},
+            "event": {
+                "operator": {"open_id": "ou_user"},
+                "action": {"value": {"choice": "api"}},
+                "host": "im_group_chat",
+                "context": {"open_chat_id": "oc_group", "chat_type": "group"}
+            }
+        });
+        let g = native_from_envelope(&ep, &group).unwrap();
+        assert_eq!(g.query_text(), "api");
+        assert_eq!(g.meta["is_group"], json!(true));
+        assert_eq!(g.meta["receive_id"], json!("oc_group"));
+        let other_card = json!({
+            "header": {"event_type": "im.message.card_update"},
+            "event": {
+                "operator": {"open_id": "ou_user"},
+                "action": {"value": {"choice": "1"}}
+            }
+        });
+        assert!(native_from_envelope(&ep, &other_card).is_none());
+    }
+
+    #[test]
+    fn choice_card_puts_choice_on_buttons() {
+        let card = feishu_choice_card(
+            "pick",
+            &[
+                ("1".into(), "Allow".into()),
+                ("2".into(), "Always".into()),
+                ("3".into(), "Deny".into()),
+            ],
+        );
+        assert_eq!(card["elements"][1]["actions"][0]["value"]["choice"], "1");
+        assert_eq!(card["elements"][1]["actions"][0]["type"], "primary");
+        assert_eq!(card["elements"][1]["actions"][2]["type"], "danger");
+    }
+
+    #[test]
     fn protobuf_ping_roundtrip() {
         let f = PbFrame::ping(42);
         let bytes = f.encode();
@@ -1532,5 +2869,138 @@ mod tests {
         let ack = json_ack(&v).unwrap();
         assert!(ack.contains("m1"));
         assert!(ack.contains("ack"));
+    }
+
+    #[test]
+    fn typing_ok_needs_message_id() {
+        let mut env = NativePayload::default();
+        env.channel = "feishu".into();
+        assert!(!typing_ok(&env));
+        env.meta.insert("message_id".into(), json!("om_1"));
+        assert!(typing_ok(&env));
+        assert_eq!(typing_message_id(&env), "om_1");
+    }
+
+    #[test]
+    fn first_send_replies_to_inbound_message() {
+        let mut env = NativePayload::default();
+        env.channel = "feishu".into();
+        let open = send_create_url("https://open.feishu.cn", &env, "open_id");
+        assert!(open.contains("receive_id_type=open_id"), "{open}");
+        assert!(!send_is_reply(&open));
+        env.meta.insert("message_id".into(), json!("om/1"));
+        let reply = send_create_url("https://open.feishu.cn", &env, "open_id");
+        assert!(reply.ends_with("/im/v1/messages/om%2F1/reply"), "{reply}");
+        assert!(send_is_reply(&reply));
+    }
+
+    #[test]
+    fn typing_reaction_urls_and_body() {
+        let body = typing_create_body();
+        assert_eq!(body["reaction_type"]["emoji_type"], json!(TYPING_EMOJI));
+        let create = typing_create_url("https://open.feishu.cn", "om/1");
+        assert!(create.ends_with("/im/v1/messages/om%2F1/reactions"));
+        let del = typing_delete_url("https://open.feishu.cn", "om_1", "re/a");
+        assert!(del.ends_with("/im/v1/messages/om_1/reactions/re%2Fa"));
+        assert_eq!(
+            parse_reaction_id(&json!({"code": 0, "data": {"reaction_id": "re_9"}})).as_deref(),
+            Some("re_9")
+        );
+        assert!(parse_reaction_id(&json!({"code": 0, "data": {}})).is_none());
+        assert!(feishu_api_ok(&json!({"code": 0})));
+        assert!(!feishu_api_ok(&json!({"code": 99992351})));
+    }
+
+    #[test]
+    fn parse_sent_message_id_from_create() {
+        assert_eq!(
+            parse_sent_message_id(&json!({"code": 0, "data": {"message_id": "om_p"}})).as_deref(),
+            Some("om_p")
+        );
+        assert!(parse_sent_message_id(&json!({"code": 0, "data": {}})).is_none());
+        assert_eq!(
+            sent_chat_meta(&json!({
+                "code": 0,
+                "data": {
+                    "message_id": "om_sent",
+                    "chat_id": "oc_from_send",
+                    "create_time": "1700000000000"
+                }
+            })),
+            Some((
+                "oc_from_send".into(),
+                "om_sent".into(),
+                "1700000000000".into()
+            ))
+        );
+        assert!(sent_chat_meta(&json!({"code": 0, "data": {"message_id": "om_p"}})).is_none());
+    }
+
+    #[test]
+    fn pick_ws_url_reads_sdk_fields() {
+        assert_eq!(
+            pick_ws_url(&json!({"code": 0, "data": {"URL": "wss://msg-frontier.feishu.cn/ws/v2"}}))
+                .as_deref(),
+            Some("wss://msg-frontier.feishu.cn/ws/v2")
+        );
+        assert_eq!(
+            pick_ws_url(&json!({"data": {"url": "wss://example/ws"}})).as_deref(),
+            Some("wss://example/ws")
+        );
+    }
+
+    #[test]
+    fn patch_url_and_bubble_slot() {
+        let url = patch_url("https://open.feishu.cn", "om/1");
+        assert!(url.ends_with("/im/v1/messages/om%2F1"));
+        store_bubble("c:1", "om_p".into());
+        assert_eq!(peek_slot("c:1").map(|s| s.mid).as_deref(), Some("om_p"));
+        bump_bubble("c:1");
+        assert_eq!(peek_slot("c:1").map(|s| s.patches), Some(1));
+        assert_eq!(take_bubble("c:1").as_deref(), Some("om_p"));
+        assert!(peek_slot("c:1").is_none());
+    }
+
+    #[test]
+    fn list_messages_uses_chat_container_type() {
+        let url = list_messages_url("https://open.feishu.cn/", "oc_16af");
+        assert!(url.contains("container_id_type=chat&"), "{url}");
+        assert!(!url.contains("container_id_type=chat_id"), "{url}");
+        assert!(url.contains("container_id=oc_16af"), "{url}");
+    }
+
+    #[test]
+    fn list_chats_url_has_sort_and_user_id_type() {
+        let url = list_chats_url("https://open.feishu.cn/", None);
+        assert!(
+            url.starts_with("https://open.feishu.cn/open-apis/im/v1/chats?"),
+            "{url}"
+        );
+        assert!(!url.contains("open.feishu.cn//"), "{url}");
+        assert!(url.contains("user_id_type=open_id"), "{url}");
+        assert!(url.contains("sort_type=ByCreateTimeAsc"), "{url}");
+        assert!(url.contains("page_size=100"), "{url}");
+        let next = list_chats_url("https://open.feishu.cn", Some("tok/1"));
+        assert!(next.contains("page_token=tok%2F1"), "{next}");
+    }
+
+    #[test]
+    fn feishu_edit_cap_rotates_before_20() {
+        assert!(!should_rotate_feishu_bubble(0));
+        assert!(!should_rotate_feishu_bubble(17));
+        assert!(should_rotate_feishu_bubble(18));
+        assert!(should_rotate_feishu_bubble(20));
+        assert!(is_feishu_edit_exhausted(&Error::msg(
+            "feishu patch HTTP 400 Bad Request code=230072 msg=The message has reached the number of times it can be edited."
+        )));
+        assert!(!is_feishu_edit_exhausted(&Error::msg(
+            "feishu patch HTTP 400 Bad Request code=230002 msg=invalid"
+        )));
+        assert!(is_feishu_illegal_content(&Error::msg(
+            "feishu send HTTP 400 Bad Request code=230001 msg=content is illegal"
+        )));
+        assert!(!is_feishu_illegal_content(&Error::msg(
+            "feishu patch HTTP 400 Bad Request code=230072 msg=edited"
+        )));
     }
 }

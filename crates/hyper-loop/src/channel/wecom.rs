@@ -6,7 +6,7 @@
 
 use std::collections::{BTreeMap, HashMap};
 use std::sync::{Arc, Mutex as StdMutex, OnceLock};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use futures::{SinkExt, StreamExt};
 use serde_json::{json, Value};
@@ -24,6 +24,11 @@ const DEVICE_ID: &str = "hyper";
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(20);
 const HEARTBEAT: Duration = Duration::from_secs(30);
 const MAX_MARKDOWN: usize = 4000;
+/// Official WS docs: finish the stream within 10 minutes of the first frame.
+/// Some clients cut off around 6 minutes. Rotate early so a 30-minute coding
+/// turn keeps a live think bubble.
+const STREAM_ROTATE: Duration = Duration::from_secs(5 * 60);
+const STREAM_EXPIRED: [i64; 2] = [846608, 846604];
 
 const CMD_SUBSCRIBE: &str = "aibot_subscribe";
 const CMD_CALLBACK: &str = "aibot_msg_callback";
@@ -248,6 +253,7 @@ async fn run_once(
                 let cmd = payload.get("cmd").and_then(Value::as_str).unwrap_or("");
                 if cmd == CMD_CALLBACK || cmd == CMD_LEGACY_CALLBACK {
                     if let Some(mut env) = native_from_callback(ep, &payload) {
+                        super::stamp_endpoint(&mut env, ep);
                         super::xfer::hydrate_http_parts(&mut env.content_parts).await;
                         env.text = super::xfer::query_text_of(&env.content_parts);
                         if env.content_parts.is_empty() {
@@ -256,6 +262,11 @@ async fn run_once(
                         if let Err(e) = mgr.ingest(env).await {
                             eprintln!("hyper wecom ingest: {e}");
                         }
+                    }
+                } else if stream_expired(&payload) {
+                    let rid = payload_req_id(&payload);
+                    if !rid.is_empty() {
+                        drop_stream(&rid);
                     }
                 }
             }
@@ -298,6 +309,23 @@ pub async fn send(
         }
         caption.push_str(&notes.join("\n"));
     }
+    let req = reply_req_id(env);
+    if !req.is_empty() {
+        if let Some(stream_id) = take_stream(&req) {
+            let body = if caption.trim().is_empty() {
+                "…"
+            } else {
+                caption.as_str()
+            };
+            tx.send(stream_frame(env, &stream_id, body, true)?)
+                .map_err(|_| Error::msg("wecom send: websocket not connected"))?;
+            for url in image_urls {
+                tx.send(outbound_image_frame(env, &url)?)
+                    .map_err(|_| Error::msg("wecom send: websocket not connected"))?;
+            }
+            return Ok(());
+        }
+    }
     if !caption.trim().is_empty() {
         tx.send(outbound_frame(env, &caption)?)
             .map_err(|_| Error::msg("wecom send: websocket not connected"))?;
@@ -306,6 +334,147 @@ pub async fn send(
         tx.send(outbound_image_frame(env, &url)?)
             .map_err(|_| Error::msg("wecom send: websocket not connected"))?;
     }
+    Ok(())
+}
+
+fn reply_req_id(env: &NativePayload) -> String {
+    env.meta
+        .get("reply_req_id")
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .trim()
+        .to_string()
+}
+
+struct StreamSlot {
+    id: String,
+    born: Instant,
+}
+
+fn streams() -> &'static StdMutex<HashMap<String, StreamSlot>> {
+    static C: OnceLock<StdMutex<HashMap<String, StreamSlot>>> = OnceLock::new();
+    C.get_or_init(|| StdMutex::new(HashMap::new()))
+}
+
+fn mint_stream_id() -> String {
+    let hex = uuid::Uuid::new_v4().simple().to_string();
+    format!("stream_{}", &hex[..12])
+}
+
+#[cfg(test)]
+fn ensure_stream(req_id: &str) -> String {
+    ensure_stream_at(req_id, Instant::now()).0
+}
+
+/// Current stream id, plus the previous id when this call rotated.
+fn ensure_stream_at(req_id: &str, now: Instant) -> (String, Option<String>) {
+    let fresh = mint_stream_id();
+    let Ok(mut g) = streams().lock() else {
+        return (fresh, None);
+    };
+    match g.get_mut(req_id) {
+        Some(slot) if now.saturating_duration_since(slot.born) >= STREAM_ROTATE => {
+            let old = slot.id.clone();
+            slot.id = fresh.clone();
+            slot.born = now;
+            (fresh, Some(old))
+        }
+        Some(slot) => (slot.id.clone(), None),
+        None => {
+            g.insert(
+                req_id.to_string(),
+                StreamSlot {
+                    id: fresh.clone(),
+                    born: now,
+                },
+            );
+            (fresh, None)
+        }
+    }
+}
+
+fn take_stream(req_id: &str) -> Option<String> {
+    let Ok(mut g) = streams().lock() else {
+        return None;
+    };
+    g.remove(req_id).map(|s| s.id)
+}
+
+fn drop_stream(req_id: &str) {
+    let _ = take_stream(req_id);
+}
+
+fn stream_expired(payload: &Value) -> bool {
+    let code = match payload.get("errcode") {
+        Some(Value::Number(n)) => n.as_i64(),
+        Some(Value::String(s)) => s.trim().parse().ok(),
+        _ => payload
+            .get("body")
+            .and_then(|b| b.get("errcode"))
+            .and_then(Value::as_i64),
+    };
+    code.is_some_and(|c| STREAM_EXPIRED.contains(&c))
+}
+
+fn clip_stream(text: &str) -> String {
+    text.chars().take(MAX_MARKDOWN).collect()
+}
+
+fn stream_frame(
+    env: &NativePayload,
+    stream_id: &str,
+    content: &str,
+    finish: bool,
+) -> Result<Value> {
+    let req = reply_req_id(env);
+    if req.is_empty() {
+        return Err(Error::msg("wecom stream: missing reply_req_id"));
+    }
+    Ok(json!({
+        "cmd": CMD_RESPOND,
+        "headers": {"req_id": req},
+        "body": {
+            "msgtype": "stream",
+            "stream": {
+                "id": stream_id,
+                "finish": finish,
+                "content": clip_stream(content),
+            }
+        }
+    }))
+}
+
+/// ACK / think / heartbeat: replace the same WeCom bubble (`finish: false`).
+/// Final [`send`] promotes it with `finish: true`.
+pub(crate) async fn send_progress(
+    ep: Option<&ChannelEndpoint>,
+    env: &NativePayload,
+    parts: &[ContentPart],
+) -> Result<()> {
+    let text = super::im_md::markdown_pretty(&super::xfer::spoken_text(parts));
+    if text.trim().is_empty() {
+        return Ok(());
+    }
+    let Some(ep) = ep else {
+        return Ok(());
+    };
+    let req = reply_req_id(env);
+    if req.is_empty() {
+        return send(Some(ep), env, parts).await;
+    }
+    let Some((bot_id, _)) = credentials(ep) else {
+        return Ok(());
+    };
+    let Some(tx) = sender_for(&bot_id) else {
+        return Ok(());
+    };
+    let (stream_id, old) = ensure_stream_at(&req, Instant::now());
+    if let Some(old) = old {
+        tx.send(stream_frame(env, &old, &text, true)?)
+            .map_err(|_| Error::msg("wecom progress: websocket not connected"))?;
+    }
+    tx.send(stream_frame(env, &stream_id, &text, false)?)
+        .map_err(|_| Error::msg("wecom progress: websocket not connected"))?;
     Ok(())
 }
 
@@ -347,7 +516,10 @@ fn outbound_image_frame(env: &NativePayload, url: &str) -> Result<Value> {
 }
 
 fn outbound_frame(env: &NativePayload, text: &str) -> Result<Value> {
-    let content: String = text.chars().take(MAX_MARKDOWN).collect();
+    let content: String = super::im_md::markdown_pretty(text)
+        .chars()
+        .take(MAX_MARKDOWN)
+        .collect();
     let reply_req_id = env
         .meta
         .get("reply_req_id")
@@ -840,5 +1012,142 @@ mod tests {
         send(Some(&ep), &env, &[ContentPart::text("again")])
             .await
             .unwrap_err();
+    }
+
+    #[test]
+    fn stream_frame_matches_aibot_respond() {
+        let mut env = NativePayload::default();
+        env.meta.insert("reply_req_id".into(), json!("req-stream"));
+        let frame = stream_frame(&env, "stream_abc", "思考中", false).unwrap();
+        assert_eq!(frame["cmd"], CMD_RESPOND);
+        assert_eq!(frame["headers"]["req_id"], "req-stream");
+        assert_eq!(frame["body"]["msgtype"], "stream");
+        assert_eq!(frame["body"]["stream"]["id"], "stream_abc");
+        assert_eq!(frame["body"]["stream"]["finish"], json!(false));
+        assert_eq!(frame["body"]["stream"]["content"], "思考中");
+        let done = stream_frame(&env, "stream_abc", "done", true).unwrap();
+        assert_eq!(done["body"]["stream"]["finish"], json!(true));
+        assert!(stream_frame(&NativePayload::default(), "s", "x", false).is_err());
+    }
+
+    #[test]
+    fn stream_id_stable_until_take() {
+        let key = format!("req-{}", uuid::Uuid::new_v4().simple());
+        let a = ensure_stream(&key);
+        let b = ensure_stream(&key);
+        assert_eq!(a, b);
+        assert!(a.starts_with("stream_"));
+        assert_eq!(take_stream(&key).as_deref(), Some(a.as_str()));
+        assert!(take_stream(&key).is_none());
+    }
+
+    #[test]
+    fn stream_rotates_after_ttl() {
+        let key = format!("req-{}", uuid::Uuid::new_v4().simple());
+        let t0 = Instant::now();
+        let (a, old) = ensure_stream_at(&key, t0);
+        assert!(old.is_none());
+        let (b, old) = ensure_stream_at(&key, t0 + STREAM_ROTATE - Duration::from_secs(1));
+        assert_eq!(a, b);
+        assert!(old.is_none());
+        let (c, old) = ensure_stream_at(&key, t0 + STREAM_ROTATE);
+        assert_ne!(a, c);
+        assert_eq!(old.as_deref(), Some(a.as_str()));
+        drop_stream(&key);
+    }
+
+    #[test]
+    fn stream_expired_codes() {
+        assert!(stream_expired(&json!({"errcode": 846608})));
+        assert!(stream_expired(&json!({"errcode": "846604"})));
+        assert!(stream_expired(&json!({"body": {"errcode": 846608}})));
+        assert!(!stream_expired(&json!({"errcode": 0})));
+        assert!(!stream_expired(&json!({})));
+    }
+
+    #[tokio::test]
+    async fn progress_rotates_finishes_old_stream() {
+        let bot_id = format!("bot-{}", uuid::Uuid::new_v4());
+        let req = format!("req-{}", uuid::Uuid::new_v4().simple());
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        register_sender(&bot_id, tx.clone());
+        {
+            let mut g = streams().lock().unwrap();
+            g.insert(
+                req.clone(),
+                StreamSlot {
+                    id: "stream_oldoldold".into(),
+                    born: Instant::now()
+                        .checked_sub(STREAM_ROTATE + Duration::from_secs(1))
+                        .unwrap_or_else(Instant::now),
+                },
+            );
+        }
+        let mut ep = ChannelEndpoint {
+            kind: "wecom".into(),
+            ..ChannelEndpoint::default()
+        };
+        ep.extra.insert("bot_id".into(), bot_id.clone());
+        ep.extra.insert("secret".into(), "unit-test-secret".into());
+        let mut env = NativePayload::default();
+        env.meta.insert("reply_req_id".into(), json!(req.clone()));
+        env.meta.insert("chat_id".into(), json!("c1"));
+        send_progress(Some(&ep), &env, &[ContentPart::text("还在处理…")])
+            .await
+            .unwrap();
+        let close_old = rx.try_recv().unwrap();
+        assert_eq!(close_old["body"]["stream"]["id"], "stream_oldoldold");
+        assert_eq!(close_old["body"]["stream"]["finish"], json!(true));
+        let fresh = rx.try_recv().unwrap();
+        assert_eq!(fresh["body"]["msgtype"], "stream");
+        assert_eq!(fresh["body"]["stream"]["finish"], json!(false));
+        assert_ne!(fresh["body"]["stream"]["id"], "stream_oldoldold");
+        drop_stream(&req);
+        unregister_sender(&bot_id, &tx);
+    }
+
+    #[tokio::test]
+    async fn progress_then_send_finishes_same_stream() {
+        let bot_id = format!("bot-{}", uuid::Uuid::new_v4());
+        let req = format!("req-{}", uuid::Uuid::new_v4().simple());
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        register_sender(&bot_id, tx.clone());
+        let mut ep = ChannelEndpoint {
+            kind: "wecom".into(),
+            ..ChannelEndpoint::default()
+        };
+        ep.extra.insert("bot_id".into(), bot_id.clone());
+        ep.extra.insert("secret".into(), "unit-test-secret".into());
+        let mut env = NativePayload::default();
+        env.meta.insert("reply_req_id".into(), json!(req));
+        env.meta.insert("chat_id".into(), json!("c1"));
+        send_progress(Some(&ep), &env, &[ContentPart::text("收到，正在处理…")])
+            .await
+            .unwrap();
+        let first = rx.try_recv().unwrap();
+        assert_eq!(first["body"]["msgtype"], "stream");
+        assert_eq!(first["body"]["stream"]["finish"], json!(false));
+        let sid = first["body"]["stream"]["id"].as_str().unwrap().to_string();
+        send(Some(&ep), &env, &[ContentPart::text("终稿")])
+            .await
+            .unwrap();
+        let last = rx.try_recv().unwrap();
+        assert_eq!(last["body"]["msgtype"], "stream");
+        assert_eq!(last["body"]["stream"]["finish"], json!(true));
+        assert_eq!(last["body"]["stream"]["id"], sid);
+        assert_eq!(last["body"]["stream"]["content"], "终稿");
+        unregister_sender(&bot_id, &tx);
+    }
+
+    #[test]
+    fn drop_stream_on_expired_ack() {
+        let key = format!("req-{}", uuid::Uuid::new_v4().simple());
+        let id = ensure_stream(&key);
+        assert_eq!(take_stream(&key).as_deref(), Some(id.as_str()));
+        let id = ensure_stream(&key);
+        drop_stream(&key);
+        let next = ensure_stream(&key);
+        assert_ne!(next, id);
+        drop_stream(&key);
     }
 }

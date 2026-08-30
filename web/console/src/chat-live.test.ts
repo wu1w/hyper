@@ -2,12 +2,17 @@ import assert from "node:assert/strict";
 import {
   applyHistoryIncoming,
   coversLive,
+  editDiffFromTool,
+  editDiffLines,
   isPrepareHint,
   lastAssistantContent,
   lastAssistantInCurrentTurn,
   preferFresherHistory,
+  runPhase,
+  stripLeakedToolJson,
   stripLeakedToolMarkup,
   stripThinkRestatement,
+  thinkOverlayLive,
 } from "./chat-live.ts";
 import type { SessionEvent } from "./api.ts";
 
@@ -28,6 +33,9 @@ assert.equal(lastAssistantInCurrentTurn([user]), "");
   assert.equal(lastAssistantContent([user, hop]), "");
   assert.equal(lastAssistantInCurrentTurn([user, hop]), "");
   assert.equal(coversLive([user, hop], { think: "", content: "已改好标题。" }), false);
+  assert.equal(coversLive([user], { think: "正在连接模型…\n", content: "" }), false);
+  assert.equal(coversLive([user, hop], { think: "正在连接模型…\n", content: "" }), true);
+  assert.equal(coversLive([user, hop], { think: "计划先读入口。", content: "" }), false);
 }
 
 {
@@ -103,6 +111,91 @@ assert.equal(
   "auth.rs 里 page_bounds 的起算是 1-based。",
 );
 
+{
+  const r97 =
+    "The user wants a file.\n```json\n{\"name\": \"Write\", \"path\": \"a.txt\", \"contents\": \"R97_OK\\n\"}\n```\nThen native Write.";
+  const vis = stripLeakedToolJson(r97);
+  assert.ok(vis.includes("The user wants a file."));
+  assert.ok(vis.includes("Then native Write."));
+  assert.equal(vis.includes("R97_OK"), false);
+  assert.equal(stripThinkRestatement("write a.txt", r97).includes("R97_OK"), false);
+  assert.equal(
+    stripLeakedToolJson("I'll write.\n```json\n{\"name\": \"Write\", \"path\":"),
+    "I'll write.\n",
+  );
+}
+
 assert.equal(isPrepareHint("正在连接模型…\n"), true);
 assert.equal(isPrepareHint("正在准备工作区…"), true);
 assert.equal(isPrepareHint("hmm, the user asked…"), false);
+
+{
+  assert.equal(thinkOverlayLive({ hasTools: false, hasContent: false }), true);
+  assert.equal(thinkOverlayLive({ hasTools: true, hasContent: false }), false);
+  assert.equal(thinkOverlayLive({ hasTools: false, hasContent: true }), false);
+  assert.equal(thinkOverlayLive({ hasTools: true, hasContent: true }), false);
+}
+
+{
+  const think = { think: "计划先读入口。", content: "" };
+  const empty = { think: "", content: "" };
+  assert.equal(runPhase({ busy: false, live: think, events: [] }), "idle");
+  assert.equal(runPhase({ busy: true, live: think, events: [] }), "thinking");
+  assert.equal(
+    runPhase({ busy: false, live: { think: "", content: "已改好。" }, events: [] }),
+    "writing",
+  );
+  assert.equal(runPhase({ busy: true, live: empty, events: [] }), "waiting");
+  assert.equal(
+    runPhase({
+      busy: true,
+      live: think,
+      events: [{ type: "tool/lifecycle", phase: "started", name: "Read", tool_call_id: "c1" }],
+    }),
+    "tool",
+    "typed tool state wins over a stale think overlay",
+  );
+  assert.equal(
+    runPhase({
+      busy: true,
+      live: empty,
+      events: [{ type: "step", phase: "started", run_id: "r1", turn_id: "t1", step_id: 2 }],
+    }),
+    "waiting",
+  );
+  assert.equal(
+    runPhase({
+      busy: true,
+      live: empty,
+      events: [{ type: "tool/lifecycle", phase: "error", name: "Bash", tool_call_id: "c2" }],
+    }),
+    "retrying",
+  );
+}
+
+{
+  const lines = editDiffLines("keep\nold title\nend", "keep\nnew title\nend");
+  assert.deepEqual(lines, [
+    { kind: "ctx", text: "keep" },
+    { kind: "del", text: "old title" },
+    { kind: "add", text: "new title" },
+    { kind: "ctx", text: "end" },
+  ]);
+  const view = editDiffFromTool(
+    "StrReplace",
+    JSON.stringify({ path: "src/App.tsx", old_string: "old title", new_string: "new title" }),
+  );
+  assert.equal(view?.kind, "replace");
+  assert.equal(view?.path, "src/App.tsx");
+  assert.deepEqual(view?.lines, [
+    { kind: "del", text: "old title" },
+    { kind: "add", text: "new title" },
+  ]);
+  const write = editDiffFromTool("Write", JSON.stringify({ path: "a.txt", contents: "hello\nworld" }));
+  assert.equal(write?.kind, "write");
+  assert.deepEqual(write?.lines, [
+    { kind: "add", text: "hello" },
+    { kind: "add", text: "world" },
+  ]);
+  assert.equal(editDiffFromTool("Read", JSON.stringify({ path: "a.txt" })), null);
+}

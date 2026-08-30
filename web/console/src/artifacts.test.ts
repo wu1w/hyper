@@ -4,11 +4,12 @@ import {
   mergeArtifactLists,
   siblingStamp,
   turnArtifacts,
+  turnEditedPaths,
   turnPreviewPaths,
   turnTouchedPaths,
-} from "./artifacts";
-import { siteHref } from "./media";
-import type { SessionEvent } from "./api";
+} from "./artifacts.ts";
+import { siteHref } from "./media.ts";
+import type { SessionEvent } from "./api.ts";
 
 const WS = "/tmp/hyper-dialect-ws";
 
@@ -78,6 +79,19 @@ function turn(user: string, rest: SessionEvent[]) {
     turn("x", tool("Write", { path: `${WS}/build_user_guide.py`, contents: "print(1)\n" }, "Wrote 8 bytes to build_user_guide.py.")),
     [],
   );
+}
+
+{
+  const events: SessionEvent[] = [
+    { type: "user", text: "改标题" },
+    ...tool(
+      "StrReplace",
+      { path: `${WS}/src/App.tsx`, old_string: "a", new_string: "b" },
+      "Successfully replaced text in src/App.tsx.",
+    ),
+  ];
+  assert.deepEqual(turnEditedPaths(events, WS), ["src/App.tsx"]);
+  assert.deepEqual(turnArtifacts(events, WS), []);
 }
 
 {

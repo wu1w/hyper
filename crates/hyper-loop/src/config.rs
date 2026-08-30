@@ -191,6 +191,8 @@ pub struct PolicyConfig {
     pub max_think_tokens_low: u32,
     pub max_think_tokens_medium: u32,
     pub max_think_tokens_xhigh: u32,
+    /// TUI / web console. Same 500 as IM (`max_steps_unattended`) so long
+    /// coding tasks close; wall clock still `max_wall_seconds`.
     pub max_steps: u32,
     pub max_steps_think: u32,
     pub max_wall_seconds: u64,
@@ -212,7 +214,7 @@ impl Default for PolicyConfig {
             max_think_tokens_low: 512,
             max_think_tokens_medium: 2048,
             max_think_tokens_xhigh: 4096,
-            max_steps: 80,
+            max_steps: 500,
             max_steps_think: 100,
             max_wall_seconds: 1800,
             max_steps_unattended: 500,
@@ -251,7 +253,7 @@ impl Config {
 pub struct PromptConfig {
     /// Unused. Builtin identity is one agent contract; kept so old config.toml loads.
     pub coding: bool,
-    /// Looked up in the workspace, then `~/.grok-hyper`. Empty = `AGENT.md`.
+    /// Basename under `~/.grok-hyper` only. Empty = `AGENT.md`. Workspace copies are ignored.
     pub file: String,
     /// One-line progress narration on interactive channels (TUI/web).
     /// `--print` and IM bridges are never narrated regardless of this flag.
@@ -281,8 +283,11 @@ pub struct FeatureConfig {
     /// TUI permission mode: ask | auto | yolo. `--print` never prompts.
     pub approvals: String,
     /// Append ComputerUse (screenshot + mouse/keyboard on Windows / macOS).
-    /// Not spliced into the frozen Cursor 13.
+    /// Not spliced into the core Cursor-shaped set. Default off.
     pub computer_use: bool,
+    /// Append workspace `Search` (FTS index). Default off: the frozen set
+    /// already has Grep / Glob / Read.
+    pub code_search: bool,
 }
 
 impl Default for FeatureConfig {
@@ -294,7 +299,8 @@ impl Default for FeatureConfig {
             mcp_auto_catalog: false,
             workspace_write_only: true,
             approvals: "ask".into(),
-            computer_use: true,
+            computer_use: false,
+            code_search: false,
         }
     }
 }
@@ -335,6 +341,8 @@ impl Default for WebConfig {
 #[serde(default)]
 pub struct ConsoleConfig {
     /// Absolute folder. Empty = `hyper web` falls back to the process cwd.
+    /// Live session cwd is `session/start.workspace` in the JSONL; this field
+    /// is the default for new chats and for `hyper web` without `--workspace`.
     #[serde(skip_serializing_if = "String::is_empty")]
     pub workspace: String,
 }
@@ -486,7 +494,7 @@ pub struct MediaConfig {
 impl Default for MediaConfig {
     fn default() -> Self {
         Self {
-            enabled: true,
+            enabled: false,
             max_bytes: crate::media::MAX_INLINE_MEDIA_BYTES as u64,
             ffmpeg: String::new(),
             whisper: String::new(),
@@ -746,7 +754,7 @@ mod tests {
             crate::policy::Effort::Xhigh
         );
         assert!(c.server.base_url.is_empty());
-        assert_eq!(c.policy.max_steps, 80);
+        assert_eq!(c.policy.max_steps, 500);
         assert!(!c.policy.low_precision);
         assert_eq!(c.policy.max_wall_seconds, 1800);
         assert_eq!(c.policy.max_steps_unattended, 500);

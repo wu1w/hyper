@@ -129,10 +129,68 @@ pub fn compact_url(base_url: &str) -> String {
 /// `instructions` already carry grok-hyper) and wash platform prefix text
 /// out of other roles. Do not parse `encrypted_content`.
 pub fn messages_to_responses_input(messages: &[ChatMessage]) -> Vec<Value> {
-    hoist_hidden_notes_before_query(messages)
+    let mut items: Vec<Value> = hoist_hidden_notes_before_query(messages)
         .iter()
         .flat_map(chat_to_input_items)
-        .collect()
+        .collect();
+    append_im_hop_closer(&mut items, messages);
+    items
+}
+
+const IM_HOP_CLOSER_ZH: &str = "[im] 这一跳思考用中文，不要英文。工具跳正文留空。";
+const IM_HOP_CLOSER_EN: &str =
+    "[im] This hop: think in the user's language. Tool hops keep visible text empty.";
+
+fn live_im_hop_closer(messages: &[ChatMessage]) -> Option<&'static str> {
+    for m in messages.iter().rev() {
+        if m.role != "user" {
+            continue;
+        }
+        let inner = unwrap_qwen_hidden(m.content.as_deref().unwrap_or(""));
+        let t = inner.trim();
+        if !t.starts_with("[im]") || t.contains("[im] applied") {
+            continue;
+        }
+        if t.contains("都必须用中文") || t.contains("不要用英文写思考") {
+            return Some(IM_HOP_CLOSER_ZH);
+        }
+        return Some(IM_HOP_CLOSER_EN);
+    }
+    None
+}
+
+fn append_im_hop_closer(items: &mut Vec<Value>, messages: &[ChatMessage]) {
+    let Some(closer) = live_im_hop_closer(messages) else {
+        return;
+    };
+    let Some(last) = items.last_mut() else {
+        return;
+    };
+    if last.get("type").and_then(|t| t.as_str()) != Some("function_call_output") {
+        return;
+    }
+    match last.get_mut("output") {
+        Some(Value::String(s)) => {
+            if s.contains(closer) {
+                return;
+            }
+            if !s.ends_with('\n') {
+                s.push('\n');
+            }
+            s.push_str(closer);
+        }
+        Some(Value::Array(arr)) => {
+            if arr.iter().any(|p| {
+                p.get("text")
+                    .and_then(|t| t.as_str())
+                    .is_some_and(|t| t.contains(closer))
+            }) {
+                return;
+            }
+            arr.push(json!({ "type": "input_text", "text": closer }));
+        }
+        _ => {}
+    }
 }
 
 /// Qwen Jinja skipped `<tool_response>` wraps, so skill/plan/mcp cards were
@@ -245,6 +303,9 @@ fn is_cursor_noise_user(msg: &ChatMessage) -> bool {
         // Stubbed cards only. A live `[workset]` snapshot must reach grok-4.6;
         // dropping the prefix here hid every workset card on the Responses wire.
         "[workset] applied",
+        "[rules] applied",
+        "[im] applied",
+        "[history] applied",
         "[background",
         "HYPER_WORKING_WINDOW=",
         "MEMORY hot",
@@ -701,6 +762,7 @@ mod tests {
             ChatMessage::hidden_user("[guard] tests went red."),
             ChatMessage::hidden_user("MEMORY hot\nprefer Chinese"),
             ChatMessage::hidden_user("[workset] applied"),
+            ChatMessage::hidden_user("[rules] applied"),
         ];
         let input = messages_to_responses_input(&msgs);
         let blob = serde_json::to_string(&input).unwrap();
@@ -708,6 +770,32 @@ mod tests {
         assert!(!blob.contains("[guard]"), "{blob}");
         assert!(!blob.contains("MEMORY hot"), "{blob}");
         assert!(!blob.contains("[workset] applied"), "{blob}");
+        assert!(!blob.contains("[rules] applied"), "{blob}");
+    }
+
+    #[test]
+    fn live_im_card_reaches_responses() {
+        let msgs = vec![
+            ChatMessage::user("task"),
+            ChatMessage::hidden_user(crate::sticky::IM_CARD),
+        ];
+        let input = messages_to_responses_input(&msgs);
+        let blob = serde_json::to_string(&input).unwrap();
+        assert_eq!(input.len(), 2, "{blob}");
+        assert!(blob.contains("[im]"), "{blob}");
+        assert!(blob.contains("user's language"), "{blob}");
+    }
+
+    #[test]
+    fn stubbed_im_card_is_dropped_from_responses() {
+        let msgs = vec![
+            ChatMessage::user("task"),
+            ChatMessage::hidden_user("[im] applied"),
+        ];
+        let input = messages_to_responses_input(&msgs);
+        let blob = serde_json::to_string(&input).unwrap();
+        assert_eq!(input.len(), 1, "{blob}");
+        assert!(!blob.contains("[im]"), "{blob}");
     }
 
     #[test]
@@ -723,6 +811,46 @@ mod tests {
         assert_eq!(input.len(), 2, "{blob}");
         assert!(blob.contains("[workset]"), "{blob}");
         assert!(blob.contains("hyper-loop"), "{blob}");
+    }
+
+    #[test]
+    fn live_history_card_reaches_responses() {
+        let msgs = vec![
+            ChatMessage::user("task"),
+            ChatMessage::hidden_user(
+                "[history]\nfeishu · 审计\n  Shell 不是沙箱，workspace_write_only 管不住命令。",
+            ),
+        ];
+        let input = messages_to_responses_input(&msgs);
+        let blob = serde_json::to_string(&input).unwrap();
+        assert_eq!(input.len(), 2, "{blob}");
+        assert!(blob.contains("[history]"), "{blob}");
+        assert!(blob.contains("Shell 不是沙箱"), "{blob}");
+    }
+
+    #[test]
+    fn stubbed_history_card_is_dropped_from_responses() {
+        let msgs = vec![
+            ChatMessage::user("task"),
+            ChatMessage::hidden_user("[history] applied"),
+        ];
+        let input = messages_to_responses_input(&msgs);
+        let blob = serde_json::to_string(&input).unwrap();
+        assert_eq!(input.len(), 1, "{blob}");
+        assert!(!blob.contains("[history]"), "{blob}");
+    }
+
+    #[test]
+    fn live_rules_card_reaches_responses() {
+        let msgs = vec![
+            ChatMessage::user("task"),
+            ChatMessage::hidden_user("[rules]\n# rust.mdc\nuse rustfmt.\n"),
+        ];
+        let input = messages_to_responses_input(&msgs);
+        let blob = serde_json::to_string(&input).unwrap();
+        assert_eq!(input.len(), 2, "{blob}");
+        assert!(blob.contains("[rules]"), "{blob}");
+        assert!(blob.contains("rustfmt"), "{blob}");
     }
 
     #[test]
@@ -792,6 +920,36 @@ mod tests {
         assert_eq!(input[1]["type"], "function_call_output");
         assert_eq!(input[1]["call_id"], "c1");
         assert!(input[1]["output"].is_string(), "{input:?}");
+        assert!(
+            !input[1]["output"]
+                .as_str()
+                .unwrap_or("")
+                .contains("这一跳思考用中文"),
+            "desktop/no IM card must not get a closer: {input:?}"
+        );
+    }
+
+    #[test]
+    fn im_card_closer_lands_on_last_tool_output() {
+        let msgs = vec![
+            ChatMessage::user("审计完了吗"),
+            ChatMessage::hidden_user(crate::sticky::IM_CARD_ZH),
+            ChatMessage::assistant_tools(
+                None,
+                vec![json!({
+                    "id": "c1",
+                    "type": "function",
+                    "function": {"name": "Read", "arguments": "{\"path\":\"a.rs\"}"}
+                })],
+            ),
+            ChatMessage::tool("c1", "ok"),
+        ];
+        let input = messages_to_responses_input(&msgs);
+        let last = input.last().expect("output");
+        assert_eq!(last["type"], "function_call_output");
+        let out = last["output"].as_str().unwrap_or("");
+        assert!(out.contains("ok"), "{out}");
+        assert!(out.contains("这一跳思考用中文"), "{out}");
     }
 
     #[test]

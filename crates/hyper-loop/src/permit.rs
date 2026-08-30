@@ -2,7 +2,7 @@
 //!
 //! `tools[]` stays frozen. Plan is a hidden-user card + mutating-tool deny
 //! except writes whose path is `plan.md` (or the session plan file).
-//! Ask/auto is a TUI oneshot in front of write/edit/bash/run_code/mcp.
+//! Ask/auto is an interactive oneshot in front of mutating tools.
 
 use std::collections::HashSet;
 use std::fmt;
@@ -19,10 +19,11 @@ pub const DEFAULT_PLAN_FILE: &str = "plan.md";
 
 // 文案必须与 plan_mode_blocks 的放行面一致：只读 + plan.md 可写。
 pub const PLAN_CARD: &str = "\
-PLAN MODE. Allowed: Read, Glob, Grep, Search, WebSearch, WebFetch, view, recall, \
-AskQuestion, ComputerUse screenshot/list_displays/wait, and Write/StrReplace of \
-plan.md (the session plan file). Do not write other files. Mutating Shell, \
-run_code, mcp, and ComputerUse click/type are blocked. Inspect the \
+PLAN MODE. Allowed: Read, Glob, Grep, Search, ReadLints, FetchMcpResource list/read, \
+WebSearch, WebFetch, view, recall, AskQuestion, ComputerUse screenshot/list_displays/wait, \
+and Write/StrReplace of plan.md (the session plan file). Do not write other files. \
+EditNotebook, GenerateImage, FetchMcpResource with downloadPath, mutating Shell, \
+run_code, CallDynamicTool, legacy mcp, and ComputerUse click/type are blocked. Inspect the \
 workspace and put the markdown plan in plan.md: files to change, steps, risks. \
 Do not implement yet.";
 
@@ -148,7 +149,7 @@ impl PermitHub {
             ApprovalMode::Ask => true,
             ApprovalMode::Auto => !matches!(
                 normalize_tool(tool).as_str(),
-                "write" | "edit" | "strreplace" | "delete"
+                "write" | "edit" | "strreplace" | "delete" | "editnotebook" | "fetchmcpresource"
             ),
         }
     }
@@ -198,10 +199,14 @@ pub fn is_mutating(tool: &str) -> bool {
             | "shell"
             | "runcode"
             | "mcp"
+            | "calldynamictool"
             | "strreplace"
             | "todowrite"
             | "computeruse"
             | "computer"
+            | "editnotebook"
+            | "generateimage"
+            | "fetchmcpresource"
     )
 }
 
@@ -218,7 +223,7 @@ pub fn plan_mode_blocks_in(tool: &str, args: &Value, plan_file: &str) -> bool {
         return false;
     }
     match name.as_str() {
-        "write" | "edit" | "delete" | "strreplace" => match tool_path(args) {
+        "write" | "edit" | "delete" | "strreplace" | "editnotebook" => match tool_path(args) {
             Some(path) if is_plan_file_path(&path, plan_file) => false,
             _ => true,
         },
@@ -226,7 +231,8 @@ pub fn plan_mode_blocks_in(tool: &str, args: &Value, plan_file: &str) -> bool {
             let cmd = tool_command(args).unwrap_or_default();
             !shell_allowed_in_plan(&cmd, plan_file)
         }
-        "runcode" | "mcp" => true,
+        "runcode" | "mcp" | "calldynamictool" | "generateimage" => true,
+        "fetchmcpresource" => fetch_writes_workspace(args),
         "computeruse" | "computer" => !crate::tools::computer::is_observe(args),
         _ => false,
     }
@@ -438,7 +444,14 @@ fn normalize_tool(tool: &str) -> String {
 }
 
 fn tool_path(args: &Value) -> Option<String> {
-    const KEYS: &[&str] = &["path", "file_path", "target_file", "target", "dest"];
+    const KEYS: &[&str] = &[
+        "path",
+        "file_path",
+        "target_file",
+        "target_notebook",
+        "target",
+        "dest",
+    ];
     for k in KEYS {
         if let Some(s) = args.get(*k).and_then(|v| v.as_str()).map(str::trim) {
             if !s.is_empty() {
@@ -464,6 +477,14 @@ pub fn plan_denied(tool: &str) -> String {
          is writable. Stay otherwise read-only. The user will /plan go when they want you \
          to implement."
     )
+}
+
+pub fn fetch_writes_workspace(args: &Value) -> bool {
+    ["downloadPath", "download_path"].iter().any(|key| {
+        args.get(*key)
+            .and_then(Value::as_str)
+            .is_some_and(|s| !s.trim().is_empty())
+    })
 }
 
 pub fn user_denied(tool: &str) -> String {
@@ -497,6 +518,15 @@ mod tests {
         assert!(PermitHub::needs_prompt(ApprovalMode::Ask, "ComputerUse"));
         assert!(PermitHub::needs_prompt(ApprovalMode::Auto, "ComputerUse"));
         assert!(!PermitHub::needs_prompt(ApprovalMode::Yolo, "ComputerUse"));
+        assert!(is_mutating("EditNotebook"));
+        assert!(is_mutating("GenerateImage"));
+        assert!(!PermitHub::needs_prompt(ApprovalMode::Auto, "EditNotebook"));
+        assert!(PermitHub::needs_prompt(ApprovalMode::Ask, "GenerateImage"));
+        assert!(PermitHub::needs_prompt(ApprovalMode::Auto, "GenerateImage"));
+        assert!(!PermitHub::needs_prompt(
+            ApprovalMode::Auto,
+            "FetchMcpResource"
+        ));
     }
 
     #[test]
@@ -523,6 +553,22 @@ mod tests {
         assert!(plan_mode_blocks("Delete", &other));
         assert!(!plan_mode_blocks("ask", &ask));
         assert!(!plan_mode_blocks("AskQuestion", &ask));
+        assert!(plan_mode_blocks(
+            "EditNotebook",
+            &serde_json::json!({"target_notebook": "n.ipynb", "cell_idx": 0})
+        ));
+        assert!(plan_mode_blocks(
+            "GenerateImage",
+            &serde_json::json!({"description": "cat"})
+        ));
+        assert!(!plan_mode_blocks(
+            "FetchMcpResource",
+            &serde_json::json!({"server": "echo", "uri": "echo://x"})
+        ));
+        assert!(plan_mode_blocks(
+            "FetchMcpResource",
+            &serde_json::json!({"server": "echo", "uri": "echo://x", "downloadPath": "a.txt"})
+        ));
         assert!(!plan_mode_blocks("bash", &ls));
         assert!(plan_mode_blocks("Shell", &rm));
         assert!(!plan_mode_blocks("bash", &redirect_plan));

@@ -415,14 +415,14 @@ fn split_instructions(
     (instructions, input)
 }
 
-/// Host `web_search` / `x_search` / `image_generation` plus client functions.
-/// Drop client `WebSearch` — mixing it with the host tool makes grok-4.6 call both.
+/// Cursor frozen tools as Responses functions. Do not prepend host
+/// `web_search` / `x_search` — mixing those with client `WebSearch` made
+/// grok-4.6 call both. Host `image_generation` stays out: frozen 17 already
+/// has client `GenerateImage`. If a host type still appears in `tools`, skip
+/// the search hosts so the Cursor name wins.
 fn map_responses_tools(tools: &[Value]) -> Vec<Value> {
-    let mut out = crate::tools_schema::xai_server_search_tools();
-    let mut seen_host: HashSet<String> = ["web_search", "x_search", "image_generation"]
-        .into_iter()
-        .map(str::to_string)
-        .collect();
+    let mut out = Vec::new();
+    let mut seen_host: HashSet<String> = HashSet::new();
     for t in tools {
         let flat = flatten_tool(t);
         let ty = flat
@@ -430,13 +430,16 @@ fn map_responses_tools(tools: &[Value]) -> Vec<Value> {
             .and_then(|v| v.as_str())
             .unwrap_or("function");
         if ty != "function" {
+            if matches!(ty, "web_search" | "x_search") {
+                continue;
+            }
             if seen_host.insert(ty.to_string()) {
                 out.push(flat);
             }
             continue;
         }
         let name = flat.get("name").and_then(|v| v.as_str()).unwrap_or("");
-        if name.is_empty() || crate::tools_schema::is_client_web_search_name(name) {
+        if name.is_empty() {
             continue;
         }
         out.push(flat);
@@ -1340,19 +1343,28 @@ mod tests {
         assert!(body.get("top_k").is_none(), "{body}");
         assert!(body.get("min_p").is_none(), "{body}");
         assert!(body.get("repetition_penalty").is_none(), "{body}");
-        assert_eq!(body["tools"][0]["type"], json!("web_search"));
-        assert_eq!(body["tools"][1]["type"], json!("x_search"));
-        assert_eq!(body["tools"][2]["type"], json!("image_generation"));
-        assert_eq!(body["tools"][3]["name"], json!("Read"));
-        assert!(body["tools"][3].get("function").is_none());
+        assert_eq!(body["tools"][0]["name"], json!("Read"));
+        assert!(body["tools"][0].get("function").is_none());
         let names: Vec<&str> = body["tools"]
             .as_array()
             .unwrap()
             .iter()
             .filter_map(|t| t.get("name").and_then(|n| n.as_str()))
             .collect();
-        assert!(!names.contains(&"WebSearch"), "{names:?}");
+        let host: Vec<&str> = body["tools"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|t| t.get("type").and_then(|n| n.as_str()))
+            .filter(|ty| *ty != "function")
+            .collect();
+        assert!(
+            !host.iter().any(|t| *t == "web_search" || *t == "x_search"),
+            "{host:?}"
+        );
+        assert!(names.contains(&"WebSearch"), "{names:?}");
         assert!(names.contains(&"WebFetch"), "{names:?}");
+        assert!(names.contains(&"GenerateImage"), "{names:?}");
         assert_eq!(body["parallel_tool_calls"], json!(true));
         assert!(body.get("max_output_tokens").is_none(), "{body}");
         assert_eq!(

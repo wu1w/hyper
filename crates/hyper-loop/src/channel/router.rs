@@ -77,6 +77,13 @@ impl SessionRouter {
         self.map.get(route_key).map(|s| s.as_str())
     }
 
+    pub fn bind(&mut self, env: &NativePayload, session_id: impl Into<String>) -> Result<String> {
+        let id = session_id.into();
+        self.touch(env.route_key(), id.clone());
+        self.flush()?;
+        Ok(id)
+    }
+
     fn touch(&mut self, key: String, id: String) {
         self.map.insert(key.clone(), id.clone());
         self.dirty.insert(key, id);

@@ -6,8 +6,8 @@ use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use super::{
-    arg_new_string, arg_old_string, arg_path, arg_str, arg_u32, cleanup_stale_tmp, folded_response,
-    BlobStore, ToolLimits, Workspace,
+    arg_bool, arg_new_string, arg_old_string, arg_path, arg_str, arg_u32, cleanup_stale_tmp,
+    folded_response, BlobStore, ToolLimits, Workspace,
 };
 use crate::tool_calls::{ToolCall, ToolResponse, ToolState};
 use crate::vendor::sha256_hex;
@@ -25,6 +25,10 @@ pub fn read_file(
         Ok(p) => p,
         Err(e) => return ToolResponse::text(&call.id, e, ToolState::Error),
     };
+    let shown = ws.shown(&raw);
+    if path.is_dir() {
+        return list_directory(&shown, &path, &call.id, limits, blobs);
+    }
 
     if crate::media::is_media_ext(&raw) {
         return ToolResponse::text(
@@ -37,7 +41,6 @@ pub fn read_file(
         );
     }
 
-    let shown = ws.shown(&raw);
     if super::doc::is_legacy_office(&raw) || super::doc::is_doc_path(&raw) {
         if !path.exists() {
             return ToolResponse::text(
@@ -77,11 +80,7 @@ pub fn read_file(
             );
         }
         Err(e) if e.kind() == std::io::ErrorKind::IsADirectory => {
-            return ToolResponse::text(
-                &call.id,
-                format!("Error: The path {} is not a file.", ws.shown(&raw)),
-                ToolState::Error,
-            );
+            return list_directory(&shown, &path, &call.id, limits, blobs);
         }
         Err(e) => {
             return ToolResponse::text(
@@ -142,6 +141,59 @@ pub fn read_file(
         ));
     }
     folded_response(&call.id, text, ToolState::Success, limits, blobs)
+}
+
+const DIR_LIST_CAP: usize = 200;
+
+fn list_directory(
+    shown: &str,
+    path: &Path,
+    id: &str,
+    limits: ToolLimits,
+    blobs: Option<&BlobStore>,
+) -> ToolResponse {
+    let Ok(rd) = fs::read_dir(path) else {
+        return ToolResponse::text(
+            id,
+            format!("Error: Could not list directory {shown}."),
+            ToolState::Error,
+        );
+    };
+    let mut files = Vec::new();
+    let mut dirs = Vec::new();
+    for entry in rd.flatten() {
+        let name = entry.file_name().to_string_lossy().into_owned();
+        if name == ".git" {
+            continue;
+        }
+        let is_dir = entry.file_type().map(|t| t.is_dir()).unwrap_or(false);
+        if is_dir {
+            dirs.push(name);
+        } else {
+            files.push(name);
+        }
+        if dirs.len() + files.len() >= DIR_LIST_CAP {
+            break;
+        }
+    }
+    dirs.sort();
+    files.sort();
+    let n = dirs.len() + files.len();
+    let mut lines = Vec::with_capacity(n + 2);
+    lines.push(format!("Directory listing of `{shown}` ({n} entries):"));
+    for name in dirs {
+        lines.push(format!("{name}/"));
+    }
+    for name in files {
+        lines.push(name);
+    }
+    if n == 0 {
+        lines.push("(empty)".into());
+    }
+    if n >= DIR_LIST_CAP {
+        lines.push(format!("… truncated at {DIR_LIST_CAP} entries."));
+    }
+    folded_response(id, lines.join("\n"), ToolState::Success, limits, blobs)
 }
 
 fn read_page_cap(limits: ToolLimits) -> usize {
@@ -226,8 +278,14 @@ pub fn edit_file(ws: &Workspace, call: &ToolCall) -> ToolResponse {
             );
         }
     };
+    let replace_all = arg_bool(&call.arguments, "replace_all").unwrap_or(false);
     let (updated, normalized_newlines) = if old.contains('\r') || old.contains('\n') {
-        match replace_unique_newline_agnostic(&content, &old, &new) {
+        let result = if replace_all {
+            replace_all_newline_agnostic(&content, &old, &new)
+        } else {
+            replace_unique_newline_agnostic(&content, &old, &new)
+        };
+        match result {
             Ok(result) => result,
             Err(0) => {
                 return ToolResponse::text(
@@ -240,7 +298,7 @@ pub fn edit_file(ws: &Workspace, call: &ToolCall) -> ToolResponse {
                 return ToolResponse::text(
                     &call.id,
                     format!(
-                        "Error: `old_string` matched {n} times in {raw}; provide a longer, more unique `old_string` so the edit targets exactly one location."
+                        "Error: `old_string` matched {n} times in {raw}; provide a longer, more unique `old_string` so the edit targets exactly one location, or set replace_all."
                     ),
                     ToolState::Error,
                 );
@@ -248,20 +306,21 @@ pub fn edit_file(ws: &Workspace, call: &ToolCall) -> ToolResponse {
         }
     } else {
         let count = content.matches(&old).count();
-        match count {
-            0 => {
+        match (count, replace_all) {
+            (0, _) => {
                 return ToolResponse::text(
                     &call.id,
                     format!("Error: The text to replace was not found in {raw}."),
                     ToolState::Error,
                 );
             }
-            1 => (content.replacen(&old, &new, 1), false),
-            n => {
+            (1, _) => (content.replacen(&old, &new, 1), false),
+            (_, true) => (content.replace(&old, &new), false),
+            (n, false) => {
                 return ToolResponse::text(
                     &call.id,
                     format!(
-                        "Error: `old_string` matched {n} times in {raw}; provide a longer, more unique `old_string` so the edit targets exactly one location."
+                        "Error: `old_string` matched {n} times in {raw}; provide a longer, more unique `old_string` so the edit targets exactly one location, or set replace_all."
                     ),
                     ToolState::Error,
                 );
@@ -350,6 +409,46 @@ fn replace_unique_newline_agnostic(
     Ok((updated, original_fragment != old || replacement != new))
 }
 
+fn replace_all_newline_agnostic(
+    content: &str,
+    old: &str,
+    new: &str,
+) -> std::result::Result<(String, bool), usize> {
+    let (normalized_content, boundaries) = normalize_newlines_with_boundaries(content);
+    let normalized_old = normalize_newlines(old);
+    if normalized_old.is_empty() {
+        return Err(0);
+    }
+    let starts: Vec<usize> = normalized_content
+        .match_indices(&normalized_old)
+        .map(|(i, _)| i)
+        .collect();
+    if starts.is_empty() {
+        return Err(0);
+    }
+    let mut updated = content.to_string();
+    let mut changed = false;
+    for start in starts.into_iter().rev() {
+        let end = start + normalized_old.len();
+        let original_start = boundaries[start];
+        let original_end = boundaries[end];
+        let original_fragment = &content[original_start..original_end];
+        let style = dominant_newline_style(original_fragment)
+            .or_else(|| dominant_newline_style(content))
+            .unwrap_or("\n");
+        let replacement = normalize_newlines(new).replace('\n', style);
+        changed |= original_fragment != old || replacement != new;
+        let mut next = String::with_capacity(
+            updated.len() - (original_end - original_start) + replacement.len(),
+        );
+        next.push_str(&updated[..original_start]);
+        next.push_str(&replacement);
+        next.push_str(&updated[original_end..]);
+        updated = next;
+    }
+    Ok((updated, changed))
+}
+
 fn normalize_newlines(text: &str) -> String {
     normalize_newlines_with_boundaries(text).0
 }
@@ -414,7 +513,7 @@ fn dominant_newline_style(text: &str) -> Option<&'static str> {
 
 /// Unique temp next to the target, fsync, rename. Concurrent writers do not
 /// share `{name}.hypertmp`.
-fn write_atomic(path: &Path, content: &str) -> std::io::Result<()> {
+pub(super) fn write_atomic(path: &Path, content: &str) -> std::io::Result<()> {
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent)?;
     }
@@ -958,6 +1057,35 @@ mod tests {
         assert_eq!(r.state, ToolState::Error, "{t}");
         assert!(t.contains("docx"), "{t}");
         assert!(t.contains("legacy"), "{t}");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn read_directory_lists_entries() {
+        let (ws, dir) = workspace();
+        fs::create_dir_all(dir.join("src")).unwrap();
+        fs::write(dir.join("src/lib.rs"), "fn x() {}\n").unwrap();
+        fs::write(dir.join("README.md"), "hi\n").unwrap();
+        let r = read_file(
+            &ws,
+            &call("read", json!({"path": "."})),
+            ToolLimits::default(),
+            None,
+        );
+        let t = r.joined_text();
+        assert_eq!(r.state, ToolState::Success, "{t}");
+        assert!(t.contains("Directory listing"), "{t}");
+        assert!(t.contains("src/"), "{t}");
+        assert!(t.contains("README.md"), "{t}");
+        let nested = read_file(
+            &ws,
+            &call("read", json!({"path": "src"})),
+            ToolLimits::default(),
+            None,
+        );
+        let n = nested.joined_text();
+        assert_eq!(nested.state, ToolState::Success, "{n}");
+        assert!(n.contains("lib.rs"), "{n}");
         let _ = fs::remove_dir_all(&dir);
     }
 }

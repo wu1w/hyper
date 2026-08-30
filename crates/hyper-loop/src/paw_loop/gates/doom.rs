@@ -10,6 +10,9 @@ use crate::paw_loop::{GateCtx, GateDecision, ToolFingerprint};
 /// calls useful for a few rounds.
 pub const REPEAT_NOTE: &str = "[trajectory] The same tool and arguments appeared three times in a row; new information may be low. Check the last result; change the target or arguments if you need new evidence, else continue or finish from what you have.";
 
+/// Quiet Cursor halt. Injected as `stop_reason`, not as a hidden lecture.
+pub const REPEAT_STOP: &str = "budget:repeat";
+
 #[derive(Clone, Debug)]
 pub struct DoomStage {
     pub after: u32,
@@ -67,10 +70,10 @@ impl DoomLoopGate {
         Self::new(2, 1.0, vec![DoomStage::warn(6, REPEAT_NOTE)])
     }
 
-    /// Cursor: no repetition lecture and no halt-at-6. Iteration/timeout
-    /// gates are the hard edge.
+    /// Cursor: sixth identical tool+args stops quietly (`budget:repeat`).
+    /// No Qwen repetition lecture. Iteration/timeout remain the far wall.
     pub fn grok_default() -> Self {
-        Self::new(2, 1.0, vec![])
+        Self::new(2, 1.0, vec![DoomStage::halt(6, REPEAT_STOP)])
     }
 
     /// Low-precision overlay: one nudge at the second identical call.
@@ -264,16 +267,58 @@ mod tests {
     }
 
     #[test]
-    fn grok_default_never_lectures_or_halts() {
+    fn grok_default_halts_quietly_at_sixth_identical() {
         let gate = DoomLoopGate::grok_default();
         let a = ToolFingerprint::new("read", r#"{"path":"a.rs"}"#);
-        for iter in 1..=12 {
+        for iter in 1..=5 {
             assert!(
                 matches!(hop(&gate, iter, &[a.clone()]), GateDecision::Bypass),
                 "iter={iter}"
             );
         }
         assert_eq!(gate.continuation("s"), "");
+        match hop(&gate, 6, &[a.clone()]) {
+            GateDecision::Stop { reason } => assert_eq!(reason, REPEAT_STOP),
+            other => panic!("expected quiet halt at 6th identical: {other:?}"),
+        }
+        assert_eq!(gate.continuation("s"), "", "no lecture on Cursor halt");
+        match hop(&gate, 7, &[a]) {
+            GateDecision::Stop { reason } => assert_eq!(reason, REPEAT_STOP),
+            other => panic!("expected halt to stick: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn grok_bash_repeat_gets_one_extra_hop_then_halts() {
+        let gate = DoomLoopGate::grok_default();
+        let b = ToolFingerprint::new("bash", r#"{"command":"git status"}"#);
+        for iter in 1..=6 {
+            assert!(
+                matches!(hop(&gate, iter, &[b.clone()]), GateDecision::Bypass),
+                "iter={iter}"
+            );
+        }
+        match hop(&gate, 7, &[b]) {
+            GateDecision::Stop { reason } => assert_eq!(reason, REPEAT_STOP),
+            other => panic!("expected bash halt at 7th identical: {other:?}"),
+        }
+        assert_eq!(gate.continuation("s"), "");
+    }
+
+    #[test]
+    fn grok_parallel_distinct_reads_do_not_halt() {
+        let gate = DoomLoopGate::grok_default();
+        let batch = vec![
+            ToolFingerprint::new("read", r#"{"path":"a.rs"}"#),
+            ToolFingerprint::new("read", r#"{"path":"b.rs"}"#),
+            ToolFingerprint::new("read", r#"{"path":"c.rs"}"#),
+        ];
+        for i in 1..=8 {
+            assert!(
+                matches!(hop(&gate, i, &batch), GateDecision::Bypass),
+                "iter={i}"
+            );
+        }
     }
 
     #[test]

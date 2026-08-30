@@ -18,6 +18,8 @@ mod workset;
 use std::collections::HashSet;
 use std::future::Future;
 use std::path::PathBuf;
+use std::sync::atomic::AtomicU32;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use serde_json::Value;
@@ -174,9 +176,8 @@ pub struct RunOpts {
     pub blob_dir: Option<PathBuf>,
     /// Override `~/.grok-hyper` (tests). Isolates MEMORY.md / skills / memory.sqlite.
     pub home: Option<PathBuf>,
-    /// Append memory_search / mcp (never splice the frozen four). `skill` stays
-    /// out of tools[]; bodies are hidden-user notes. `mcp` is one extra blob,
-    /// appended only when servers are mounted.
+    /// Mount peripheral tools. Skill bodies remain hidden-user notes; MCP uses
+    /// the stable GetDynamicTools / CallDynamicTool / FetchMcpResource set only when servers exist.
     pub peripheral: bool,
     pub skills_auto_catalog: bool,
     pub mcp_auto_catalog: bool,
@@ -184,23 +185,25 @@ pub struct RunOpts {
     /// Append `web` (search/fetch) at session start. Builtin engines need no
     /// key; a Tavily key upgrades the backend transparently.
     pub web: crate::config::WebConfig,
-    /// Append `view` in agent mode (not spliced into the frozen four).
+    /// Append `view` in agent mode.
     pub media: bool,
     /// Append `ComputerUse` in agent mode (Windows / macOS desktop control).
     pub computer_use: bool,
+    /// Append workspace `Search` (FTS). Default off; Grep / Glob / Read stay in the frozen set.
+    pub code_search: bool,
     pub media_max_bytes: usize,
     pub media_bins: MediaBins,
-    /// `AGENT.md` filename (workspace then home).
+    /// `AGENT.md` basename under Hyper home only.
     pub prompt_file: String,
     /// Unused: builtin identity is one agent contract. Kept so RunOpts stay stable.
     pub coding_identity: bool,
-    /// Hidden plan card + mutating-tool deny. Does not change the frozen four.
+    /// Hidden plan card + mutating-tool deny.
     pub plan_mode: bool,
     /// Session `/clarify`. Combined with plan_mode, appends the `ask` tool.
     pub clarify_mode: bool,
     /// TUI permission bridge. None = YOLO (`--print`, tests).
     pub permit: Option<crate::permit::PermitHub>,
-    /// Blocking ask overlay. None = error unless `--print` / YOLO / IM Skip.
+    /// Blocking ask overlay. In-process IM, TUI, and web all install one.
     pub clarify: Option<crate::clarify::ClarifyHub>,
     /// Parent Config snapshot for child Task (no `apply_env` in the child).
     pub config: Config,
@@ -215,6 +218,8 @@ pub struct RunOpts {
     /// When set, compact POSTs `/v1/responses/compact` before local archive.
     /// `(base_url, api_key)` — never log the key.
     pub xai_compact: Option<(String, String)>,
+    /// Open editors from the host. Empty unless sidecar/console passed `editor`.
+    pub editor_files: Vec<crate::sidecar::EditorFile>,
 }
 
 impl RunOpts {
@@ -258,6 +263,7 @@ impl RunOpts {
             web: cfg.web.clone(),
             media: cfg.media.enabled,
             computer_use: cfg.features.computer_use,
+            code_search: cfg.features.code_search,
             media_max_bytes: cfg.media.max_bytes as usize,
             media_bins: MediaBins::from_config(&cfg.media),
             prompt_file: cfg.prompt.file.clone(),
@@ -272,6 +278,7 @@ impl RunOpts {
             xai_compact: crate::transport::compact_creds(cfg),
             config: cfg.clone(),
             child: None,
+            editor_files: Vec::new(),
         }
     }
 }
@@ -279,7 +286,33 @@ impl RunOpts {
 /// Console-facing channels where a human watches progress live. IM bridges
 /// deliver per-message and would surface narration as chat spam.
 pub(crate) fn interactive_channel(channel: &str) -> bool {
-    matches!(channel, "" | "cli" | "tui" | "web" | "console")
+    matches!(channel, "" | "cli" | "tui" | "web" | "console" | "sidecar")
+}
+
+/// In-process chat bridges (`hyper --channels` / console IM). Not sidecar/web.
+pub(crate) fn im_bridge_channel(channel: &str) -> bool {
+    matches!(
+        channel,
+        "telegram"
+            | "discord"
+            | "slack"
+            | "dingtalk"
+            | "feishu"
+            | "qq"
+            | "wechat"
+            | "wecom"
+            | "imessage"
+            | "matrix"
+            | "mattermost"
+            | "onebot"
+            | "xiaoyi"
+            | "yuanbao"
+            | "im"
+            // Generic HTTP inbound (`kind = webhook` / `http`) is still IM:
+            // ACK/heartbeat plus the language card. Not the desktop console.
+            | "webhook"
+            | "http"
+    )
 }
 
 /// Hermes-shaped unattended caps: gateway `max_turns` 500, plus a wall so IM cannot stall forever.
@@ -382,6 +415,9 @@ pub struct AgentOutcome {
     pub streamed_text: bool,
     /// Workspace-relative files this turn wrote that channels should send.
     pub channel_files: Vec<String>,
+    /// Runtime mode after SwitchMode calls in this run.
+    pub plan_mode: bool,
+    pub clarify_mode: bool,
 }
 
 pub struct Agent<C> {
@@ -390,6 +426,11 @@ pub struct Agent<C> {
     handler: StopHandler,
     coordinator: ToolCoordinator,
     session_id: String,
+    /// Stable identifiers for the active user turn. They are persisted on
+    /// lifecycle events and cleared exactly once when the run terminates.
+    run_id: Option<String>,
+    turn_id: Option<String>,
+    current_step: u32,
     messages: Vec<ChatMessage>,
     tools: Vec<Value>,
     pending_stop: Option<String>,
@@ -435,8 +476,10 @@ pub struct Agent<C> {
     window_overlay: Option<WorkingWindowOverlay>,
     /// S1/S2 judgment guards over successful edits.
     edit_guard: guard::EditGuard,
-    /// Empty / cli / tui / web / console are interactive; IM skips AskQuestion.
+    /// Empty / cli / tui / web / console are interactive; IM uses its own hub.
     channel: String,
+    /// Host open editors for `[workset]`.
+    editor_files: Vec<crate::sidecar::EditorFile>,
     /// Optional FTS for the `Search` tool. Built on the first user turn, not
     /// in `Agent::new` (Windows home-folder hang).
     code_index: Option<std::sync::Arc<CodeIndex>>,
@@ -444,6 +487,23 @@ pub struct Agent<C> {
     index_build: Option<tokio::task::JoinHandle<std::sync::Arc<CodeIndex>>>,
     /// Prefetch handles for the in-flight model hop.
     speculate: Option<SpeculativeSlot>,
+    /// Cargo/tsc/ruff started as soon as a code Write lands, overlapping later
+    /// tools in the same batch. Awaited before `commit_tool` so `[diagnostics]`
+    /// still rides on the last edit output.
+    in_flight_diag: Option<tokio::task::JoinHandle<Option<String>>>,
+    /// `complete_resilient` calls this turn. Hop 0 keeps PREPARE_HINT; later
+    /// hops only `reset()` so the console does not flash「正在连接模型」.
+    model_hops: AtomicU32,
+    /// Search calls this user turn. Caps paraphrase storms without changing
+    /// `drive()` hop geometry.
+    search_calls: Arc<AtomicU32>,
+    /// Distinct Search queries this turn. Near-duplicates do not consume
+    /// `search_calls`, so a second topic still gets a slot.
+    search_queries: Mutex<Vec<String>>,
+    /// Grep calls this user turn. Caps rg storms without changing `drive()`.
+    grep_calls: Arc<AtomicU32>,
+    /// Full-file Read paths this user turn. Same-path re-reads fold; offset paging stays.
+    read_full: Mutex<HashSet<String>>,
     /// Physics cap (steps / wall / context / tool budget) already got a wrap-up hop.
     physics_nudged: bool,
     /// Last official xAI compaction item (opaque). Next Responses `input` should

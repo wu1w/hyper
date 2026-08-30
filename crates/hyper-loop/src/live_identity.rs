@@ -1,8 +1,9 @@
 //! Identity injection: prefix cost vs long-session voice stickiness.
 //!
 //! Hermes keeps personality in system slot #1 (`SOUL.md`), frozen for the
-//! session. hyper already freezes `AGENT.md` into `session/start.system`; compact
-//! keeps that system blob and drops live turns into an extractive archive.
+//! session. hyper freezes home `AGENT.md` (`~/.grok-hyper`) into
+//! `session/start.system`; compact keeps that system blob and drops live turns
+//! into an extractive archive.
 //! MEMORY.md is never auto-injected. This live matrix asks which injection
 //! layer actually holds a voice after tools + a distractor + compact, and what
 //! it costs.
@@ -282,11 +283,11 @@ mod tests {
         let (fname, body) = role.workspace_file();
         std::fs::write(dir.join(fname), body).unwrap();
         std::fs::write(dir.join("pad.txt"), pad_body()).unwrap();
-        if let Some(md) = agent_md_for(role, inj) {
-            std::fs::write(dir.join("AGENT.md"), format!("{md}\n")).unwrap();
-        }
         let home = dir.join(".hyper-home");
         std::fs::create_dir_all(&home).unwrap();
+        if let Some(md) = agent_md_for(role, inj) {
+            std::fs::write(home.join("AGENT.md"), format!("{md}\n")).unwrap();
+        }
         if let Some(mem) = memory_md_for(role, inj) {
             std::fs::write(home.join("MEMORY.md"), mem).unwrap();
         }

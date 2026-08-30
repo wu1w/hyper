@@ -326,6 +326,9 @@ impl SidecarSession {
             Ok(p) => p,
             Err(e) => return Dispatch::Error(e),
         };
+        if let Some(ed) = p.editor.clone() {
+            self.editor = ed.into_files();
+        }
         let prompt = p.prompt();
         let parts = p.parts();
         if prompt.trim().is_empty() && parts.is_empty() {
@@ -350,6 +353,9 @@ impl SidecarSession {
             Ok(p) => p,
             Err(e) => return Dispatch::Error(e),
         };
+        if let Some(ed) = p.editor.clone() {
+            self.editor = ed.into_files();
+        }
         self.enqueue_parts(p.prompt(), p.parts(), false)
     }
 
@@ -358,6 +364,9 @@ impl SidecarSession {
             Ok(p) => p,
             Err(e) => return Dispatch::Error(e),
         };
+        if let Some(ed) = p.editor.clone() {
+            self.editor = ed.into_files();
+        }
         self.enqueue_parts(p.prompt(), p.parts(), true)
     }
 

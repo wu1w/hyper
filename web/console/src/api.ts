@@ -113,6 +113,8 @@ export type Snap = {
   agent_scope?: "workspace" | "global";
   low_precision?: boolean;
   busy?: string;
+  effort?: string;
+  effort_locked?: boolean;
   queued?: number;
   steered?: number;
   queue_preview?: string[];
@@ -144,6 +146,13 @@ export type SessionEvent = {
   cached_tokens?: number | null;
   decode_tok_s?: number | null;
   reason?: string;
+  phase?: "accepted" | "started" | "completed" | "aborted" | "error" | "interrupted" | "skipped";
+  run_id?: string;
+  turn_id?: string;
+  step_id?: number;
+  at_ms?: number;
+  summary?: string;
+  kind?: string;
   session_id?: string;
   session?: string;
   tool_call_id?: string;
@@ -340,8 +349,8 @@ export const SLASH: Array<[string, string]> = [
   ["/retry", "重试上一轮"],
   ["/fork", "从当前会话分叉"],
   ["/stop", "中止轮次"],
-  ["/queue", "忙碌时排队到下轮"],
-  ["/steer", "下一个工具结果后注入引导"],
+  ["/queue", "显式排队到当前任务之后"],
+  ["/steer", "在下一个安全工具边界注入引导"],
   ["/think", "low | medium | xhigh | off"],
   ["/effort", "思考力度 low | medium | xhigh | off"],
   ["/fast", "关思考"],
@@ -363,7 +372,7 @@ export const SLASH: Array<[string, string]> = [
   ["/cron", "定时任务（.grok-hyper/cron.json）"],
   ["/config", "配置投影"],
   ["/setup", "连接向导：探测端点并写配置"],
-  ["/busy", "忙碌策略 interrupt | queue | steer"],
+  ["/busy", "忙碌策略 steer（默认） | queue | interrupt"],
   ["/history", "最近轮次一览"],
   ["/clear", "清空当前对话"],
   ["/version", "版本信息"],

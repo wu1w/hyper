@@ -634,6 +634,7 @@ mod tests {
             "pkg/thing_test.go",
             "spec/models/user.spec.js",
             "test_cli.py",
+            "crates/hyper-loop/src/agent/tests.rs",
         ] {
             assert!(crate::agent::verify::is_test_path(p), "{p}");
         }

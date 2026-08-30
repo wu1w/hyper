@@ -3,11 +3,13 @@
 //! bodies never do, and `skill` is not in `tools[]`.
 //!
 //! Overlay matches MCP: later wins, missing dirs skipped.
-//! Home (low → high): `~/.cursor/skills`, `~/.agents/skills`, `~/.grok/skills`,
-//! then `~/.grok-hyper/skills`. Workspace (low → high): `.cursor/skills`,
-//! `.agents/skills`, `.grok/skills`, `.grok-hyper/skills`. Harness injects at
-//! most one body as a hidden user after the live query. A model-emitted `skill`
-//! call still hits [`run_skill`] so XML does not fall through to unknown-tool.
+//! Home (low → high): `~/.cursor/skills`, `~/.grok/skills`, then
+//! `~/.grok-hyper/skills`. Workspace (low → high): `.cursor/skills`,
+//! `.grok/skills`, `.grok-hyper/skills`. Codex `~/.agents` / `.agents` are not
+//! scanned (broken YAML descriptions leak into the system prompt). Harness
+//! injects at most one body as a hidden user after the live query. A
+//! model-emitted `skill` call still hits [`run_skill`] so XML does not fall
+//! through to unknown-tool.
 
 use std::path::{Path, PathBuf};
 
@@ -36,13 +38,11 @@ impl SkillCatalog {
         {
             if let Some(user) = home.parent() {
                 scan_dir(user.join(".cursor").join("skills"), &mut skills);
-                scan_dir(user.join(".agents").join("skills"), &mut skills);
                 scan_dir(user.join(".grok").join("skills"), &mut skills);
             }
         }
         scan_dir(home.join("skills"), &mut skills);
         scan_dir(workspace.join(".cursor").join("skills"), &mut skills);
-        scan_dir(workspace.join(".agents").join("skills"), &mut skills);
         scan_dir(workspace.join(".grok").join("skills"), &mut skills);
         scan_dir(workspace.join(".grok-hyper").join("skills"), &mut skills);
         let mut out: Vec<Skill> = Vec::new();
@@ -374,13 +374,19 @@ mod tests {
         write(&user.join(".cursor").join("skills"), "pdf", "cursor home");
         write(&user.join(".grok").join("skills"), "pdf", "grok home");
         write(&ws.join(".agents").join("skills"), "review", "ws agents");
+        write(&ws.join(".cursor").join("skills"), "review", "ws cursor");
         write(&ws.join(".grok").join("skills"), "pdf", "workspace grok");
         let cat = SkillCatalog::load(&home, &ws);
         assert!(cat.get("shell").is_none());
         assert!(cat.get("canvas").is_none());
         assert!(cat.get("statusline").is_none());
         assert_eq!(cat.get("pdf").unwrap().description, "workspace grok");
-        assert_eq!(cat.get("review").unwrap().description, "ws agents");
+        assert_eq!(cat.get("review").unwrap().description, "ws cursor");
+        assert_ne!(
+            cat.get("review").unwrap().description,
+            "ws agents",
+            "Codex .agents/skills must not be scanned"
+        );
         let _ = std::fs::remove_dir_all(root);
     }
 }

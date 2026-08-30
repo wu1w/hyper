@@ -9,7 +9,10 @@ use crate::lock_unpoison;
 use tokio::task::JoinHandle;
 use tokio::time::{sleep_until, Instant};
 
-use super::timeout::{secs_to_dur, MIN_BACKGROUND_WINDOW_SECS, OFFLOAD_TIMEOUT_RATIO};
+use super::timeout::{
+    secs_to_dur, COORDINATOR_OWNED_EXEC_TIMEOUT_SECS, MIN_BACKGROUND_WINDOW_SECS,
+    OFFLOAD_TIMEOUT_RATIO,
+};
 use super::types::{
     CancelFlag, CancelReason, Deadlines, TextBlock, ToolCall, ToolResponse, ToolState,
 };
@@ -229,7 +232,12 @@ impl ToolCoordinator {
                             .get(&id)
                             .map(|l| l.name.clone())
                             .unwrap_or_default();
-                        self.spawn_watch(id.clone(), name, join, cancel, deadlines.kill_at);
+                        // Foreground timeout only bounds the hop. After offload
+                        // the command keeps running (Cursor: AwaitShell), up to
+                        // the coordinator-owned cap — not the 60s code_mode kill.
+                        let bg_kill = Instant::now()
+                            + secs_to_dur(COORDINATOR_OWNED_EXEC_TIMEOUT_SECS);
+                        self.spawn_watch(id.clone(), name, join, cancel, Some(bg_kill));
                         let text = format!(
                             "running in background (id={id}). Keep going. Call AwaitShell with shell_id or task_id {id} when you need the result."
                         );
@@ -288,9 +296,11 @@ impl ToolCoordinator {
     }
 
     fn has_kill_budget(deadlines: &Deadlines) -> bool {
+        // 50% of the default 60s timeout is exactly 30s. Treat that as enough
+        // leftover so a one-tick jitter cannot skip offload and hard-kill.
         deadlines
             .remaining_kill()
-            .is_some_and(|d| d.as_secs_f64() >= MIN_BACKGROUND_WINDOW_SECS)
+            .is_some_and(|d| d.as_secs_f64() + 0.05 >= MIN_BACKGROUND_WINDOW_SECS)
     }
 }
 
@@ -469,18 +479,41 @@ mod tests {
     }
 
     #[tokio::test(start_paused = true)]
+    async fn offload_survives_past_foreground_timeout() {
+        let coord = ToolCoordinator::new(Some(80.0));
+        coord.set_offload_on_deadline(true);
+        let (go_tx, go_rx) = tokio::sync::oneshot::channel::<()>();
+        let exec = coord.execute(call("c7"), "agent", None, move |_cancel| async move {
+            let _ = go_rx.await;
+            ToolResponse::text("c7", "late", ToolState::Success)
+        });
+        tokio::pin!(exec);
+        tokio::select! {
+            biased;
+            _ = &mut exec => panic!("tool finished before offload"),
+            _ = tokio::task::yield_now() => {}
+        }
+        tokio::time::advance(Duration::from_secs(41)).await;
+        let out = exec.await;
+        assert!(out.offloaded, "{out:?}");
+        // Original kill was 80s; 41+50 would have timed out the background hop.
+        tokio::time::advance(Duration::from_secs(50)).await;
+        let _ = go_tx.send(());
+        tokio::task::yield_now().await;
+        tokio::task::yield_now().await;
+        let done = coord.take_finished();
+        assert_eq!(done.len(), 1, "{done:?}");
+        assert_eq!(done[0].1.joined_text(), "late");
+        assert_eq!(done[0].1.state, ToolState::Success);
+    }
+
+    #[tokio::test(start_paused = true)]
     async fn offload_then_kill_posts_timeout() {
         let coord = ToolCoordinator::new(Some(80.0));
         coord.set_offload_on_deadline(true);
         let exec = coord.execute(call("c5"), "agent", None, |cancel| async move {
-            tokio::select! {
-                _ = cancel.cancelled() => {
-                    ToolResponse::text("c5", "saw-cancel", ToolState::Interrupted)
-                }
-                _ = tokio::time::sleep(Duration::from_secs(10_000)) => {
-                    ToolResponse::text("c5", "late", ToolState::Success)
-                }
-            }
+            cancel.cancelled().await;
+            ToolResponse::text("c5", "saw-cancel", ToolState::Interrupted)
         });
         tokio::pin!(exec);
         tokio::select! {
@@ -492,7 +525,10 @@ mod tests {
         let out = exec.await;
         assert!(out.offloaded);
         tokio::task::yield_now().await;
-        tokio::time::advance(Duration::from_secs(50)).await;
+        tokio::time::advance(Duration::from_secs(
+            super::COORDINATOR_OWNED_EXEC_TIMEOUT_SECS as u64 + 1,
+        ))
+        .await;
         tokio::task::yield_now().await;
         tokio::task::yield_now().await;
         let done = coord.take_finished();

@@ -270,11 +270,14 @@ impl PathLoopGate {
 
 pub fn fs_tool_path(name: &str, args: &Value) -> Option<String> {
     match crate::tools_schema::dispatch_name(name) {
-        "read" | "edit" | "write" | "delete" => args
-            .get("path")
-            .and_then(|v| v.as_str())
-            .filter(|s| !s.is_empty())
-            .map(str::to_string),
+        "read" | "edit" | "write" | "delete" | "editnotebook" => {
+            ["path", "target_notebook"].iter().find_map(|key| {
+                args.get(*key)
+                    .and_then(|v| v.as_str())
+                    .filter(|s| !s.is_empty())
+                    .map(str::to_string)
+            })
+        }
         _ => None,
     }
 }
@@ -450,5 +453,10 @@ mod tests {
         assert_eq!(fs_tool_path("Write", &via_path).as_deref(), Some("b.rs"));
         assert_eq!(fs_tool_path("read", &via_path).as_deref(), Some("b.rs"));
         assert_eq!(fs_tool_path("bash", &via_path), None);
+        let notebook = serde_json::json!({"target_notebook": "n.ipynb"});
+        assert_eq!(
+            fs_tool_path("EditNotebook", &notebook).as_deref(),
+            Some("n.ipynb")
+        );
     }
 }

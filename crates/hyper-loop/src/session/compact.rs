@@ -50,6 +50,8 @@ const STATE_CAP: usize = 10;
 const STATE_HEAD: usize = 3;
 const NOTE_CAP: usize = 2;
 const DECISION_CAP: usize = 8;
+/// Last two finals stay long so a follow-up still sees this chat's conclusions.
+const DECISION_KEEP: usize = 1800;
 /// Prior real user turns that left the live window. Cap drops oldest.
 const CONSTRAINT_CAP: usize = 6;
 const PRIOR_USER: &str = "Prior User";
@@ -319,11 +321,11 @@ fn merge_extract(prev_s: &str, prev_i: &str, new_s: &str, new_i: &str) -> (Strin
     upsert_section(
         &mut out,
         "Current State",
-        merge_bullets(
+        filter_state_bullets(merge_bullets(
             section_get(&prev, "Current State"),
             section_get(&new, "Current State"),
             12,
-        ),
+        )),
     );
     upsert_section(
         &mut out,
@@ -337,10 +339,10 @@ fn merge_extract(prev_s: &str, prev_i: &str, new_s: &str, new_i: &str) -> (Strin
     upsert_section(
         &mut out,
         "Decisions",
-        merge_bullets(
+        merge_decision_bullets(
             section_get(&prev, "Decisions"),
             section_get(&new, "Decisions"),
-            8,
+            DECISION_CAP,
         ),
     );
     upsert_section(
@@ -437,6 +439,66 @@ fn is_ack_user(text: &str) -> bool {
     )
 }
 
+fn merge_decision_bullets(prev: Option<&str>, new: Option<&str>, cap: usize) -> String {
+    let mut bullets = collect_unique_bullets(prev, new);
+    bullets.retain(|b| !crate::session::history::is_session_file_noise(b));
+    while bullets.len() > cap {
+        if let Some(i) = bullets.iter().position(|b| b.chars().count() <= CLIP) {
+            bullets.remove(i);
+        } else {
+            bullets.remove(0);
+        }
+    }
+    format_bullet_block(bullets)
+}
+
+fn collect_unique_bullets(prev: Option<&str>, new: Option<&str>) -> Vec<String> {
+    let mut bullets = Vec::new();
+    for block in [prev, new].into_iter().flatten() {
+        for line in block.lines() {
+            let t = line.trim();
+            let item = t.strip_prefix("- ").unwrap_or(t);
+            if item.is_empty() || is_stub_section(item) {
+                continue;
+            }
+            let key = bullet_key(item);
+            if !bullets.iter().any(|b: &String| bullet_key(b) == key) {
+                bullets.push(item.to_string());
+            }
+        }
+    }
+    bullets
+}
+
+fn format_bullet_block(bullets: Vec<String>) -> String {
+    if bullets.is_empty() {
+        return "(none)".into();
+    }
+    bullets
+        .into_iter()
+        .map(|b| format!("- {b}"))
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+fn filter_state_bullets(block: String) -> String {
+    let kept: Vec<String> = block
+        .lines()
+        .filter_map(|line| {
+            let t = line.trim();
+            let item = t.strip_prefix("- ").unwrap_or(t);
+            if item.is_empty() || is_stub_section(item) {
+                return None;
+            }
+            if crate::session::history::is_session_file_noise(item) {
+                return None;
+            }
+            Some(item.to_string())
+        })
+        .collect();
+    format_bullet_block(kept)
+}
+
 fn merge_bullets(prev: Option<&str>, new: Option<&str>, cap: usize) -> String {
     let mut bullets = Vec::new();
     for block in [prev, new].into_iter().flatten() {
@@ -456,12 +518,7 @@ fn merge_bullets(prev: Option<&str>, new: Option<&str>, cap: usize) -> String {
         return "(none)".into();
     }
     let skip = bullets.len().saturating_sub(cap);
-    bullets
-        .into_iter()
-        .skip(skip)
-        .map(|b| format!("- {b}"))
-        .collect::<Vec<_>>()
-        .join("\n")
+    format_bullet_block(bullets.into_iter().skip(skip).collect())
 }
 
 fn merge_index(prev: &str, new: &str) -> String {
@@ -469,7 +526,7 @@ fn merge_index(prev: &str, new: &str) -> String {
         .lines()
         .chain(new.lines())
         .map(|l| l.trim().to_string())
-        .filter(|l| !l.is_empty())
+        .filter(|l| !l.is_empty() && !crate::session::history::is_session_file_noise(l))
         .collect();
     if lines.len() > INDEX_LINES {
         lines = head_tail(lines, INDEX_LINES, INDEX_HEAD);
@@ -485,9 +542,9 @@ fn is_stub_section(s: &str) -> bool {
 fn render_sections(sections: &[(String, String)]) -> String {
     const ORDER: [&str; 5] = [
         "Active Task",
-        "Current State",
-        PRIOR_USER,
         "Decisions",
+        PRIOR_USER,
+        "Current State",
         "Open Work",
     ];
     let mut body = String::new();
@@ -560,10 +617,15 @@ fn groups(events: &[SessionEvent]) -> Vec<Group> {
                         | SessionEvent::Undo(_)
                         | SessionEvent::Start(_)
                         | SessionEvent::Delta(_)
-                        | SessionEvent::Subagent(_) => {
+                        | SessionEvent::Subagent(_)
+                        | SessionEvent::Run(_)
+                        | SessionEvent::Step(_)
+                        | SessionEvent::ToolLifecycle(_) => {
                             i += 1;
                         }
-                        SessionEvent::User(_) | SessionEvent::Assistant(_) => break,
+                        SessionEvent::User(_)
+                        | SessionEvent::Context(_)
+                        | SessionEvent::Assistant(_) => break,
                     }
                 }
                 out.push(Group {
@@ -612,14 +674,19 @@ fn extract(
                     for c in calls {
                         let detail = call_detail(c);
                         pending.insert(c.id.clone(), detail.clone());
+                        if crate::session::history::is_session_file_noise(&detail) {
+                            continue;
+                        }
                         lines.push(format!("seq {seq}  assistant  {detail}"));
                     }
                 }
                 let spoken = crate::platform_prefix::wash_message_content("assistant", &a.content);
                 if !spoken.trim().is_empty() && a.tool_calls.is_none() {
-                    let c = clip(&spoken, CLIP);
-                    decisions.push(c.clone());
-                    lines.push(format!("seq {seq}  assistant  {c}"));
+                    // Last answer is what a follow-up ("复查这些建议") must see.
+                    // CLIP (120) turned a 4k audit into a stub, so grok re-Read
+                    // the tree. Keep earlier decisions short; keep the latest long.
+                    decisions.push(spoken.clone());
+                    lines.push(format!("seq {seq}  assistant  {}", clip(&spoken, CLIP)));
                 }
                 // Full think stays out of FTS. A short note is only useful when
                 // the turn has no user-facing text (those go to Decisions) and
@@ -635,6 +702,13 @@ fn extract(
                 let label = pending
                     .remove(&t.tool_call_id)
                     .unwrap_or_else(|| t.name.clone());
+                if is_fold_noise(&t.output) {
+                    continue;
+                }
+                if crate::session::history::is_session_file_noise(&format!("{label} {}", t.output))
+                {
+                    continue;
+                }
                 tools.push(tool_state_line(&label, t));
                 lines.push(format!("seq {seq}  {}", tool_line(&label, t)));
             }
@@ -658,7 +732,7 @@ fn extract(
         write_bullets(&mut summary, &constraints);
     }
     summary.push_str("\n## Decisions\n");
-    write_bullets(&mut summary, &take_last(decisions, DECISION_CAP));
+    write_bullets(&mut summary, &clip_decisions(decisions));
     summary.push_str("\n## Open Work\n");
     summary.push_str(&format_open_work(&already, keep_user <= until));
     summary.push('\n');
@@ -682,9 +756,16 @@ fn collect_tool_states(events: &[SessionEvent], from: usize, until: usize) -> Ve
                 }
             }
             SessionEvent::Tool(t) => {
+                if is_fold_noise(&t.output) {
+                    continue;
+                }
                 let label = pending
                     .remove(&t.tool_call_id)
                     .unwrap_or_else(|| t.name.clone());
+                if crate::session::history::is_session_file_noise(&format!("{label} {}", t.output))
+                {
+                    continue;
+                }
                 tools.push(tool_state_line(&label, t));
             }
             _ => {}
@@ -715,6 +796,31 @@ fn format_open_work(already: &[String], intra_turn: bool) -> String {
         .map(|s| format!("- {s}"))
         .collect::<Vec<_>>()
         .join("\n")
+}
+
+fn is_fold_noise(s: &str) -> bool {
+    s.contains("Search already dumped")
+        || s.contains("Already searched a similar query")
+        || s.contains("Grep budget for this turn")
+        || s.contains("Already located via Search")
+        || s.contains("Read with offset") && s.contains("Search already")
+}
+
+fn clip_decisions(decisions: Vec<String>) -> Vec<String> {
+    let kept = take_last(decisions, DECISION_CAP);
+    let n = kept.len();
+    kept.into_iter()
+        .enumerate()
+        .map(|(i, s)| {
+            // Last two finals stay long. One CLIP stub was enough for grok to
+            // abandon this chat and Grep overnight session JSONL instead.
+            if i + 2 >= n {
+                clip_chars(s.trim(), DECISION_KEEP)
+            } else {
+                clip(&s, CLIP)
+            }
+        })
+        .collect()
 }
 
 fn write_bullets(out: &mut String, items: &[String]) {
@@ -783,6 +889,9 @@ fn call_detail(c: &OpenAiToolCall) -> String {
 fn think_note(reasoning: &str, calls: Option<&[OpenAiToolCall]>) -> Option<String> {
     let t = reasoning.trim();
     if t.is_empty() || is_task_restatement(t) || is_tool_announcement(t, calls) {
+        return None;
+    }
+    if is_fold_noise(t) {
         return None;
     }
     // Hop wrap-up essays (the audit conclusion written in think) must not
@@ -1523,6 +1632,121 @@ mod tests {
     fn empty_transcript_does_not_compact() {
         let events = vec![start(), SessionEvent::user("hi")];
         assert!(plan_compact(&events).is_none());
+    }
+
+    #[test]
+    fn last_final_survives_compact_for_follow_up() {
+        let body = format!(
+            "审计完了。结论：Shell 不是沙箱，workspace_write_only 管不住命令。{}",
+            "建议核对 drive 的收口和 permit。".repeat(30)
+        );
+        assert!(body.chars().count() > 120);
+        let events = vec![
+            start(),
+            SessionEvent::user("审计一遍"),
+            SessionEvent::assistant(
+                "",
+                "",
+                Some(vec![read_call("r", "crates/hyper-loop/src/agent/turn.rs")]),
+            ),
+            SessionEvent::tool("r", "read", "pub async fn run"),
+            SessionEvent::assistant(&body, "", None),
+            SessionEvent::user("你复查确认下你提的建议是否靠谱"),
+        ];
+        let plan = plan_compact(&events).expect("follow-up compact");
+        assert!(
+            plan.summary.contains("Shell 不是沙箱"),
+            "last answer must not be CLIP-stubbed: {}",
+            plan.summary
+        );
+        assert!(
+            plan.summary.contains("建议核对 drive"),
+            "follow-up must still see the suggestions: {}",
+            plan.summary
+        );
+        let sections = parse_sections(&plan.summary);
+        let dec = section_get(&sections, "Decisions").unwrap_or("");
+        assert!(
+            dec.chars().count() > 200,
+            "last Decision should keep the audit body: {dec}"
+        );
+    }
+
+    #[test]
+    fn session_jsonl_reads_are_not_current_state() {
+        let events = vec![
+            start(),
+            SessionEvent::user("前面的审计做完了吗？结果发我"),
+            SessionEvent::assistant(
+                "",
+                "",
+                Some(vec![read_call(
+                    "r",
+                    "/Users/w/.grok-hyper/sessions/hyper-self-audit-r2.jsonl",
+                )]),
+            ),
+            SessionEvent::tool("r", "read", "steer skip-unstarted-tools overnight recap"),
+            SessionEvent::assistant(
+                "审计完了。结论：Shell 不是沙箱，workspace_write_only 管不住命令。",
+                "",
+                None,
+            ),
+            SessionEvent::user("你复查一下，看修没修好"),
+        ];
+        let plan = plan_compact(&events).expect("compact");
+        assert!(
+            !plan.summary.contains("hyper-self-audit")
+                && !plan.summary.contains(".grok-hyper/sessions")
+                && !plan.index.contains("hyper-self-audit"),
+            "session JSONL must not become Current State: {}\n{}",
+            plan.summary,
+            plan.index
+        );
+        assert!(
+            plan.summary.contains("Shell 不是沙箱"),
+            "this chat's decision must remain: {}",
+            plan.summary
+        );
+    }
+
+    #[test]
+    fn decision_merge_keeps_long_over_short_cap() {
+        let shorts: String = (0..8).map(|i| format!("- ok{i}\n")).collect();
+        let prev = format!(
+            "## Active Task\na\n\n## Current State\n- x\n\n## Decisions\n{shorts}## Open Work\nlive\n"
+        );
+        let long = "审计完了。结论：Shell 不是沙箱。".repeat(8);
+        let new = format!(
+            "## Active Task\nb\n\n## Current State\n- y\n\n## Decisions\n- {long}\n\n## Open Work\nlive\n"
+        );
+        let (merged, _) = merge_extract(&prev, "i1", &new, "i2");
+        assert!(
+            merged.contains("Shell 不是沙箱"),
+            "long decision must survive the cap: {merged}"
+        );
+    }
+
+    #[test]
+    fn fold_nudge_is_not_current_state() {
+        let events = vec![
+            start(),
+            SessionEvent::user("audit turn.rs"),
+            SessionEvent::assistant("", "", Some(vec![read_call("r", "turn.rs")])),
+            SessionEvent::tool(
+                "r",
+                "read",
+                "Search already dumped a span from this file this turn. Use that. Read with offset.",
+            ),
+            SessionEvent::assistant("turn.rs 的 drive 是 ReAct。", "", None),
+            SessionEvent::user("复查"),
+        ];
+        let plan = plan_compact(&events).expect("compact");
+        assert!(
+            !plan.summary.contains("Search already dumped"),
+            "fold replies are not facts: {}",
+            plan.summary
+        );
+        assert!(plan.summary.contains("drive 是 ReAct"), "{}", plan.summary);
     }
 
     #[test]

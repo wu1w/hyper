@@ -11,7 +11,9 @@ use crate::template::ChatMessage;
 pub fn derive_messages(events: &[SessionEvent]) -> Vec<ChatMessage> {
     let mut out = Vec::new();
     if let Some(SessionEvent::Start(start)) = events.first() {
-        out.push(ChatMessage::system(start.system.clone()));
+        out.push(ChatMessage::system(crate::prompt::seal_persona(
+            &start.system,
+        )));
     }
     let compact = events.iter().rev().find_map(|e| match e {
         SessionEvent::Compact(c) => Some(c),
@@ -45,6 +47,9 @@ pub fn derive_messages(events: &[SessionEvent]) -> Vec<ChatMessage> {
         }
         match event {
             SessionEvent::User(u) => out.push(user_message(u)),
+            SessionEvent::Context(c) => out.push(ChatMessage::user(
+                crate::template::wrap_tool_response(&c.text),
+            )),
             SessionEvent::Assistant(a) => out.push(assistant_message(a)),
             SessionEvent::Tool(t) => {
                 let mut msg = ChatMessage::tool(&t.tool_call_id, t.output.clone());
@@ -59,10 +64,17 @@ pub fn derive_messages(events: &[SessionEvent]) -> Vec<ChatMessage> {
             | SessionEvent::Stop(_)
             | SessionEvent::Undo(_)
             | SessionEvent::Delta(_)
-            | SessionEvent::Subagent(_) => {}
+            | SessionEvent::Subagent(_)
+            | SessionEvent::Run(_)
+            | SessionEvent::Step(_)
+            | SessionEvent::ToolLifecycle(_) => {}
         }
     }
     crate::sticky::stub_expired_notes(&mut out);
+    // JSONL keeps the full snapshot. Cold resume must not replay it as live —
+    // `inject_workset_note` / compact refresh stamp a fresh card.
+    crate::sticky::stub_live_workset_notes(&mut out);
+    crate::sticky::stub_live_history_notes(&mut out);
     out
 }
 

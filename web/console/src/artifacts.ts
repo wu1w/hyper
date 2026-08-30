@@ -1,5 +1,5 @@
-import type { SessionEvent } from "./api";
-import { pathFromMediaUrl } from "./media";
+import type { SessionEvent } from "./api.ts";
+import { pathFromMediaUrl } from "./media.ts";
 
 /**
  * 产物 rail is workspace `out/` (and Imagine media under `.grok-hyper/generated/`).
@@ -244,6 +244,18 @@ function addPath(out: Map<string, string>, raw: string | null | undefined, works
   if (!out.has(key)) out.set(key, shown);
 }
 
+function addWorkspacePath(out: Map<string, string>, raw: string | null | undefined, workspace?: string) {
+  if (!raw) return;
+  const trimmed = raw.replace(/^['"`]|['"`]$/g, "").replace(/\.$/, "");
+  if (isRemoteUrl(trimmed)) return;
+  const p = foldPath(trimmed);
+  if (!looksLikeFilePath(p)) return;
+  if (isJunkPath(p) && !isUploadPath(p) && !isGeneratedPath(p)) return;
+  const shown = toDisplayPath(p, workspace);
+  const key = foldPath(shown).toLowerCase();
+  if (!out.has(key)) out.set(key, shown);
+}
+
 function looksLikeFilePath(p: string): boolean {
   if (!p || p === "/dev/null") return false;
   if (/[=;&|<>]/.test(p)) return false;
@@ -373,6 +385,28 @@ function addEventMedia(out: Map<string, string>, e: SessionEvent, workspace?: st
 /** Workspace writes this turn, including process files next to an HTML demo (`app.js`, `styles.css`). */
 export function turnTouchedPaths(events: SessionEvent[], workspace?: string): string[] {
   return collectRaw(events, workspace);
+}
+
+/** Write/StrReplace/Delete paths this turn — source files, not only `out/`. */
+export function turnEditedPaths(events: SessionEvent[], workspace?: string): string[] {
+  const out = new Map<string, string>();
+  const slice = events.slice(lastLiveUserIndex(events));
+  for (const e of slice) {
+    if (e.type === "assistant") {
+      for (const c of e.tool_calls || []) {
+        const name = (c.function?.name || "").toLowerCase();
+        const args = parseArgs(c.function?.arguments);
+        if (WRITE_TOOLS.has(name)) addWorkspacePath(out, argPath(args), workspace);
+      }
+    }
+    if (e.type === "tool") {
+      const name = (e.name || "").toLowerCase();
+      if (WRITE_TOOLS.has(name)) {
+        announcedPaths(String(e.output || "")).forEach((p) => addWorkspacePath(out, p, workspace));
+      }
+    }
+  }
+  return [...out.values()];
 }
 
 export function dirOf(p: string): string {

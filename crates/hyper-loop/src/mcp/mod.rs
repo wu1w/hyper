@@ -1,12 +1,14 @@
-//! One `mcp(server, method, args)` tool. Never expand `tools/list` into OpenAI
-//! `tools[]` — that is the QwenPaw zoo that wrecks 27B tool choice and the
-//! Jinja tools hash.
+//! Cursor-shaped dynamic MCP tools. `GetDynamicTools` discovers each live
+//! server catalog and `CallDynamicTool` invokes one discovered tool. The
+//! server-specific schemas remain dynamic instead of bloating OpenAI
+//! `tools[]`; the legacy `mcp(server, method, args)` executor is retained for
+//! old transcripts.
 //!
 //! Config is a mount list, same overlay as skills: `config.toml` `[mcp]`,
 //! `~/.grok-hyper/mcp.toml` + `mcp/*.toml`, then workspace `.grok-hyper/mcp.toml` +
 //! `.grok-hyper/mcp/*.toml` (later wins). Catalog stays out of the frozen system.
-//! The one `mcp` blob is appended at session start only when servers exist.
-//! Harness injects at most one hidden card after the live query.
+//! The stable discovery/call pair is appended at session start only when
+//! servers exist. Harness injects at most one hidden card after the live query.
 
 use std::collections::{BTreeMap, HashSet};
 use std::path::{Path, PathBuf};
@@ -21,7 +23,7 @@ use tokio::process::Command;
 
 use crate::error::{Error, Result};
 use crate::tool_calls::{ToolCall, ToolResponse, ToolState};
-use crate::tools::{arg_str, folded_response, BlobStore, ToolLimits};
+use crate::tools::{arg_str, arg_str_any, folded_response, BlobStore, ToolLimits, Workspace};
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(default)]
@@ -443,6 +445,263 @@ pub async fn run_mcp(
     }
 }
 
+/// Discover live MCP catalogs with Cursor-compatible tool geometry. Omitting
+/// `server` intentionally fans out across the configured mounts so the model
+/// gets real tool names and schemas, not another list of server aliases.
+pub async fn get_dynamic_tools(
+    registry: &McpRegistry,
+    call: &ToolCall,
+    limits: ToolLimits,
+    blobs: Option<&BlobStore>,
+) -> ToolResponse {
+    if registry.servers.is_empty() {
+        return ToolResponse::text(
+            &call.id,
+            "No MCP servers configured. Add [[mcp.servers]] in config.toml.",
+            ToolState::Success,
+        );
+    }
+    let requested = arg_str_any(&call.arguments, &["server", "namespace"]);
+    let servers: Vec<&McpServer> = match requested.as_deref() {
+        Some(name) => match registry.get(name) {
+            Some(server) => vec![server],
+            None => {
+                return ToolResponse::text(
+                    &call.id,
+                    format!(
+                        "Error: unknown MCP server '{name}'. Configured: {}",
+                        registry.server_names()
+                    ),
+                    ToolState::Error,
+                );
+            }
+        },
+        None => registry.servers.iter().collect(),
+    };
+    let query = arg_str_any(&call.arguments, &["query", "pattern"])
+        .unwrap_or_default()
+        .trim()
+        .to_ascii_lowercase();
+    let tool_name = arg_str_any(&call.arguments, &["toolName", "tool_name"])
+        .unwrap_or_default()
+        .trim()
+        .to_ascii_lowercase();
+    let jobs = servers.into_iter().map(|server| {
+        let legacy = ToolCall {
+            id: call.id.clone(),
+            name: "mcp".into(),
+            arguments: json!({"server": server.name, "method": "tools/list", "args": {}}),
+        };
+        async move {
+            let response = run_mcp(registry, &legacy, limits, blobs).await;
+            (server.name.clone(), response)
+        }
+    });
+    let responses = futures::future::join_all(jobs).await;
+    let mut catalogs = Vec::with_capacity(responses.len());
+    for (server, response) in responses {
+        if response.state != ToolState::Success {
+            catalogs.push(json!({
+                "server": server,
+                "error": response.joined_text(),
+            }));
+            continue;
+        }
+        let raw = response.joined_text();
+        let mut catalog =
+            serde_json::from_str::<Value>(&raw).unwrap_or_else(|_| json!({"raw": raw}));
+        if !query.is_empty() {
+            filter_catalog(&mut catalog, &query);
+        }
+        if !tool_name.is_empty() {
+            filter_catalog_name(&mut catalog, &tool_name);
+        }
+        catalogs.push(json!({"server": server, "catalog": catalog}));
+    }
+    let text = serde_json::to_string_pretty(&json!({"servers": catalogs}))
+        .unwrap_or_else(|_| "{\"servers\":[]}".into());
+    folded_response(&call.id, text, ToolState::Success, limits, blobs)
+}
+
+/// Invoke one tool returned by [`get_dynamic_tools`]. A few argument aliases
+/// are accepted for compatibility with model/tool-call transcripts.
+pub async fn call_dynamic_tool(
+    registry: &McpRegistry,
+    call: &ToolCall,
+    limits: ToolLimits,
+    blobs: Option<&BlobStore>,
+) -> ToolResponse {
+    let Some(server) = arg_str_any(&call.arguments, &["server", "namespace"]) else {
+        return ToolResponse::text(
+            &call.id,
+            "Error: CallDynamicTool needs `server`.",
+            ToolState::Error,
+        );
+    };
+    let name = arg_str_any(&call.arguments, &["name", "toolName", "tool_name", "tool"]);
+    let Some(name) = name.filter(|s| !s.trim().is_empty()) else {
+        return ToolResponse::text(
+            &call.id,
+            "Error: CallDynamicTool needs `name`.",
+            ToolState::Error,
+        );
+    };
+    let arguments = call
+        .arguments
+        .get("arguments")
+        .or_else(|| call.arguments.get("args"))
+        .cloned()
+        .unwrap_or_else(|| json!({}));
+    let legacy = ToolCall {
+        id: call.id.clone(),
+        name: "mcp".into(),
+        arguments: json!({"server": server, "method": name, "args": arguments}),
+    };
+    run_mcp(registry, &legacy, limits, blobs).await
+}
+
+/// Read or list MCP resources. Cursor `FetchMcpResource`.
+pub async fn fetch_mcp_resource(
+    registry: &McpRegistry,
+    call: &ToolCall,
+    limits: ToolLimits,
+    blobs: Option<&BlobStore>,
+    workspace: Option<&Workspace>,
+) -> ToolResponse {
+    if registry.servers.is_empty() {
+        return ToolResponse::text(
+            &call.id,
+            "No MCP servers configured. Add [[mcp.servers]] in config.toml.",
+            ToolState::Success,
+        );
+    }
+    let Some(server) = arg_str_any(&call.arguments, &["server", "namespace"]) else {
+        return ToolResponse::text(
+            &call.id,
+            format!(
+                "Error: FetchMcpResource needs `server`. Configured: {}",
+                registry.server_names()
+            ),
+            ToolState::Error,
+        );
+    };
+    let uri = arg_str_any(&call.arguments, &["uri", "url"]).unwrap_or_default();
+    let method = if uri.trim().is_empty() {
+        "resources/list"
+    } else {
+        "resources/read"
+    };
+    let args = if uri.trim().is_empty() {
+        json!({})
+    } else {
+        json!({"uri": uri})
+    };
+    let legacy = ToolCall {
+        id: call.id.clone(),
+        name: "mcp".into(),
+        arguments: json!({"server": server, "method": method, "args": args}),
+    };
+    let response = run_mcp(registry, &legacy, limits, blobs).await;
+    if response.state != ToolState::Success {
+        return response;
+    }
+    let download = arg_str_any(&call.arguments, &["downloadPath", "download_path"]);
+    let Some(rel) = download.filter(|s| !s.trim().is_empty()) else {
+        return response;
+    };
+    let Some(ws) = workspace else {
+        return ToolResponse::text(
+            &call.id,
+            format!(
+                "{}\n(downloadPath ignored: no workspace)",
+                response.joined_text()
+            ),
+            ToolState::Success,
+        );
+    };
+    let dest = match ws.resolve(&rel) {
+        Ok(p) => p,
+        Err(e) => return ToolResponse::text(&call.id, e, ToolState::Error),
+    };
+    match write_resource_file(&dest, &response.joined_text()) {
+        Ok(n) => ToolResponse::text(
+            &call.id,
+            format!("Wrote {n} bytes to {}.", ws.shown(&rel)),
+            ToolState::Success,
+        ),
+        Err(e) => ToolResponse::text(&call.id, format!("Error: {e}"), ToolState::Error),
+    }
+}
+
+fn write_resource_file(path: &std::path::Path, raw: &str) -> Result<usize> {
+    let bytes = resource_bytes(raw)?;
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent).map_err(Error::msg)?;
+    }
+    std::fs::write(path, &bytes).map_err(Error::msg)?;
+    Ok(bytes.len())
+}
+
+fn resource_bytes(raw: &str) -> Result<Vec<u8>> {
+    let Ok(v) = serde_json::from_str::<Value>(raw) else {
+        return Ok(raw.as_bytes().to_vec());
+    };
+    if let Some(contents) = v.get("contents").and_then(Value::as_array) {
+        if let Some(first) = contents.first() {
+            if let Some(text) = first.get("text").and_then(Value::as_str) {
+                return Ok(text.as_bytes().to_vec());
+            }
+            if let Some(blob) = first.get("blob").and_then(Value::as_str) {
+                use base64::Engine;
+                return base64::engine::general_purpose::STANDARD
+                    .decode(blob.trim())
+                    .map_err(|e| Error::msg(format!("resource blob: {e}")));
+            }
+        }
+    }
+    if let Some(text) = v.get("text").and_then(Value::as_str) {
+        return Ok(text.as_bytes().to_vec());
+    }
+    Ok(raw.as_bytes().to_vec())
+}
+
+fn filter_catalog(catalog: &mut Value, query: &str) {
+    let Some(tools) = catalog.get_mut("tools").and_then(Value::as_array_mut) else {
+        return;
+    };
+    tools.retain(|tool| {
+        tool.get("name")
+            .and_then(Value::as_str)
+            .into_iter()
+            .chain(tool.get("description").and_then(Value::as_str))
+            .any(|text| text.to_ascii_lowercase().contains(query))
+    });
+}
+
+fn filter_catalog_name(catalog: &mut Value, tool_name: &str) {
+    let Some(tools) = catalog.get_mut("tools").and_then(Value::as_array_mut) else {
+        return;
+    };
+    let exact: Vec<Value> = tools
+        .iter()
+        .filter(|tool| {
+            tool.get("name")
+                .and_then(Value::as_str)
+                .is_some_and(|name| name.eq_ignore_ascii_case(tool_name))
+        })
+        .cloned()
+        .collect();
+    if !exact.is_empty() {
+        *tools = exact;
+        return;
+    }
+    tools.retain(|tool| {
+        tool.get("name")
+            .and_then(Value::as_str)
+            .is_some_and(|name| name.to_ascii_lowercase().contains(tool_name))
+    });
+}
+
 fn is_transport_fail(msg: &str) -> bool {
     let m = msg.to_ascii_lowercase();
     m.contains("mcp eof")
@@ -459,14 +718,19 @@ async fn dispatch_mcp(
     arguments: Value,
     stderr_buf: &Arc<Mutex<Vec<u8>>>,
 ) -> Result<Value> {
-    if method == "tools/list" {
-        jsonrpc_tools_list(spec, stderr_buf).await
-    } else {
-        jsonrpc_call(spec, method, arguments, stderr_buf).await
+    match method {
+        "tools/list" | "resources/list" => jsonrpc_named(spec, method, json!({}), stderr_buf).await,
+        "resources/read" => jsonrpc_named(spec, method, arguments, stderr_buf).await,
+        _ => jsonrpc_call(spec, method, arguments, stderr_buf).await,
     }
 }
 
-async fn jsonrpc_tools_list(spec: &McpServer, stderr_buf: &Arc<Mutex<Vec<u8>>>) -> Result<Value> {
+async fn jsonrpc_named(
+    spec: &McpServer,
+    method: &str,
+    params: Value,
+    stderr_buf: &Arc<Mutex<Vec<u8>>>,
+) -> Result<Value> {
     let mut child = spawn(spec)?;
     let mut stdin = child.stdin.take().ok_or_else(|| Error::msg("mcp stdin"))?;
     let stdout = child
@@ -481,8 +745,8 @@ async fn jsonrpc_tools_list(spec: &McpServer, stderr_buf: &Arc<Mutex<Vec<u8>>>) 
         json!({
             "jsonrpc": "2.0",
             "id": 2,
-            "method": "tools/list",
-            "params": {}
+            "method": method,
+            "params": params
         }),
     )
     .await?;
@@ -806,6 +1070,11 @@ while True:
         write_note()
         name = (msg.get("params") or {}).get("name")
         write_msg({"jsonrpc":"2.0","id":mid,"result":{"content":[{"type":"text","text":"pong:"+str(name)}]}})
+    elif method == "resources/list":
+        write_msg({"jsonrpc":"2.0","id":mid,"result":{"resources":[{"uri":"echo://pong","name":"pong"}]}})
+    elif method == "resources/read":
+        uri = (msg.get("params") or {}).get("uri")
+        write_msg({"jsonrpc":"2.0","id":mid,"result":{"contents":[{"uri":str(uri),"mimeType":"text/plain","text":"resource-body"}]}})
 "#,
         )
         .unwrap();
@@ -830,6 +1099,22 @@ while True:
             "{}",
             list.joined_text()
         );
+        let dynamic_list = get_dynamic_tools(
+            &registry,
+            &crate::tool_calls::ToolCall {
+                id: "d1".into(),
+                name: "GetDynamicTools".into(),
+                arguments: json!({"query":"pong"}),
+            },
+            crate::tools::ToolLimits::default(),
+            None,
+        )
+        .await;
+        assert!(
+            dynamic_list.joined_text().contains("ping"),
+            "{}",
+            dynamic_list.joined_text()
+        );
         let ping = run_mcp(
             &registry,
             &crate::tool_calls::ToolCall {
@@ -845,6 +1130,117 @@ while True:
             ping.joined_text().contains("pong"),
             "{}",
             ping.joined_text()
+        );
+        let dynamic_ping = call_dynamic_tool(
+            &registry,
+            &crate::tool_calls::ToolCall {
+                id: "d2".into(),
+                name: "CallDynamicTool".into(),
+                arguments: json!({"server":"echo","name":"ping","arguments":{}}),
+            },
+            crate::tools::ToolLimits::default(),
+            None,
+        )
+        .await;
+        assert!(
+            dynamic_ping.joined_text().contains("pong:ping"),
+            "{}",
+            dynamic_ping.joined_text()
+        );
+        let alias_ping = call_dynamic_tool(
+            &registry,
+            &crate::tool_calls::ToolCall {
+                id: "d3".into(),
+                name: "CallDynamicTool".into(),
+                arguments: json!({"namespace":"echo","toolName":"ping","arguments":{}}),
+            },
+            crate::tools::ToolLimits::default(),
+            None,
+        )
+        .await;
+        assert!(
+            alias_ping.joined_text().contains("pong:ping"),
+            "{}",
+            alias_ping.joined_text()
+        );
+        let named = get_dynamic_tools(
+            &registry,
+            &crate::tool_calls::ToolCall {
+                id: "d4".into(),
+                name: "GetDynamicTools".into(),
+                arguments: json!({"namespace":"echo","toolName":"ping"}),
+            },
+            crate::tools::ToolLimits::default(),
+            None,
+        )
+        .await;
+        assert!(
+            named.joined_text().contains("ping"),
+            "{}",
+            named.joined_text()
+        );
+        let listed = fetch_mcp_resource(
+            &registry,
+            &crate::tool_calls::ToolCall {
+                id: "r1".into(),
+                name: "FetchMcpResource".into(),
+                arguments: json!({"server":"echo"}),
+            },
+            crate::tools::ToolLimits::default(),
+            None,
+            None,
+        )
+        .await;
+        assert!(
+            listed.joined_text().contains("echo://pong"),
+            "{}",
+            listed.joined_text()
+        );
+        let read = fetch_mcp_resource(
+            &registry,
+            &crate::tool_calls::ToolCall {
+                id: "r2".into(),
+                name: "FetchMcpResource".into(),
+                arguments: json!({"namespace":"echo","uri":"echo://pong"}),
+            },
+            crate::tools::ToolLimits::default(),
+            None,
+            None,
+        )
+        .await;
+        assert!(
+            read.joined_text().contains("resource-body"),
+            "{}",
+            read.joined_text()
+        );
+        let ws_dir = dir.join("ws");
+        std::fs::create_dir_all(&ws_dir).unwrap();
+        let ws = crate::tools::Workspace::open(&ws_dir, true).unwrap();
+        let downloaded = fetch_mcp_resource(
+            &registry,
+            &crate::tool_calls::ToolCall {
+                id: "r3".into(),
+                name: "FetchMcpResource".into(),
+                arguments: json!({
+                    "server": "echo",
+                    "uri": "echo://pong",
+                    "downloadPath": "copied.txt"
+                }),
+            },
+            crate::tools::ToolLimits::default(),
+            None,
+            Some(&ws),
+        )
+        .await;
+        assert_eq!(
+            downloaded.state,
+            ToolState::Success,
+            "{}",
+            downloaded.joined_text()
+        );
+        assert_eq!(
+            std::fs::read_to_string(ws_dir.join("copied.txt")).unwrap(),
+            "resource-body"
         );
         let _ = std::fs::remove_dir_all(dir);
     }

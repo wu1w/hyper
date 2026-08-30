@@ -50,6 +50,7 @@ impl MemoryStore {
     pub fn ensure_layout(&self) -> Result<()> {
         for sub in [
             "memory",
+            "memory/chats",
             "digest/personal",
             "digest/procedure",
             "digest/wiki",
@@ -87,6 +88,38 @@ impl MemoryStore {
         if let Ok(idx) = MemoryIndex::open(&self.root) {
             let rel = format!("memory/{day}/{session_id}-{until_seq}.md");
             let _ = idx.upsert(&rel, "daily", &text);
+        }
+        Ok(path)
+    }
+
+    /// One recap per chat, overwritten each substantial finish. Indexed as
+    /// `chat` so a new session can find it without mounting `recall`.
+    pub fn write_chat_recap(
+        &self,
+        session_id: &str,
+        channel: &str,
+        workspace: &str,
+        user: &str,
+        assistant: &str,
+    ) -> Result<PathBuf> {
+        let dir = self.root.join("memory/chats");
+        std::fs::create_dir_all(&dir)?;
+        let title = crate::session::catalog::title_from_text(user);
+        let heading = if title.is_empty() {
+            session_id
+        } else {
+            title.as_str()
+        };
+        let text = format!(
+            "# {heading}\nchannel: {channel}\nworkspace: {workspace}\nsession: {session_id}\n\n## User\n{}\n\n## Assistant\n{}\n",
+            user.trim(),
+            assistant.trim(),
+        );
+        let path = dir.join(format!("{session_id}.md"));
+        std::fs::write(&path, &text)?;
+        if let Ok(idx) = MemoryIndex::open(&self.root) {
+            let rel = format!("memory/chats/{session_id}.md");
+            let _ = idx.upsert(&rel, "chat", &text);
         }
         Ok(path)
     }

@@ -49,6 +49,7 @@ pub async fn run(opts: WebOpts) -> Result<std::process::ExitCode> {
         );
     }
 
+    let cli_workspace = opts.workspace.clone();
     let workspace = crate::files::resolve_web_workspace(&opts.workspace, &cfg.console.workspace)
         .context("workspace")?;
     let session_id = if !opts.session_id.is_empty() {
@@ -93,6 +94,14 @@ pub async fn run(opts: WebOpts) -> Result<std::process::ExitCode> {
         hyper_loop::sidecar::Dispatch::Error(err) => anyhow::bail!("{}", err.message),
         other => anyhow::bail!("session.open: {other:?}"),
     }
+    // session.open + bind_store restore JSONL cwd. An explicit CLI
+    // `--workspace` must win and be written into this session's start event.
+    if !cli_workspace.as_os_str().is_empty() {
+        session
+            .set_workspace(workspace.clone())
+            .map_err(|e| anyhow::anyhow!("workspace: {e}"))?;
+    }
+    let workspace_shown = session.workspace().display().to_string();
 
     let addr: SocketAddr = opts.bind.parse().context("bind address")?;
     if !addr.ip().is_loopback() && !opts.allow_lan {
@@ -116,7 +125,7 @@ pub async fn run(opts: WebOpts) -> Result<std::process::ExitCode> {
     let bound = listener.local_addr().context("local addr")?;
     let url = format!("http://{bound}/");
     eprintln!("hyper web  {url}");
-    eprintln!("workspace {}", workspace.display());
+    eprintln!("workspace {workspace_shown}");
     if opts.open_browser {
         open_browser(&url);
     }

@@ -12,15 +12,15 @@ use crate::error::{Error, Result};
 use crate::lock_unpoison;
 use crate::media::MediaPart;
 
-/// What Enter does while a turn is running. Hermes `/busy`.
+/// What a normal follow-up does while a turn is running.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum BusyPolicy {
-    /// Abort the live turn, then start this prompt (Hermes default).
-    #[default]
+    /// Abort the live turn, then start this prompt.
     Interrupt,
-    /// Run after the live turn finishes. Hermes `/queue`.
+    /// Run after the live turn finishes. Explicit `/queue`.
     Queue,
-    /// Inject after the next tool result. Hermes `/steer`.
+    /// Inject at the next safe tool boundary. Cursor/OpenClaw-style default.
+    #[default]
     Steer,
 }
 
@@ -205,6 +205,10 @@ pub fn push_steer(slot: &SteerSlot, text: String) {
 
 pub fn take_steer(slot: &SteerSlot) -> Vec<String> {
     std::mem::take(&mut *lock_unpoison(slot))
+}
+
+pub fn has_steer(slot: &SteerSlot) -> bool {
+    !lock_unpoison(slot).is_empty()
 }
 
 #[cfg(test)]

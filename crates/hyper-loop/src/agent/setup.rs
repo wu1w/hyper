@@ -22,7 +22,8 @@ use crate::template::ChatMessage;
 use crate::tool_calls::{CancelFlag, ToolCoordinator, COORDINATOR_OWNED_EXEC_TIMEOUT_SECS};
 use crate::tools::{BlobStore, Workspace};
 use crate::tools_schema::{
-    agent_tools, code_tools, computer_use_tool, dispatch_name, mcp_tool, search_tool, view_tool,
+    agent_tools, code_tools, computer_use_tool, dispatch_name, dynamic_mcp_tools, search_tool,
+    view_tool,
 };
 
 impl<C: Completer> Agent<C> {
@@ -66,6 +67,9 @@ impl<C: Completer> Agent<C> {
         if completer.recasts_xai_product() {
             crate::platform_prefix::append_xai_product_closer(&mut system);
         }
+        if super::im_bridge_channel(&opts.channel) {
+            sticky::ensure_im_system_lock(&mut system);
+        }
 
         let gates = vec![
             Gate::from(DoomLoopGate::grok_default()),
@@ -93,15 +97,32 @@ impl<C: Completer> Agent<C> {
         );
         coordinator.set_offload_on_deadline(true);
 
-        let policy = completer
+        let wire = completer
             .policy()
             .unwrap_or_else(ThinkPolicy::agent_default);
-        let (messages, log) = bind_session(&opts, &system, &tools, policy.clone());
-        let policy = if opts.effort_locked {
-            policy
+        let (mut messages, log) = bind_session(&opts, &system, &tools, wire.clone());
+        if super::im_bridge_channel(&opts.channel) {
+            sticky::ensure_im_system_lock_on_messages(&mut messages);
+        }
+        let mut policy = if opts.effort_locked {
+            wire.clone()
         } else {
-            log.as_ref().and_then(|l| l.policy()).unwrap_or(policy)
+            log.as_ref()
+                .and_then(|l| l.policy())
+                .unwrap_or_else(|| wire.clone())
         };
+        // Old JSONL froze medium. Unlocked Agent/Code on grok-4.6 must match
+        // the wire default (xhigh), including IM `Agent::new` each message.
+        if !opts.effort_locked
+            && matches!(
+                opts.session_mode,
+                crate::session::SessionMode::Agent | crate::session::SessionMode::Code
+            )
+            && wire.effort == Some(crate::policy::Effort::Xhigh)
+            && policy.effort != Some(crate::policy::Effort::Xhigh)
+        {
+            policy = wire;
+        }
         completer.set_policy(policy.clone());
         let effort = EffortController::new(policy.clone(), opts.effort_locked);
         let media_caps = completer.media_caps();
@@ -137,6 +158,9 @@ impl<C: Completer> Agent<C> {
             handler,
             coordinator,
             session_id: opts.session_id,
+            run_id: None,
+            turn_id: None,
+            current_step: 0,
             messages,
             tools,
             pending_stop: None,
@@ -178,9 +202,16 @@ impl<C: Completer> Agent<C> {
             window_overlay: opts.working_window_overlay,
             edit_guard: guard::EditGuard::new(),
             channel: opts.channel,
+            editor_files: opts.editor_files,
             code_index,
             index_build: None,
             speculate: None,
+            in_flight_diag: None,
+            model_hops: std::sync::atomic::AtomicU32::new(0),
+            search_calls: std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0)),
+            search_queries: std::sync::Mutex::new(Vec::new()),
+            grep_calls: std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0)),
+            read_full: std::sync::Mutex::new(HashSet::new()),
             physics_nudged: false,
             official_compaction: None,
             xai_compact: opts.xai_compact,
@@ -255,6 +286,16 @@ impl<C: Completer> Agent<C> {
             media_max_bytes: self.media_max_bytes,
             child: self.child,
             plan_mode: self.plan_mode,
+            skip_grep: super::notes::forbids_grep(self.last_real_user()),
+            skip_glob: super::notes::forbids_glob(self.last_real_user()),
+            search_queries: crate::lock_unpoison(&self.search_queries).clone(),
+            search_used: self.search_calls.load(std::sync::atomic::Ordering::Relaxed),
+            named_new: super::dispatch::named_new_files(&self.workspace, self.last_real_user()),
+            search_located: super::dispatch::located_search_paths(&self.messages)
+                .into_iter()
+                .map(|p| super::dispatch::canon_ws_path(&self.workspace, &p))
+                .collect(),
+            search_shown_idents: super::dispatch::shown_dump_idents(&self.messages),
         }
     }
 }
@@ -363,9 +404,9 @@ pub(crate) fn bind_periphery(
         ToolSet::Code => code_tools(),
     };
     if extra_tools && !mcp.servers.is_empty() {
-        tools.push(mcp_tool());
+        tools.extend(dynamic_mcp_tools());
     }
-    if matches!(tool_set, ToolSet::Agent) {
+    if opts.code_search && matches!(tool_set, ToolSet::Agent) {
         tools.push(search_tool());
     }
     if opts.media && matches!(tool_set, ToolSet::Agent) {

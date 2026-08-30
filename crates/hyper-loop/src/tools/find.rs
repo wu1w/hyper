@@ -19,10 +19,10 @@ pub(crate) const SKIP_DIR: &[&str] = &[
     "node_modules",
     "dist",
     "build",
+    "third_party",
     "__pycache__",
     ".venv",
     "venv",
-    ".grok-hyper",
     "blobs",
     "AppData",
     "Application Data",
@@ -31,6 +31,10 @@ pub(crate) const SKIP_DIR: &[&str] = &[
     "Caches",
     "OneDrive",
 ];
+
+/// Session JSONL / blob archives under the workspace overlay. Overnight scripts,
+/// todos, and cron live beside these and must stay Glob/Grep-visible.
+const HYPER_SKIP_DIR: &[&str] = &["sessions", "blobs", "doc-cache"];
 
 const GLOB_CAP: usize = 200;
 const GREP_CAP: usize = 80;
@@ -86,7 +90,9 @@ pub fn glob_files(ws: &Workspace, call: &ToolCall, limits: ToolLimits) -> ToolRe
         hits.join("\n")
     };
     if n >= GLOB_CAP {
-        text.push_str(&format!("\n… truncated at {GLOB_CAP} paths."));
+        text.push_str(&format!(
+            "\n… truncated at {GLOB_CAP} paths. Narrow the glob or use Search."
+        ));
     } else if end == WalkEnd::Budget {
         text.push_str(&format!(
             "\n… scan stopped after {}s.",
@@ -212,6 +218,15 @@ fn grep_ripgrep(ws: &Workspace, root: &Path, pattern: &str, args: &Value) -> Opt
     cmd.arg("--hidden");
     cmd.arg("--glob");
     cmd.arg("!.git/**");
+    if path_under_hyper_overlay(ws, root) {
+        // Overlay is gitignored; otherwise rg never sees overnight scripts.
+        cmd.arg("--no-ignore-vcs");
+        cmd.arg("--no-ignore-parent");
+    }
+    if !path_under_dir(ws, root, "third_party") {
+        cmd.arg("--glob");
+        cmd.arg("!third_party/**");
+    }
     match grep_output_mode(args) {
         "files_with_matches" => {
             cmd.arg("-l");
@@ -509,8 +524,12 @@ fn glob_to_regex(pattern: &str) -> String {
         .replace('\\', "/")
         .trim_start_matches("./")
         .to_string();
-    let mut out = String::from("^");
+    format!("^{}$", glob_body(&pat))
+}
+
+fn glob_body(pat: &str) -> String {
     let chars: Vec<char> = pat.chars().collect();
+    let mut out = String::new();
     let mut i = 0;
     while i < chars.len() {
         match chars[i] {
@@ -531,7 +550,23 @@ fn glob_to_regex(pattern: &str) -> String {
                 out.push_str("[^/]");
                 i += 1;
             }
-            '.' | '+' | '(' | ')' | '|' | '^' | '$' | '{' | '}' | '[' | ']' => {
+            '{' => {
+                if let Some((end, inner)) = glob_brace_alts(&chars, i) {
+                    out.push_str("(?:");
+                    for (n, alt) in inner.iter().enumerate() {
+                        if n > 0 {
+                            out.push('|');
+                        }
+                        out.push_str(&glob_body(alt));
+                    }
+                    out.push(')');
+                    i = end;
+                } else {
+                    out.push_str("\\{");
+                    i += 1;
+                }
+            }
+            '.' | '+' | '(' | ')' | '|' | '^' | '$' | '}' | '[' | ']' => {
                 out.push('\\');
                 out.push(chars[i]);
                 i += 1;
@@ -542,8 +577,38 @@ fn glob_to_regex(pattern: &str) -> String {
             }
         }
     }
-    out.push('$');
     out
+}
+
+/// Cursor-style `{rs,toml,md}`. Nested braces and `{` without a comma stay literal.
+fn glob_brace_alts(chars: &[char], open: usize) -> Option<(usize, Vec<String>)> {
+    let mut depth = 0usize;
+    let mut comma = false;
+    for (j, &c) in chars.iter().enumerate().skip(open) {
+        match c {
+            '{' => depth += 1,
+            '}' => {
+                depth = depth.saturating_sub(1);
+                if depth == 0 {
+                    if !comma {
+                        return None;
+                    }
+                    let inner: String = chars[open + 1..j].iter().collect();
+                    if inner.contains('{') {
+                        return None;
+                    }
+                    let alts: Vec<String> = inner.split(',').map(|s| s.to_string()).collect();
+                    if alts.iter().any(|a| a.is_empty()) {
+                        return None;
+                    }
+                    return Some((j + 1, alts));
+                }
+            }
+            ',' if depth == 1 => comma = true,
+            _ => {}
+        }
+    }
+    None
 }
 
 fn rg_search_path() -> OsString {
@@ -576,6 +641,29 @@ fn rg_search_path() -> OsString {
     std::env::join_paths(parts).unwrap_or_else(|_| std::env::var_os("PATH").unwrap_or_default())
 }
 
+fn path_under_hyper_overlay(ws: &Workspace, root: &Path) -> bool {
+    path_under_dir(ws, root, ".grok-hyper")
+}
+
+fn path_under_dir(ws: &Workspace, root: &Path, name: &str) -> bool {
+    let Ok(rel) = root.strip_prefix(ws.root()) else {
+        return root
+            .file_name()
+            .and_then(|n| n.to_str())
+            .is_some_and(|n| n == name);
+    };
+    let s = rel.to_string_lossy().replace('\\', "/");
+    s == name || s.starts_with(&format!("{name}/"))
+}
+
+fn skip_walk_dir(name: &str, parent_rel: &str) -> bool {
+    if SKIP_DIR.contains(&name) {
+        return true;
+    }
+    let under_hyper = parent_rel == ".grok-hyper" || parent_rel.starts_with(".grok-hyper/");
+    under_hyper && HYPER_SKIP_DIR.contains(&name)
+}
+
 fn walk_files(dir: &Path, root: &Path, visit: &mut dyn FnMut(&str, &Path) -> bool) -> WalkEnd {
     let started = Instant::now();
     let mut stack = vec![dir.to_path_buf()];
@@ -597,7 +685,12 @@ fn walk_files(dir: &Path, root: &Path, visit: &mut dyn FnMut(&str, &Path) -> boo
                 continue;
             };
             if ft.is_dir() {
-                if SKIP_DIR.contains(&name_s.as_ref()) {
+                let parent_rel = cur
+                    .strip_prefix(root)
+                    .unwrap_or(&cur)
+                    .to_string_lossy()
+                    .replace('\\', "/");
+                if skip_walk_dir(name_s.as_ref(), &parent_rel) {
                     continue;
                 }
                 if super::path::is_reparse_or_symlink(&path) {
@@ -620,4 +713,176 @@ fn walk_files(dir: &Path, root: &Path, visit: &mut dyn FnMut(&str, &Path) -> boo
         }
     }
     WalkEnd::Done
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::tool_calls::ToolCall;
+    use serde_json::json;
+    use std::path::PathBuf;
+
+    fn scratch() -> (Workspace, PathBuf) {
+        let dir =
+            std::env::temp_dir().join(format!("hyper-find-{}", uuid::Uuid::new_v4().simple()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let w = Workspace::open(&dir, true).unwrap();
+        (w, dir)
+    }
+
+    fn call(args: serde_json::Value) -> ToolCall {
+        ToolCall {
+            id: "t1".into(),
+            name: "Glob".into(),
+            arguments: args,
+        }
+    }
+
+    #[test]
+    fn glob_sees_hyper_overnight_but_skips_sessions() {
+        let (ws, dir) = scratch();
+        let overnight = dir.join(".grok-hyper/overnight");
+        let sessions = dir.join(".grok-hyper/sessions");
+        std::fs::create_dir_all(&overnight).unwrap();
+        std::fs::create_dir_all(&sessions).unwrap();
+        std::fs::write(overnight.join("ping.py"), "print('ok')\n").unwrap();
+        std::fs::write(sessions.join("sid.jsonl"), "{}\n").unwrap();
+        let by_pattern = glob_files(
+            &ws,
+            &call(json!({"glob_pattern": ".grok-hyper/overnight/**"})),
+            ToolLimits::default(),
+        );
+        let t = by_pattern.joined_text();
+        assert!(t.contains("ping.py"), "{t}");
+        assert!(!t.contains("sid.jsonl"), "{t}");
+        let by_star = glob_files(
+            &ws,
+            &call(json!({"glob_pattern": "**/*.py"})),
+            ToolLimits::default(),
+        );
+        let s = by_star.joined_text();
+        assert!(s.contains("ping.py"), "{s}");
+        let all = glob_files(
+            &ws,
+            &call(json!({"glob_pattern": ".grok-hyper/**"})),
+            ToolLimits::default(),
+        );
+        let a = all.joined_text();
+        assert!(a.contains("ping.py"), "{a}");
+        assert!(
+            !a.contains("sid.jsonl"),
+            "session dumps must stay skipped: {a}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn grep_overlay_finds_overnight_file() {
+        let (ws, dir) = scratch();
+        let overnight = dir.join(".grok-hyper/overnight");
+        std::fs::create_dir_all(&overnight).unwrap();
+        std::fs::write(overnight.join("ping.py"), "print('OVERNIGHT_OK')\n").unwrap();
+        let hit = grep_files(
+            &ws,
+            &ToolCall {
+                id: "t1".into(),
+                name: "Grep".into(),
+                arguments: json!({
+                    "pattern": "OVERNIGHT_OK",
+                    "path": ".grok-hyper/overnight"
+                }),
+            },
+            ToolLimits::default(),
+            None,
+        );
+        let t = hit.joined_text();
+        assert!(t.contains("OVERNIGHT_OK"), "{t}");
+        assert!(t.contains("ping.py"), "{t}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn glob_brace_alts_match_extensions() {
+        let m = GlobMatcher::new("**/*.{rs,toml,md}").unwrap();
+        assert!(m.matches("crates/hyper-loop/src/lib.rs"), "rs");
+        assert!(m.matches("config.toml"), "toml");
+        assert!(m.matches("docs/architecture.md"), "md");
+        assert!(!m.matches("fold_idle.py"), "py must not match brace glob");
+        let (ws, dir) = scratch();
+        std::fs::create_dir_all(dir.join("crates")).unwrap();
+        std::fs::write(dir.join("crates/lib.rs"), "fn x() {}\n").unwrap();
+        std::fs::write(dir.join("config.toml"), "").unwrap();
+        std::fs::write(dir.join("readme.md"), "# h\n").unwrap();
+        std::fs::write(dir.join("skip.py"), "").unwrap();
+        let t = glob_files(
+            &ws,
+            &call(json!({"glob_pattern": "**/*.{rs,toml,md}"})),
+            ToolLimits::default(),
+        )
+        .joined_text();
+        assert!(t.contains("lib.rs"), "{t}");
+        assert!(t.contains("config.toml"), "{t}");
+        assert!(t.contains("readme.md"), "{t}");
+        assert!(!t.contains("skip.py"), "{t}");
+        assert!(
+            !t.starts_with("No files matching"),
+            "brace glob must not empty-hit: {t}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn glob_skips_vendored_third_party() {
+        let (ws, dir) = scratch();
+        std::fs::create_dir_all(dir.join("crates")).unwrap();
+        std::fs::create_dir_all(dir.join("third_party/grok-build")).unwrap();
+        std::fs::write(dir.join("crates/lib.rs"), "fn x() {}\n").unwrap();
+        std::fs::write(
+            dir.join("third_party/grok-build/lib.rs"),
+            "fn vendored() {}\n",
+        )
+        .unwrap();
+        let t = glob_files(
+            &ws,
+            &call(json!({"glob_pattern": "**/*.rs"})),
+            ToolLimits::default(),
+        )
+        .joined_text();
+        assert!(t.contains("crates/lib.rs"), "{t}");
+        assert!(
+            !t.contains("third_party"),
+            "vendored clones must not fill the glob cap: {t}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn grep_skips_vendored_third_party() {
+        let (ws, dir) = scratch();
+        std::fs::create_dir_all(dir.join("crates")).unwrap();
+        std::fs::create_dir_all(dir.join("third_party/grok-build")).unwrap();
+        std::fs::write(dir.join("crates/lib.rs"), "fn vendor_mark_alpha() {}\n").unwrap();
+        std::fs::write(
+            dir.join("third_party/grok-build/lib.rs"),
+            "fn vendor_mark_alpha() {}\n",
+        )
+        .unwrap();
+        let t = grep_files(
+            &ws,
+            &ToolCall {
+                id: "t1".into(),
+                name: "Grep".into(),
+                arguments: json!({"pattern": "vendor_mark_alpha"}),
+            },
+            ToolLimits::default(),
+            None,
+        )
+        .joined_text();
+        assert!(t.contains("crates/lib.rs"), "{t}");
+        assert!(
+            !t.contains("third_party"),
+            "rg must not dump vendored clones: {t}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }

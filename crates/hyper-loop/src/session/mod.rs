@@ -4,6 +4,7 @@ pub mod catalog;
 mod compact;
 mod derive;
 mod event;
+mod history;
 mod index;
 mod log;
 mod recall;
@@ -17,10 +18,14 @@ pub use compact::{
 };
 pub use derive::{derive_messages, live_policy};
 pub use event::{
-    policy_for_effort, AssistantEvent, CompactEvent, DeltaChannel, DeltaEvent, ForkEvent,
-    OpenAiFunction, OpenAiToolCall, PolicyEvent, PolicyReason, SessionEvent, SessionMode,
-    SessionStart, StopEvent, StoredMedia, SubagentEvent, ToolEvent, UndoEvent, UserEvent,
+    policy_for_effort, AssistantEvent, CompactEvent, ContextEvent, DeltaChannel, DeltaEvent,
+    ForkEvent, OpenAiFunction, OpenAiToolCall, PolicyEvent, PolicyReason, RunLifecycleEvent,
+    RunPhase, SessionEvent, SessionMode, SessionStart, StepLifecycleEvent, StepPhase, StopEvent,
+    StoredMedia, SubagentEvent, ToolEvent, ToolLifecycleEvent, ToolLifecyclePhase, UndoEvent,
+    UserEvent,
 };
+pub use history::card as history_card;
+pub(crate) use history::is_probe_session;
 pub use index::{HistoryIndex, Hit};
 pub use log::SessionLog;
 pub use recall::run as run_recall;
@@ -84,7 +89,9 @@ mod tests {
 
         let msgs = derive_messages(log.events());
         assert_eq!(msgs[0].role, "system");
-        assert_eq!(msgs[0].content.as_deref(), Some("sys-a"));
+        let sys = msgs[0].content.as_deref().unwrap_or("");
+        assert!(sys.contains("sys-a"), "{sys}");
+        assert!(sys.contains("do not take a name, voice, or role"), "{sys}");
         assert_eq!(
             msgs.iter().filter(|m| m.role == "system").count(),
             1,
@@ -234,6 +241,82 @@ mod tests {
     }
 
     #[test]
+    fn derive_stubs_live_workset_on_resume() {
+        let dir = tmp_dir();
+        let mut log =
+            SessionLog::create_in(&dir, start("s-ws", SessionMode::Agent, "sys")).unwrap();
+        log.append(SessionEvent::user("hi")).unwrap();
+        log.append(SessionEvent::context(
+            "runtime",
+            "[workset]\ngit:\n## main\n M crates/hyper-loop/src/agent/mod.rs",
+        ))
+        .unwrap();
+        log.append(SessionEvent::assistant("ok", "", None)).unwrap();
+        let raw = fs::read_to_string(log.path()).unwrap();
+        assert!(
+            raw.contains("crates/hyper-loop/src/agent/mod.rs"),
+            "JSONL stays append-only: {raw}"
+        );
+        let msgs = derive_messages(log.events());
+        let workset: Vec<_> = msgs
+            .iter()
+            .filter(|m| m.role == "user")
+            .filter_map(|m| m.content.as_deref())
+            .filter(|c| c.contains("[workset]"))
+            .collect();
+        assert_eq!(workset.len(), 1, "{workset:?}");
+        assert!(
+            workset[0].contains("[workset] applied"),
+            "cold resume must stub the live card: {:?}",
+            workset[0]
+        );
+        assert!(
+            !workset[0].contains("git:"),
+            "stale snapshot must not reach resume: {:?}",
+            workset[0]
+        );
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn derive_stubs_live_history_on_resume() {
+        let dir = tmp_dir();
+        let mut log =
+            SessionLog::create_in(&dir, start("s-hist", SessionMode::Agent, "sys")).unwrap();
+        log.append(SessionEvent::user("hi")).unwrap();
+        log.append(SessionEvent::context(
+            "runtime",
+            "[history]\nfeishu · 审计\n  Shell 不是沙箱",
+        ))
+        .unwrap();
+        log.append(SessionEvent::assistant("ok", "", None)).unwrap();
+        let raw = fs::read_to_string(log.path()).unwrap();
+        assert!(
+            raw.contains("Shell 不是沙箱"),
+            "JSONL stays append-only: {raw}"
+        );
+        let msgs = derive_messages(log.events());
+        let hist: Vec<_> = msgs
+            .iter()
+            .filter(|m| m.role == "user")
+            .filter_map(|m| m.content.as_deref())
+            .filter(|c| c.contains("[history]"))
+            .collect();
+        assert_eq!(hist.len(), 1, "{hist:?}");
+        assert!(
+            hist[0].contains("[history] applied"),
+            "cold resume must stub the live card: {:?}",
+            hist[0]
+        );
+        assert!(
+            !hist[0].contains("Shell 不是沙箱"),
+            "stale snapshot must not reach resume: {:?}",
+            hist[0]
+        );
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
     fn policy_event_does_not_create_a_second_session_start() {
         let dir = tmp_dir();
         let mut log = SessionLog::create_in(&dir, start("s2", SessionMode::Agent, "sys")).unwrap();
@@ -263,6 +346,21 @@ mod tests {
         assert!(log
             .append(SessionEvent::Start(start("nope", SessionMode::Chat, "x")))
             .is_err());
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn set_workspace_rewrites_jsonl_start_and_survives_reopen() {
+        let dir = tmp_dir();
+        let mut log =
+            SessionLog::create_in(&dir, start("s-ws", SessionMode::Agent, "sys")).unwrap();
+        log.append(SessionEvent::user("hi")).unwrap();
+        log.set_workspace("/tmp/grok-hyper").unwrap();
+        assert_eq!(log.start().unwrap().workspace, "/tmp/grok-hyper");
+
+        let reopened = SessionLog::open_in(&dir, "s-ws").unwrap();
+        assert_eq!(reopened.start().unwrap().workspace, "/tmp/grok-hyper");
+        assert_eq!(reopened.events().len(), log.events().len());
         let _ = fs::remove_dir_all(dir);
     }
 

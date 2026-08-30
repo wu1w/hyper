@@ -118,6 +118,7 @@ async fn run_once(
                                 let client_secret = client_secret.to_string();
                                 tokio::spawn(async move {
                                     if let Some(mut env) = native_from_chatbot(&ep, &data) {
+                                        super::stamp_endpoint(&mut env, &ep);
                                         enrich_dingtalk(
                                             &http,
                                             &client_id,
@@ -487,7 +488,7 @@ pub async fn send(
         return Err(Error::msg("dingtalk send: missing session_webhook"));
     };
     let http = crate::llm_http::env_aware_client(15, &url)?;
-    let spoken = super::xfer::spoken_text(parts);
+    let spoken = super::im_md::markdown_pretty(&super::xfer::spoken_text(parts));
     let mut notes = Vec::new();
     let mut image_urls = Vec::new();
     for part in parts {

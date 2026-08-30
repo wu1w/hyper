@@ -19,8 +19,17 @@ import {
   type SubagentSnap,
   type Uploaded,
 } from "./api";
-import { isPrepareHint, stripLeakedToolMarkup, stripThinkRestatement } from "./chat-live";
-import { isJunkPath, lastLiveUserIndex, mergeArtifactLists, siblingStamp, turnArtifacts, turnPreviewPaths, turnTouchedPaths } from "./artifacts";
+import {
+  editDiffFromTool,
+  runPhase,
+  stripLeakedToolMarkup,
+  stripThinkRestatement,
+  thinkOverlayLive,
+  type EditDiffView,
+  type RunPhase,
+} from "./chat-live";
+import { isJunkPath, lastLiveUserIndex, mergeArtifactLists, siblingStamp, turnArtifacts, turnEditedPaths, turnPreviewPaths, turnTouchedPaths } from "./artifacts";
+import { parseTreeEntry, WorkspaceTree, type TreeEntry } from "./tree";
 import { isOfficeKind, kindFor } from "./preview/kinds";
 import { PreviewDock } from "./preview/PreviewDock";
 import { MdText } from "./md";
@@ -41,25 +50,15 @@ import {
   type StoredMedia,
 } from "./media";
 
+export type { RunPhase };
+export { runPhase };
+
 /** IME confirm (Enter / 选词) must not send the message. keyCode 229 is the composition sentinel. */
 function imeBusy(e: { nativeEvent: { isComposing?: boolean }; isComposing?: boolean; keyCode: number }) {
   return e.isComposing === true || e.nativeEvent.isComposing === true || e.keyCode === 229;
 }
 
-type FileHit = { path: string; name: string; dir: boolean };
-
-function parseTreeEntry(raw: unknown): FileHit | null {
-  if (!raw || typeof raw !== "object") return null;
-  const o = raw as Record<string, unknown>;
-  const path = String(o.path ?? o.relative_path ?? o.rel ?? "")
-    .replace(/\\/g, "/")
-    .replace(/^\/+/, "");
-  const name = String(o.name ?? o.file_name ?? o.filename ?? path.split("/").pop() ?? "");
-  const dir = o.dir === true || o.is_dir === true || o.isDir === true || o.directory === true;
-  const p = path || name;
-  if (!p) return null;
-  return { path: p, name: name || p.split("/").pop() || p, dir };
-}
+type FileHit = TreeEntry;
 
 function fuzzyScore(query: string, text: string): number | null {
   const q = query.toLowerCase();
@@ -118,6 +117,12 @@ function attachPayload(raw: string, atts: Uploaded[]) {
   let prompt = raw;
   if (notes.length) prompt = `${prompt ? prompt + "\n\n" : ""}${notes.map((p) => `[attached: ${p}]`).join("\n")}`;
   return { prompt: prompt || " ", content_parts: parts };
+}
+
+function editorPayload(previewPath: string) {
+  const path = previewPath.trim().replace(/^\/+/, "");
+  if (!path) return { files: [] as { path: string }[] };
+  return { active: path, files: [{ path }] };
 }
 
 function insertAtCaret(current: string, insert: string, start: number, end: number): { next: string; caret: number } {
@@ -370,32 +375,6 @@ function livePromptTokens(events: SessionEvent[], snap?: Snap): number {
 function compactCount(events: SessionEvent[], snap?: Snap): number {
   const n = events.filter((e) => e.type === "session/compact").length;
   return n || usageCompacts(snap?.usage);
-}
-
-export type RunPhase = "idle" | "waiting" | "thinking" | "writing" | "tool" | "permit" | "clarify" | "stopping" | "retrying" | "preparing";
-
-export function runPhase(opts: {
-  busy: boolean;
-  aborting?: boolean;
-  live: { think: string; content: string };
-  events: SessionEvent[];
-  permit?: Permit;
-  clarify?: Clarify;
-}): RunPhase {
-  if (opts.clarify) return "clarify";
-  if (opts.permit) return "permit";
-  if (opts.aborting) return "stopping";
-  const liveOn = !!(opts.live.think || opts.live.content);
-  if (!opts.busy && !liveOn) return "idle";
-  if (opts.live.content) return "writing";
-  if (opts.live.think.includes("网络不稳") || opts.live.think.includes("正在重连")) return "retrying";
-  if (isPrepareHint(opts.live.think)) return "preparing";
-  if (opts.live.think) return "thinking";
-  const last = opts.events[opts.events.length - 1];
-  if (last?.type === "tool") return "tool";
-  if (last?.type === "assistant" && (last.tool_calls?.length ?? 0) > 0) return "tool";
-  if (opts.busy) return "waiting";
-  return "idle";
 }
 
 export const PHASE_LABEL: Record<RunPhase, string> = {
@@ -787,7 +766,7 @@ export function ChatPage({
   const [openSteps, setOpenSteps] = useState<Set<string>>(() => new Set());
   const [previewPath, setPreviewPath] = useState("");
   const [previewMax, setPreviewMax] = useState(false);
-  const [detailsTab, setDetailsTab] = useState<"preview" | "arts" | "session" | "agent">("session");
+  const [detailsTab, setDetailsTab] = useState<"workspace" | "preview" | "arts" | "session" | "agent">("workspace");
   const [openAgent, setOpenAgent] = useState<{
     id: string;
     label: string;
@@ -796,6 +775,8 @@ export function ChatPage({
     detail?: string;
   } | null>(null);
   const [railWidth, setRailWidth] = useState(520);
+  const [treeEntries, setTreeEntries] = useState<TreeEntry[]>([]);
+  const [wsApplying, setWsApplying] = useState(false);
   const lastArtRef = useRef("");
   const outBaseRef = useRef<Map<string, string>>(new Map());
   const [diskOut, setDiskOut] = useState<string[]>([]);
@@ -1092,6 +1073,26 @@ export function ChatPage({
     });
   };
 
+  useEffect(() => {
+    treeHold.current = undefined;
+  }, [snap.workspace]);
+  useEffect(() => {
+    let gone = false;
+    (async () => {
+      try {
+        const j = await api<{ ok?: boolean; entries?: unknown[] }>("/tree");
+        if (gone) return;
+        const rows = Array.isArray(j.entries) ? j.entries : [];
+        setTreeEntries(rows.map(parseTreeEntry).filter((x): x is TreeEntry => !!x));
+      } catch {
+        if (!gone) setTreeEntries([]);
+      }
+    })();
+    return () => {
+      gone = true;
+    };
+  }, [snap.workspace, busy]);
+
   const ensureTree = async (): Promise<FileHit[] | null> => {
     if (treeHold.current === false) return null;
     if (Array.isArray(treeHold.current)) return treeHold.current;
@@ -1211,9 +1212,10 @@ export function ChatPage({
       setErr("生图需要文字描述");
       return;
     }
-    onTurnBegin?.();
+    const busyPolicy = snap.busy || "steer";
+    if (!busy || busyPolicy === "interrupt") onTurnBegin?.();
     try {
-      await rpc("turn.start", { prompt, content_parts });
+      await rpc("turn.start", { prompt, content_parts, editor: editorPayload(previewPath) });
       setText("");
       setAtts([]);
       setSlash([]);
@@ -1268,11 +1270,13 @@ export function ChatPage({
 
   const eventArts = useMemo(() => turnArtifacts(events, snap.workspace), [events, snap.workspace]);
   const arts = useMemo(() => mergeArtifactLists(diskOut, eventArts), [diskOut, eventArts]);
+  const edited = useMemo(() => turnEditedPaths(events, snap.workspace), [events, snap.workspace]);
   const previewList = useMemo(() => {
     const products = arts;
     if (products.length) return products;
+    if (edited.length) return edited;
     return turnPreviewPaths(events, snap.workspace);
-  }, [arts, events, snap.workspace]);
+  }, [arts, edited, events, snap.workspace]);
   const touched = useMemo(() => turnTouchedPaths(events, snap.workspace), [events, snap.workspace]);
   const liveUser = useMemo(() => lastLiveUserIndex(events), [events]);
   const dockRev = useMemo(() => siblingStamp(previewPath, touched), [previewPath, touched]);
@@ -1380,7 +1384,7 @@ export function ChatPage({
   const hit = usageCachedReported(usage) && hitPct != null ? `${hitPct.toFixed(1)}%` : "n/a";
   const queued = snap.queued ?? 0;
   const steered = snap.steered ?? 0;
-  const policy = snap.busy || "interrupt";
+  const policy = snap.busy || "steer";
   const phase = runPhase({ busy, aborting, live, events, permit, clarify });
   const waitPrefix =
     phase === "waiting" ? usageLivePrompt(usage) : 0;
@@ -1397,16 +1401,32 @@ export function ChatPage({
   /** 把流式中的思考/正文合并进最后一轮：思考进轨迹块，正文在下方流式生长。 */
   const withLive = (blocks: Block[]): Block[] => {
     let out = blocks;
-    const think = stripThinkRestatement(lastUserText, live.think);
+    const think = busy ? stripThinkRestatement(lastUserText, live.think) : "";
     if (think) {
       const last = out[out.length - 1];
       if (last && last.kind === "activity") {
+        const liveThink = thinkOverlayLive({
+          hasTools: last.steps.some((s) => s.kind === "tool"),
+          hasContent: Boolean(live.content),
+        });
         out = [
           ...out.slice(0, -1),
-          { kind: "activity", steps: pushThink(last.steps, think, !live.content) },
+          { kind: "activity", steps: pushThink(last.steps, think, liveThink) },
         ];
       } else {
-        out = [...out, { kind: "activity", steps: [{ kind: "think", text: think, live: !live.content }] }];
+        out = [
+          ...out,
+          {
+            kind: "activity",
+            steps: [
+              {
+                kind: "think",
+                text: think,
+                live: thinkOverlayLive({ hasTools: false, hasContent: Boolean(live.content) }),
+              },
+            ],
+          },
+        ];
       }
     }
     if (live.content) {
@@ -1438,6 +1458,51 @@ export function ChatPage({
       await onReload();
     } catch (e) {
       setErr(failMsg(e));
+    }
+  };
+
+  const applyWorkspacePath = async (path: string) => {
+    const p = path.trim();
+    if (!p) return;
+    setErr("");
+    setWsApplying(true);
+    try {
+      await api<{ ok?: boolean; workspace?: string }>("/workspace", {
+        method: "POST",
+        body: JSON.stringify({ path: p }),
+      });
+      await onReload();
+    } catch (e) {
+      setErr(failMsg(e));
+    } finally {
+      setWsApplying(false);
+    }
+  };
+
+  const pickWorkspace = async () => {
+    setErr("");
+    setWsApplying(true);
+    try {
+      const desktopPick = window.grokHyperDesktop?.pickFolder;
+      if (desktopPick) {
+        try {
+          const r = await desktopPick();
+          if (r?.cancelled || !r?.path) return;
+          await applyWorkspacePath(r.path);
+          return;
+        } catch {
+          /* sidecar picker below */
+        }
+      }
+      const j = await api<{ ok?: boolean; cancelled?: boolean; workspace?: string }>("/workspace/pick", {
+        method: "POST",
+      });
+      if (j.cancelled) return;
+      await onReload();
+    } catch (e) {
+      setErr(failMsg(e));
+    } finally {
+      setWsApplying(false);
     }
   };
 
@@ -1501,7 +1566,7 @@ export function ChatPage({
         const { prompt, content_parts } = attachPayload(raw, atts);
         onTurnBegin?.();
         try {
-          await rpc("turn.start", { prompt, content_parts });
+          await rpc("turn.start", { prompt, content_parts, editor: editorPayload(previewPath) });
         } catch (e) {
           onTurnFailed?.();
           throw e;
@@ -1569,18 +1634,17 @@ export function ChatPage({
     : policy === "queue"
       ? "本轮结束后会跑这段话…"
       : policy === "steer"
-        ? "下一次工具结果后注入这段引导…"
+        ? "下一个安全工具边界会吸收这段引导…"
         : "发送将打断当前轮次并改跑这段话…";
   const policyHint =
     policy === "queue"
       ? "忙碌策略 queue：Enter 排到本轮之后"
       : policy === "steer"
-        ? "忙碌策略 steer：Enter 在下一次工具后注入"
+        ? "忙碌策略 steer：Enter 在下一个安全工具边界注入"
         : "忙碌策略 interrupt：Enter 打断本轮";
 
   return (
-    <div
-      className={`page chat-page${previewMax ? " pv-maxed" : ""}`}
+      <div className={`page chat-page${previewMax ? " pv-maxed" : ""}`}
       onClick={(e) => {
         const t = e.target;
         if (!(t instanceof HTMLElement)) return;
@@ -1603,7 +1667,7 @@ export function ChatPage({
         e.preventDefault();
         void attachClipboard(e.clipboardData);
       }}
-    >
+      >
       <div className="chat-col">
         <div className="chat-top">
           <div className="chat-who">
@@ -1612,6 +1676,22 @@ export function ChatPage({
           </div>
           <span className="chip mono hide-narrow" title="会话模式，/mode 切换">{snap.mode || "agent"}</span>
           <span className="spacer" />
+          <button
+            type="button"
+            className={`icon-btn${detailsOpen && detailsTab === "workspace" ? " on" : ""}`}
+            title={detailsOpen && detailsTab === "workspace" ? "收起工作区" : "打开工作区"}
+            aria-label="工作区"
+            aria-pressed={detailsOpen && detailsTab === "workspace"}
+            onClick={() => {
+              if (detailsOpen && detailsTab === "workspace") onToggleDetails();
+              else {
+                setDetailsTab("workspace");
+                if (!detailsOpen) onToggleDetails();
+              }
+            }}
+          >
+            <Icon name="folder" />
+          </button>
           <button className="btn ghost small" title="浏览与恢复历史会话" onClick={() => setHistOpen(true)}>
             <Icon name="clock" />
             历史
@@ -1634,7 +1714,7 @@ export function ChatPage({
         <div className="thread" ref={logRef} onScroll={updateJump}>
           <div className="thread-inner">
             {turns.length === 0 && !busy && !live.content && !live.think ? (
-              <Empty title="开始对话" body="在下方输入。Enter 发送。需要选择题时打开 AskQuestion。文稿和下载在「文件」页。" />
+              <Empty title="开始对话" body="在下方输入。Enter 发送。右侧「工作区」是文件树；改过的文件会在「预览」里打开。" />
             ) : null}
             {todos.length ? <TodoBoard items={todos} /> : null}
             {turns.map((t, ti) => {
@@ -1744,7 +1824,7 @@ export function ChatPage({
                     className="btn ghost small"
                     onClick={steer}
                     disabled={(!draft && atts.length === 0) || aborting}
-                    title="下一次工具结果后注入输入框内容"
+                    title="在下一个尚未启动的工具前或工具结果后注入输入框内容"
                   >
                     <Icon name="steer" />
                     转向
@@ -1913,10 +1993,12 @@ export function ChatPage({
                   imeLock.current = true;
                 }}
                 onCompositionEnd={() => {
-                  // Some engines fire compositionend, then a leftover Enter in the same frame.
+                  // Some engines fire compositionend, then a leftover Enter next frame.
                   imeLock.current = true;
                   requestAnimationFrame(() => {
-                    imeLock.current = false;
+                    requestAnimationFrame(() => {
+                      imeLock.current = false;
+                    });
                   });
                 }}
                 onPaste={(e) => {
@@ -2086,6 +2168,9 @@ export function ChatPage({
         <div className="dt-head">
           结果区
           <div className="dt-tabs">
+            <button type="button" className={`dt-tab${detailsTab === "workspace" ? " on" : ""}`} onClick={() => setDetailsTab("workspace")}>
+              工作区
+            </button>
             <button type="button" className={`dt-tab${detailsTab === "preview" ? " on" : ""}`} onClick={() => setDetailsTab("preview")}>
               预览
             </button>
@@ -2105,7 +2190,31 @@ export function ChatPage({
             <Icon name="x" />
           </button>
         </div>
-        <div className={`dt-scroll${detailsTab === "agent" ? " agent-fill" : ""}`}>
+        <div className={`dt-scroll${detailsTab === "agent" ? " agent-fill" : ""}${detailsTab === "workspace" ? " tree-fill" : ""}`}>
+          <div className="ex-pane" hidden={detailsTab !== "workspace"}>
+            <div className="ex-root-row">
+              <div className="ex-root ellipsis" title={snap.workspace || ""}>
+                {snap.workspace || "未选择工作区"}
+              </div>
+              <button
+                type="button"
+                className="btn ghost small"
+                disabled={wsApplying}
+                title="更换当前会话的工作区。会写入本会话 JSONL，重启后仍在这个目录。"
+                onClick={() => void pickWorkspace()}
+              >
+                {wsApplying ? "打开中…" : "更换"}
+              </button>
+            </div>
+            <div className="ex-scroll">
+              <WorkspaceTree
+                entries={treeEntries}
+                selected={previewPath}
+                dirty={edited}
+                onOpenFile={openPreview}
+              />
+            </div>
+          </div>
           {detailsTab === "agent" && openAgent ? (
             <AgentDock
               id={openAgent.id}
@@ -2134,7 +2243,7 @@ export function ChatPage({
                 }}
               />
             ) : (
-              <div className="sub">本轮还没有打开的文件。点产物或聊天里的附件即可预览。</div>
+              <div className="sub">本轮还没有打开的文件。点「工作区」里的文件，或聊天里的附件即可预览。</div>
             )
           ) : null}
           {detailsTab === "arts" || detailsTab === "preview" ? (
@@ -2179,6 +2288,7 @@ export function ChatPage({
             <div className="kv"><span>AskQuestion</span><b>{snap.clarify_mode ? "on" : "off"}</b></div>
             <div className="kv"><span>生成图片</span><b>{snap.imagine_mode ? "on" : "off"}</b></div>
             <div className="kv"><span>忙碌策略</span><b>{snap.busy || "—"}</b></div>
+            <div className="kv"><span>思考力度</span><b>{snap.effort || "—"}{snap.effort_locked ? " · 锁定" : ""}</b></div>
             <div className="kv"><span>运行</span><b>{busy ? PHASE_LABEL[phase] : "空闲"}</b></div>
             <div className="kv"><span>排队</span><b>{queued}</b></div>
             <div className="kv"><span>转向</span><b>{steered}</b></div>
@@ -3017,6 +3127,38 @@ function fmtArgs(raw: string): string {
   }
 }
 
+function toolFilePath(name: string, args: string): string {
+  const n = toolKey(name);
+  if (!["read", "view", "write", "edit", "strreplace", "delete"].includes(n)) return "";
+  const a = parseJsonObj(args);
+  return typeof a?.path === "string" ? a.path : "";
+}
+
+function EditDiff({ view, onOpenPath }: { view: EditDiffView; onOpenPath?: (path: string) => void }) {
+  return (
+    <div className="edit-diff" role="region" aria-label={view.path ? `${view.path} diff` : "file diff"}>
+      {view.path ? (
+        <button
+          type="button"
+          className="edit-diff-path"
+          disabled={!onOpenPath}
+          onClick={() => onOpenPath?.(view.path)}
+        >
+          {view.path}
+        </button>
+      ) : null}
+      {view.lines.map((ln, i) => (
+        <div key={i} className={`edit-diff-line ${ln.kind}`}>
+          <span className="edit-diff-gutter" aria-hidden="true">
+            {ln.kind === "add" ? "+" : ln.kind === "del" ? "-" : " "}
+          </span>
+          <span className="edit-diff-text">{ln.text === "" ? "\u00a0" : ln.text}</span>
+        </div>
+      ))}
+    </div>
+  );
+}
+
 function StepRow({
   step,
   sk,
@@ -3036,7 +3178,7 @@ function StepRow({
 }) {
   if (step.kind === "think") {
     return (
-      <div className="step think">
+      <div className={`step think${step.live ? "" : " think-done"}`}>
         <button type="button" className="step-head" onClick={() => onToggle(sk)} aria-expanded={open}>
           <Icon name="spark" />
           <span className="step-name">思考</span>
@@ -3100,19 +3242,38 @@ function StepRow({
       ? parseTodos(step.args)
       : parseTodos(step.output || "")
     : [];
+  const edit = editDiffFromTool(step.name, step.args);
+  const filePath = toolFilePath(step.name, step.args);
   return (
     <div className="step tool">
-      <button type="button" className="step-head" onClick={() => onToggle(sk)} aria-expanded={open}>
-        <Icon name={toolIcon(step.name)} />
-        <span className="step-name mono">{toolLabel(step.name)}</span>
-        <span className="step-prev">{argPreview(step.name, step.args) || clipEnd(firstLine(step.output || ""), 80)}</span>
-        <span className={`st-dot ${st}`} />
-      </button>
+      <div className="step-bar">
+        <button type="button" className="step-head" onClick={() => onToggle(sk)} aria-expanded={open}>
+          <Icon name={toolIcon(step.name)} />
+          <span className="step-name mono">{toolLabel(step.name)}</span>
+          <span className="step-prev">{filePath || argPreview(step.name, step.args) || clipEnd(firstLine(step.output || ""), 80)}</span>
+          <span className={`st-dot ${st}`} />
+        </button>
+        {filePath && onOpenPreview ? (
+          <button
+            type="button"
+            className="icon-btn step-open"
+            title={`打开 ${filePath}`}
+            aria-label={`打开 ${filePath}`}
+            onClick={() => onOpenPreview(filePath)}
+          >
+            <Icon name="file" />
+          </button>
+        ) : null}
+      </div>
       {open ? (
         <div className="step-full">
           {todoItems.length ? <TodoBoard items={todoItems} /> : null}
           {step.media?.length ? <MediaStrip items={step.media} onOpen={onOpenPreview} /> : null}
-          {step.args ? <pre className="pre step-pre">{fmtArgs(step.args)}</pre> : null}
+          {edit ? (
+            <EditDiff view={edit} onOpenPath={onOpenPreview} />
+          ) : step.args ? (
+            <pre className="pre step-pre">{fmtArgs(step.args)}</pre>
+          ) : null}
           {step.done ? (
             step.output ? (
               <pre className="pre step-pre">{step.output}</pre>

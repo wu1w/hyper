@@ -1,9 +1,10 @@
 //! WeChat iLink Bot long-poll. Thin wash of QwenPaw `wechat/client.py` +
 //! Hermes `weixin.py`: HTTP `getupdates` inbound, `sendmessage` outbound.
 
-use std::collections::{HashSet, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::PathBuf;
-use std::time::Duration;
+use std::sync::{Mutex as StdMutex, OnceLock};
+use std::time::{Duration, Instant};
 
 use base64::engine::general_purpose::STANDARD;
 use base64::Engine;
@@ -23,6 +24,9 @@ const DEDUP_CAP: usize = 512;
 const TEXT_CLIP: usize = 4000;
 const BACKOFF_MIN_SECS: u64 = 5;
 const BACKOFF_MAX_SECS: u64 = 120;
+const TYPING_STATUS_START: i64 = 1;
+const TYPING_TICKET_TTL: Duration = Duration::from_secs(10 * 60);
+const TYPING_TICKET_FAIL_BACKOFF: Duration = Duration::from_secs(20);
 
 pub fn exclusive_poll_hint() -> &'static str {
     "exclusive iLink long-poll; do not share this bot_token with Hermes weixin or another getupdates client"
@@ -89,7 +93,10 @@ pub async fn send(
     let context_token = meta_str(env, "context_token");
     let http = crate::llm_http::env_aware_client(30, &base)?;
     let mut items: Vec<Value> = Vec::new();
-    let text = clip(&super::xfer::spoken_text(parts), TEXT_CLIP);
+    let text = clip(
+        &super::im_md::separated_plain(&super::xfer::spoken_text(parts)),
+        TEXT_CLIP,
+    );
     if !text.trim().is_empty() {
         items.push(json!({"type": 1, "text_item": {"text": text}}));
     }
@@ -128,6 +135,148 @@ pub async fn send(
         )));
     }
     Ok(())
+}
+
+fn typing_user_id(env: &NativePayload) -> String {
+    let from = env.sender_id.trim();
+    if !from.is_empty() {
+        return from.to_string();
+    }
+    env.chat_id()
+}
+
+fn typing_ok(env: &NativePayload) -> bool {
+    !typing_user_id(env).is_empty()
+}
+
+fn typing_config_body(user_id: &str, context_token: &str) -> Value {
+    let mut body = json!({
+        "ilink_user_id": user_id,
+        "base_info": {"channel_version": CHANNEL_VERSION},
+    });
+    if !context_token.is_empty() {
+        body["context_token"] = json!(context_token);
+    }
+    body
+}
+
+fn typing_send_body(user_id: &str, ticket: &str, status: i64) -> Value {
+    json!({
+        "ilink_user_id": user_id,
+        "typing_ticket": ticket,
+        "status": status,
+        "base_info": {"channel_version": CHANNEL_VERSION},
+    })
+}
+
+fn parse_typing_ticket(data: &Value) -> Option<String> {
+    let t = js_str(&data["typing_ticket"]);
+    if t.is_empty() {
+        None
+    } else {
+        Some(t)
+    }
+}
+
+enum TicketEntry {
+    Ok { ticket: String, until: Instant },
+    Fail { until: Instant },
+}
+
+fn ticket_cache() -> &'static StdMutex<HashMap<String, TicketEntry>> {
+    static C: OnceLock<StdMutex<HashMap<String, TicketEntry>>> = OnceLock::new();
+    C.get_or_init(|| StdMutex::new(HashMap::new()))
+}
+
+fn cached_ticket(user: &str) -> Option<String> {
+    let now = Instant::now();
+    let Ok(g) = ticket_cache().lock() else {
+        return None;
+    };
+    match g.get(user) {
+        Some(TicketEntry::Ok { ticket, until }) if *until > now => Some(ticket.clone()),
+        _ => None,
+    }
+}
+
+fn ticket_blocked(user: &str) -> bool {
+    let now = Instant::now();
+    let Ok(g) = ticket_cache().lock() else {
+        return false;
+    };
+    matches!(g.get(user), Some(TicketEntry::Fail { until }) if *until > now)
+}
+
+fn store_ticket(user: &str, ticket: String) {
+    let Ok(mut g) = ticket_cache().lock() else {
+        return;
+    };
+    g.insert(
+        user.to_string(),
+        TicketEntry::Ok {
+            ticket,
+            until: Instant::now() + TYPING_TICKET_TTL,
+        },
+    );
+}
+
+fn store_ticket_fail(user: &str) {
+    let Ok(mut g) = ticket_cache().lock() else {
+        return;
+    };
+    g.insert(
+        user.to_string(),
+        TicketEntry::Fail {
+            until: Instant::now() + TYPING_TICKET_FAIL_BACKOFF,
+        },
+    );
+}
+
+/// iLink `sendtyping`. Failures are silent. Ticket cached ~10 minutes per user.
+pub(crate) async fn send_typing(ep: Option<&ChannelEndpoint>, env: &NativePayload) {
+    if !typing_ok(env) {
+        return;
+    }
+    let Some(ep) = ep else {
+        return;
+    };
+    let Some((token, base)) = credentials(ep) else {
+        return;
+    };
+    let user = typing_user_id(env);
+    if ticket_blocked(&user) {
+        return;
+    }
+    let ctx = meta_str(env, "context_token");
+    let Ok(http) = crate::llm_http::env_aware_client(8, &base) else {
+        return;
+    };
+    let ticket = if let Some(t) = cached_ticket(&user) {
+        t
+    } else {
+        let url = format!("{base}/ilink/bot/getconfig");
+        let data = match post_json(&http, &url, &token, &typing_config_body(&user, &ctx)).await {
+            Ok(d) => d,
+            Err(_) => {
+                store_ticket_fail(&user);
+                return;
+            }
+        };
+        let Some(t) = parse_typing_ticket(&data) else {
+            store_ticket_fail(&user);
+            return;
+        };
+        store_ticket(&user, t.clone());
+        t
+    };
+    let url = format!("{base}/ilink/bot/sendtyping");
+    let _ = post_json(
+        &http,
+        &url,
+        &token,
+        &typing_send_body(&user, &ticket, TYPING_STATUS_START),
+    )
+    .await;
 }
 
 async fn send_cdn_item(
@@ -201,6 +350,7 @@ async fn poll_once(
         let Some(mut env) = native_from_msg(ep, msg) else {
             continue;
         };
+        super::stamp_endpoint(&mut env, ep);
         env.content_parts = live_parts(http, &msg["item_list"]).await;
         env.text = NativePayload {
             content_parts: env.content_parts.clone(),
@@ -729,5 +879,38 @@ mod tests {
     #[test]
     fn exclusive_hint_mentions_hermes() {
         assert!(exclusive_poll_hint().contains("Hermes weixin"));
+    }
+
+    #[test]
+    fn typing_ok_needs_user() {
+        let mut env = NativePayload::default();
+        env.channel = "wechat".into();
+        assert!(!typing_ok(&env));
+        env.sender_id = "u1".into();
+        assert!(typing_ok(&env));
+        assert_eq!(typing_user_id(&env), "u1");
+    }
+
+    #[test]
+    fn typing_bodies_match_ilink() {
+        let cfg = typing_config_body("u1", "ct");
+        assert_eq!(cfg["ilink_user_id"], json!("u1"));
+        assert_eq!(cfg["context_token"], json!("ct"));
+        assert_eq!(cfg["base_info"]["channel_version"], json!(CHANNEL_VERSION));
+        let empty_ctx = typing_config_body("u1", "");
+        assert!(empty_ctx.get("context_token").is_none());
+        let send = typing_send_body("u1", "ticket-1", TYPING_STATUS_START);
+        assert_eq!(send["typing_ticket"], json!("ticket-1"));
+        assert_eq!(send["status"], json!(1));
+    }
+
+    #[test]
+    fn parse_typing_ticket_reads_getconfig() {
+        assert_eq!(
+            parse_typing_ticket(&json!({"ret": 0, "typing_ticket": "abc"})).as_deref(),
+            Some("abc")
+        );
+        assert!(parse_typing_ticket(&json!({"ret": 0, "typing_ticket": ""})).is_none());
+        assert!(parse_typing_ticket(&json!({"ret": 1})).is_none());
     }
 }

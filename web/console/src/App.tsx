@@ -1,6 +1,6 @@
 import { useEffect, useRef, useState, type ReactNode } from "react";
 import { api, connectEvents, rpc, type Clarify, type Permit, type SessionEvent, type Snap } from "./api";
-import { applyHistoryIncoming, CONNECT_HINT, nextLive, preferFresherHistory } from "./chat-live";
+import { applyHistoryIncoming, PREPARE_HINT, isPrepareHint, nextLive, preferFresherHistory, runPhase } from "./chat-live";
 
 type LiveBuf = { think: string; content: string };
 type Transcript = { events: SessionEvent[]; live: LiveBuf };
@@ -22,7 +22,7 @@ function modalForFocus<T extends { session?: string } | null>(item: T, focused?:
   if (!item || !item.session || !focused || item.session === focused) return item;
   return null;
 }
-import { ChatPage, ClarifyModal, PermitModal, RunChip, runPhase } from "./Chat";
+import { ChatPage, ClarifyModal, PermitModal, RunChip } from "./Chat";
 import {
   ChannelsPage,
   CronPage,
@@ -250,7 +250,7 @@ export function App() {
   const beginTurn = () => {
     setPendingTurn(true);
     setLive((l) => {
-      const next = l.think || l.content ? l : { think: CONNECT_HINT, content: "" };
+      const next = l.think || l.content ? l : { think: PREPARE_HINT, content: "" };
       const id = sessionRef.current;
       if (id) {
         const t = transcriptsRef.current[id] || { events: [], live: emptyLive() };
@@ -263,7 +263,7 @@ export function App() {
   const failTurn = () => {
     setPendingTurn(false);
     setLive((l) => {
-      const next = l.think === CONNECT_HINT ? emptyLive() : l;
+      const next = isPrepareHint(l.think) && !l.content ? emptyLive() : l;
       const id = sessionRef.current;
       if (id) {
         const t = transcriptsRef.current[id];
@@ -296,6 +296,27 @@ export function App() {
 
   useEffect(() => {
     let histTimer: number | undefined;
+    let liveRaf = 0;
+    let liveSid = "";
+    const cancelLiveRaf = () => {
+      if (!liveRaf) return;
+      cancelAnimationFrame(liveRaf);
+      liveRaf = 0;
+    };
+    const paintLive = (sid: string) => {
+      const focused = sessionRef.current;
+      if (!sid || !focused || sid !== focused) return;
+      const t = transcriptsRef.current[sid];
+      if (t) setLive(t.live);
+    };
+    const scheduleLive = (sid: string) => {
+      liveSid = sid;
+      if (liveRaf) return;
+      liveRaf = requestAnimationFrame(() => {
+        liveRaf = 0;
+        paintLive(liveSid);
+      });
+    };
     const pullHistory = () => {
       window.clearTimeout(histTimer);
       histTimer = window.setTimeout(() => {
@@ -305,6 +326,7 @@ export function App() {
             const id = sessionRef.current;
             const parked = id ? transcriptsRef.current[id] : undefined;
             const next = preferFresherHistory(parked?.events || incoming, incoming);
+            cancelLiveRaf();
             setEvents(next);
             setLive((l) => {
               const liveNext = nextLive(next, parked?.live || l);
@@ -331,6 +353,7 @@ export function App() {
           if (p.events) setEvents(p.events);
           setPermit(modalForFocus(p.permit ?? null, st.session));
           setClarify(modalForFocus(p.clarify ?? null, st.session));
+          cancelLiveRaf();
           setLive(emptyLive());
           setPendingTurn(false);
           if (st.session) {
@@ -356,6 +379,7 @@ export function App() {
             const incoming = p.events || [];
             const sid = p.session || focused || "";
             if (sid) transcriptsRef.current[sid] = { events: incoming, live: emptyLive() };
+            cancelLiveRaf();
             setEvents(incoming);
             setLive(emptyLive());
             setPendingTurn(false);
@@ -370,6 +394,7 @@ export function App() {
             const liveNext = nextLive(next, keep);
             if (sid) transcriptsRef.current[sid] = { events: next, live: liveNext };
             if (p.session && focused && p.session !== focused) return;
+            cancelLiveRaf();
             setEvents(next);
             setLive(liveNext);
           }
@@ -381,7 +406,7 @@ export function App() {
           if (e.type === "delta") {
             t.live = applyDelta(t.live, e);
             transcriptsRef.current[sid] = t;
-            if (!e.session || !focused || e.session === focused) setLive(t.live);
+            if (!e.session || !focused || e.session === focused) scheduleLive(sid);
             return;
           }
           if (e.type === "assistant") {
@@ -398,7 +423,10 @@ export function App() {
             if (body) t.live = emptyLive();
             transcriptsRef.current[sid] = t;
             if (e.session && focused && e.session !== focused) return;
-            if (body) setLive(emptyLive());
+            if (body) {
+              cancelLiveRaf();
+              setLive(emptyLive());
+            }
             if (!dup) {
               setEvents((xs) => {
                 for (let i = xs.length - 1; i >= 0; i--) {
@@ -412,11 +440,15 @@ export function App() {
             return;
           }
           t.events = [...t.events, e];
+          if (e.type === "stop") t.live = { think: "", content: t.live.content };
           transcriptsRef.current[sid] = t;
           if (e.session && focused && e.session !== focused) return;
-          if (e.type === "stop") setPendingTurn(false);
-          // stop 只收束转盘，不清 live：assistant / history.replace 还没带上正文时
-          // 清掉缓冲会让回复从页面上消失，要切页再回来才看得到。
+          if (e.type === "stop") {
+            setPendingTurn(false);
+            // Keep streamed content until history covers it; drop leftover CoT
+            // so idle turns do not keep a 思考 overlay.
+            setLive((l) => (l.think ? { think: "", content: l.content } : l));
+          }
           setEvents((xs) => [...xs, e]);
         } else if (msg.method === "permit.ask") {
           const p = msg.params as Permit;
@@ -439,6 +471,7 @@ export function App() {
       (up) => setWsUp(up),
     );
     return () => {
+      cancelLiveRaf();
       window.clearTimeout(histTimer);
       stop();
     };

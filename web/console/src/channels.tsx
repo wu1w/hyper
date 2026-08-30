@@ -26,8 +26,9 @@ const GROUP_POLICY = [
 ];
 
 function policyName(kind: "dm" | "group", id?: string) {
+  const fallback = kind === "dm" ? "allowlist" : "mention";
   const rows = kind === "dm" ? DM_POLICY : GROUP_POLICY;
-  return rows.find((r) => r.id === (id || "open"))?.label || id || "开放";
+  return rows.find((r) => r.id === (id || fallback))?.label || id || (kind === "dm" ? "白名单" : "需提及");
 }
 
 function matchLine(e: ChannelEp) {
@@ -71,9 +72,9 @@ function toChannelPayload(eps: ChannelEp[]) {
       enabled: !!e.enabled,
       bind: e.bind || "",
       reply_url: e.reply_url || "",
-      require_mention: !!e.require_mention,
-      dm_policy: e.dm_policy || "open",
-      group_policy: e.group_policy || "open",
+      require_mention: e.require_mention !== false,
+      dm_policy: e.dm_policy || "allowlist",
+      group_policy: e.group_policy || "mention",
       allow_from: e.allow_from || [],
       deny_from: e.deny_from || [],
       secret: e.secret || "",
@@ -279,7 +280,7 @@ function QrBind({
 }
 
 export function ChannelsPage({ active = true }: { active?: boolean }) {
-  const [busy, setBusy] = useState("interrupt");
+  const [busy, setBusy] = useState("steer");
   const [eps, setEps] = useState<ChannelEp[]>([]);
   const [catalog, setCatalog] = useState<ChannelKind[]>([]);
   const [sel, setSel] = useState(0);
@@ -337,12 +338,14 @@ export function ChannelsPage({ active = true }: { active?: boolean }) {
         return;
       }
     }
+    const im = kind !== "webhook";
     const row: ChannelEp = {
       id: nextEpId(eps, kind),
       kind,
       enabled: false,
-      dm_policy: "open",
-      group_policy: "open",
+      require_mention: im,
+      dm_policy: im ? "allowlist" : "open",
+      group_policy: im ? "mention" : "open",
       bind: kind === "webhook" ? "127.0.0.1:8788" : "",
       extra: kind === "feishu" ? { domain: "feishu" } : {},
       _local: true,
@@ -701,16 +704,16 @@ export function ChannelsPage({ active = true }: { active?: boolean }) {
               <div className="ch-block">
                 <h4>匹配方式</h4>
                 <p className="sub">
-                  按 sender_id 过滤。deny_from 优先拒绝；白名单非空时，即使策略是「开放」也只放行名单内。
+                  按 sender_id 过滤。默认私信白名单（配对码绑定）、群需 @。deny_from 优先拒绝；白名单非空时，即使策略是「开放」也只放行名单内。
                 </p>
                 <div className="field">
                   <label>私信 dm_policy</label>
-                  <Seg value={cur.dm_policy || "open"} options={DM_POLICY} onChange={(dm_policy) => patch({ dm_policy })} />
+                  <Seg value={cur.dm_policy || "allowlist"} options={DM_POLICY} onChange={(dm_policy) => patch({ dm_policy })} />
                 </div>
                 <div className="field">
                   <label>群聊 group_policy</label>
                   <Seg
-                    value={cur.group_policy || "open"}
+                    value={cur.group_policy || "mention"}
                     options={GROUP_POLICY}
                     onChange={(group_policy) => patch({ group_policy })}
                   />

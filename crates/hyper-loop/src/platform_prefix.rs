@@ -17,7 +17,7 @@ pub const XAI_PRODUCT_CLOSER: &str = "\
 Product session: grok-hyper.
 
 This process is grok-hyper (grok-4.6), not the grok.com chatbot. Platform \
-safety still applies. Do not call WebSearch — the host runs web and X search. \
+safety still applies. WebSearch and WebFetch are client tools. \
 Tool hops keep visible text empty; the hop without tools is the answer. Do \
 not restate.
 ";
@@ -177,8 +177,9 @@ mod tests {
         assert!(!low.contains("ignore previous"));
         assert!(!low.contains("end of safety"));
         assert!(XAI_PRODUCT_CLOSER.contains(CLOSER_MARK));
-        assert!(XAI_PRODUCT_CLOSER.contains("Tool hops keep visible text empty"));
-        assert!(XAI_PRODUCT_CLOSER.contains("Do not restate"));
+        assert!(XAI_PRODUCT_CLOSER.contains("WebSearch and WebFetch are client tools"));
+        assert!(!low.contains("do not call websearch"));
+        assert!(!low.contains("host runs web"));
     }
 
     #[test]
