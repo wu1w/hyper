@@ -566,7 +566,8 @@ async fn im_physics_cap_wraps_with_visible_reply() {
 
 #[tokio::test]
 async fn im_empty_text_hop_wraps_with_visible_reply() {
-    let dir = std::env::temp_dir().join(format!("hyper-im-empty-{}", uuid::Uuid::new_v4().simple()));
+    let dir =
+        std::env::temp_dir().join(format!("hyper-im-empty-{}", uuid::Uuid::new_v4().simple()));
     std::fs::create_dir_all(&dir).unwrap();
     let mut o = opts(&dir);
     o.max_steps = 8;
@@ -587,8 +588,10 @@ async fn im_empty_text_hop_wraps_with_visible_reply() {
 
 #[tokio::test]
 async fn im_empty_after_wrap_emits_explainer() {
-    let dir =
-        std::env::temp_dir().join(format!("hyper-im-explainer-{}", uuid::Uuid::new_v4().simple()));
+    let dir = std::env::temp_dir().join(format!(
+        "hyper-im-explainer-{}",
+        uuid::Uuid::new_v4().simple()
+    ));
     std::fs::create_dir_all(&dir).unwrap();
     let mut o = opts(&dir);
     o.max_steps = 8;
@@ -737,11 +740,7 @@ async fn steer_skips_read_behind_unfinished_shell() {
                             "block_until_ms": 2_000
                         }),
                     ),
-                    (
-                        "later-read",
-                        "Read",
-                        json!({"path": "note.txt"}),
-                    ),
+                    ("later-read", "Read", json!({"path": "note.txt"})),
                 ]),
                 turn_text("STEERED"),
             ])),

@@ -46,7 +46,7 @@ low_precision = false        # on: tighter doom/parse/repeat guards for IQ4/Q3. 
 
 [features]
 code_mode = true
-tui = false
+tui = false                    # unused; a TTY with no prompt still opens the TUI
 skills_auto_catalog = false
 mcp_auto_catalog = false
 workspace_write_only = true  # writes stay in workspace; Read/Glob/Grep/Shell can use absolute paths

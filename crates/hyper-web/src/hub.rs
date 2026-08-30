@@ -106,7 +106,7 @@ impl Inner {
 /// 单个频道 endpoint 的运行状态,GET /api/channels 的 `runtime` 字段
 #[derive(Clone)]
 pub struct ChannelRuntime {
-    pub state: &'static str, // running | error | no_credentials | off
+    pub state: &'static str, // running | retry | error | no_credentials | off
     pub detail: Option<String>,
 }
 
@@ -170,8 +170,9 @@ impl AppState {
         let (ev_tx, ev_rx) = mpsc::unbounded_channel::<(String, SessionEvent)>();
         // Token deltas are tiny but frequent. 512 filled up around ~30 tool hops
         // on Windows (slow JSON/React), RecvError::Lagged then pushed the whole
-        // history over WS and froze the UI. Keep a deeper ring; still never put
-        // the transcript on this bus (see resync / history.replace refetch).
+        // history over WS and froze the UI. Keep a deeper ring; never put the
+        // transcript on this bus. Lagged clients get a per-socket `resync` with
+        // the same `console_events` snapshot as hello (data: URIs already redacted).
         let (bus, _) = broadcast::channel(8192);
         let bus_fwd = bus.clone();
         tokio::spawn(async move {
@@ -447,18 +448,7 @@ fn endpoint_runnable(ep: &hyper_loop::ChannelEndpoint) -> bool {
 
 /// 该 kind 的适配器是否在本进程内(与 [`endpoint_runnable`] 的分支一致)。
 fn endpoint_in_process(kind: &str) -> bool {
-    matches!(
-        kind.to_ascii_lowercase().as_str(),
-        "telegram"
-            | "webhook"
-            | "http"
-            | "console"
-            | "qq"
-            | "wechat"
-            | "wecom"
-            | "dingtalk"
-            | "feishu"
-    )
+    hyper_loop::channel::in_process_kind(kind)
 }
 
 /// 不含运行结果的静态分类:off / no_credentials / running(即将启动)。
@@ -573,7 +563,7 @@ fn spawn_channel_watch(inner: Arc<Mutex<Inner>>) {
                                                 detail,
                                                 wait_secs,
                                             } => (
-                                                "error",
+                                                "retry",
                                                 Some(clip_chars(
                                                     &format!("retry in {wait_secs}s: {detail}"),
                                                     300,

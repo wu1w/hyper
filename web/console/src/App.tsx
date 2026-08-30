@@ -360,12 +360,31 @@ export function App() {
             transcriptsRef.current[st.session] = { events: p.events || [], live: emptyLive() };
           }
         } else if (msg.method === "resync") {
-          const p = msg.params as { state?: Snap; permit?: Permit; clarify?: Clarify };
+          const p = msg.params as {
+            state?: Snap;
+            events?: SessionEvent[];
+            permit?: Permit;
+            clarify?: Clarify;
+          };
           if (p.state) setSnap(p.state);
           const focused = p.state?.session || sessionRef.current;
           setPermit(modalForFocus(p.permit ?? null, focused));
           setClarify(modalForFocus(p.clarify ?? null, focused));
-          pullHistory();
+          if (Array.isArray(p.events)) {
+            const incoming = p.events;
+            const id = focused;
+            const parked = id ? transcriptsRef.current[id] : undefined;
+            const next = preferFresherHistory(parked?.events || incoming, incoming);
+            cancelLiveRaf();
+            setEvents(next);
+            setLive((l) => {
+              const liveNext = nextLive(next, parked?.live || l);
+              if (id) transcriptsRef.current[id] = { events: next, live: liveNext };
+              return liveNext;
+            });
+          } else {
+            pullHistory();
+          }
         } else if (msg.method === "history.replace") {
           const p = msg.params as {
             events?: SessionEvent[];

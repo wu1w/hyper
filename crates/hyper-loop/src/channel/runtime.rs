@@ -18,9 +18,10 @@ where
         .cloned()
         .collect();
     if enabled.is_empty() {
-        return Err(Error::msg(
-            "no enabled [[channels.endpoints]] — add telegram, webhook, or qq in ~/.grok-hyper/config.toml",
-        ));
+        return Err(Error::msg(format!(
+            "no enabled [[channels.endpoints]] — add {} in ~/.grok-hyper/config.toml",
+            super::IN_PROCESS_HELP
+        )));
     }
     let router = SessionRouter::in_home()?;
     let mgr = ChannelManager::start(cfg.clone(), router, handler);
@@ -116,15 +117,17 @@ where
             }
             other => {
                 eprintln!(
-                    "hyper channel {other}: no in-process client; POST QwenPaw native JSON to a webhook endpoint"
+                    "hyper channel {other}: no in-process client (enable {}); POST native JSON to a webhook endpoint",
+                    super::IN_PROCESS_HELP
                 );
             }
         }
     }
     if joins.is_empty() {
-        return Err(Error::msg(
-            "no runnable channel (enable telegram, webhook, or qq)",
-        ));
+        return Err(Error::msg(format!(
+            "no runnable channel (enable {})",
+            super::IN_PROCESS_HELP
+        )));
     }
     tokio::select! {
         _ = tokio::signal::ctrl_c() => {

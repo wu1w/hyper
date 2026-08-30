@@ -7,6 +7,7 @@ function runtimePill(e: ChannelEp): { cls: string; label: string } | null {
   const st = e.runtime?.state;
   if (!st) return null;
   if (st === "running") return { cls: "ok", label: "运行中" };
+  if (st === "retry") return { cls: "warn", label: "重试中" };
   if (st === "error") return { cls: "err", label: "连接错误" };
   if (st === "no_credentials") return { cls: "warn", label: "缺凭证" };
   if (e.enabled) return { cls: "idle", label: "未连接" };
@@ -286,7 +287,6 @@ export function ChannelsPage({ active = true }: { active?: boolean }) {
   const [sel, setSel] = useState(0);
   const [open, setOpen] = useState(false);
   const [dirty, setDirty] = useState(false);
-  const [showSoon, setShowSoon] = useState(false);
   const [err, setErr] = useState("");
   const load = (keepId?: string) =>
     api<{ busy: string; endpoints: ChannelEp[]; catalog?: ChannelKind[] }>("/channels").then((j) => {
@@ -307,10 +307,7 @@ export function ChannelsPage({ active = true }: { active?: boolean }) {
   const enabled = eps.filter((e) => e.enabled);
   const idle = eps.filter((e) => !e.enabled);
   const configuredKinds = new Set(eps.map((e) => e.kind));
-  const addable = catalog.filter((c) => !c.once || !configuredKinds.has(c.id));
-  // 进程内平台立即可用；其余适配器未进进程，折到「即将支持」防误解。
-  const addableLive = addable.filter((c) => c.in_process);
-  const addableSoon = addable.filter((c) => !c.in_process);
+  const addable = catalog.filter((c) => c.in_process && (!c.once || !configuredKinds.has(c.id)));
   const patch = (p: Partial<ChannelEp>) => {
     if (!cur) return;
     const n = [...eps];
@@ -331,6 +328,7 @@ export function ChannelsPage({ active = true }: { active?: boolean }) {
   };
   const add = (kind: string) => {
     const spec = kindSpec(catalog, kind);
+    if (!spec?.in_process) return;
     if (spec?.once) {
       const existing = eps.findIndex((e) => e.kind === kind);
       if (existing >= 0) {
@@ -460,7 +458,7 @@ export function ChannelsPage({ active = true }: { active?: boolean }) {
       >
         <div className="ch-card-top">
           <ChannelMark spec={s} />
-          <span className={`pill ${rt ? rt.cls : e.enabled ? "ok" : "idle"}`}>
+          <span className={`pill ${rt ? rt.cls : e.enabled ? "ok" : "idle"}`} title={e.runtime?.detail || undefined}>
             {rt ? rt.label : e.enabled ? "已启用" : "未启用"}
           </span>
         </div>
@@ -471,7 +469,7 @@ export function ChannelsPage({ active = true }: { active?: boolean }) {
           {bound ? <span className="pill ok">{s?.in_process ? "已绑定" : "凭证已写入"}</span> : null}
           {s?.in_process ? <span className="pill idle">进程内</span> : null}
         </div>
-        {e.runtime?.state === "error" && e.runtime.detail ? (
+        {(e.runtime?.state === "error" || e.runtime?.state === "retry") && e.runtime.detail ? (
           <div className="ch-err" title={e.runtime.detail}>
             {e.runtime.detail}
           </div>
@@ -533,7 +531,7 @@ export function ChannelsPage({ active = true }: { active?: boolean }) {
             <span>绑定后由本进程自动连接</span>
           </h3>
           <div className="ch-grid avail">
-            {addableLive.map((c) => (
+            {addable.map((c) => (
               <button type="button" className="card ch-avail" key={c.id} onClick={() => add(c.id)}>
                 <ChannelMark spec={c} sm />
                 <span className="grow">
@@ -545,32 +543,6 @@ export function ChannelsPage({ active = true }: { active?: boolean }) {
             ))}
           </div>
         </div>
-
-        {addableSoon.length > 0 ? (
-          <div className="ch-sec ch-soon">
-            <h3>
-              即将支持
-              <span>适配器尚未进进程，配置只会保存凭证、不会实际收发消息</span>
-              <button type="button" className="btn ghost small" style={{ marginLeft: "auto" }} onClick={() => setShowSoon((v) => !v)}>
-                {showSoon ? "收起" : `显示 ${addableSoon.length} 个`}
-              </button>
-            </h3>
-            {showSoon ? (
-              <div className="ch-grid avail">
-                {addableSoon.map((c) => (
-                  <button type="button" className="card ch-avail" key={c.id} onClick={() => add(c.id)}>
-                    <ChannelMark spec={c} sm />
-                    <span className="grow">
-                      <b>{c.name}</b>
-                      <div className="sub">{c.blurb}</div>
-                    </span>
-                    <span className="pill idle">未就绪</span>
-                  </button>
-                ))}
-              </div>
-            ) : null}
-          </div>
-        ) : null}
       </div>
 
       {open && cur ? (

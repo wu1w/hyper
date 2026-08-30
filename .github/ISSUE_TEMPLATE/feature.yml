@@ -1,0 +1,15 @@
+name: 功能
+description: 想加的能力（先对现有架构）
+labels: [enhancement]
+body:
+  - type: textarea
+    id: want
+    attributes:
+      label: 要解决什么
+    validations:
+      required: true
+  - type: textarea
+    id: fit
+    attributes:
+      label: 和现有 hyper web / 冻结 tools[] / IM 适配器怎么相处
+      description: Discord/Slack/iMessage 等没有进程内适配器，不要当成「填 token 就能聊」。

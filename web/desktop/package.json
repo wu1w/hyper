@@ -15,7 +15,8 @@
     "prepare:resources": "node scripts/prepare.mjs",
     "dist": "npm run console && npm run sidecars && node scripts/prepare.mjs && CSC_IDENTITY_AUTO_DISCOVERY=false electron-builder --publish never --mac dmg zip --arm64 --win zip --x64",
     "dist:mac": "npm run console && HYPER_SIDECAR_SKIP_WIN=1 npm run sidecars && node scripts/prepare.mjs && CSC_IDENTITY_AUTO_DISCOVERY=false electron-builder --publish never --mac dmg zip --arm64",
-    "dist:win": "npm run console && npm run sidecars && node scripts/prepare.mjs --require-win && CSC_IDENTITY_AUTO_DISCOVERY=false electron-builder --publish never --win zip --x64"
+    "dist:win": "npm run console && npm run sidecars && node scripts/prepare.mjs --require-win && CSC_IDENTITY_AUTO_DISCOVERY=false electron-builder --publish never --win zip --x64",
+    "dist:win-arm64": "npm run console && node scripts/prepare.mjs --require-win && CSC_IDENTITY_AUTO_DISCOVERY=false electron-builder --publish never --win zip --arm64"
   },
   "devDependencies": {
     "electron": "^38.2.0",

@@ -232,7 +232,8 @@ fn store_ticket_fail(user: &str) {
     );
 }
 
-/// iLink `sendtyping`. Failures are silent. Ticket cached ~10 minutes per user.
+/// iLink `sendtyping`. Failures log to stderr (QQ / Feishu do the same).
+/// Ticket cached ~10 minutes per user.
 pub(crate) async fn send_typing(ep: Option<&ChannelEndpoint>, env: &NativePayload) {
     if !typing_ok(env) {
         return;
@@ -249,6 +250,7 @@ pub(crate) async fn send_typing(ep: Option<&ChannelEndpoint>, env: &NativePayloa
     }
     let ctx = meta_str(env, "context_token");
     let Ok(http) = crate::llm_http::env_aware_client(8, &base) else {
+        eprintln!("hyper wechat typing: http client");
         return;
     };
     let ticket = if let Some(t) = cached_ticket(&user) {
@@ -257,26 +259,31 @@ pub(crate) async fn send_typing(ep: Option<&ChannelEndpoint>, env: &NativePayloa
         let url = format!("{base}/ilink/bot/getconfig");
         let data = match post_json(&http, &url, &token, &typing_config_body(&user, &ctx)).await {
             Ok(d) => d,
-            Err(_) => {
+            Err(e) => {
                 store_ticket_fail(&user);
+                eprintln!("hyper wechat typing: {e}");
                 return;
             }
         };
         let Some(t) = parse_typing_ticket(&data) else {
             store_ticket_fail(&user);
+            eprintln!("hyper wechat typing: no ticket");
             return;
         };
         store_ticket(&user, t.clone());
         t
     };
     let url = format!("{base}/ilink/bot/sendtyping");
-    let _ = post_json(
+    if let Err(e) = post_json(
         &http,
         &url,
         &token,
         &typing_send_body(&user, &ticket, TYPING_STATUS_START),
     )
-    .await;
+    .await
+    {
+        eprintln!("hyper wechat typing: {e}");
+    }
 }
 
 async fn send_cdn_item(

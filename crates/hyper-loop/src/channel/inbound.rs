@@ -173,7 +173,8 @@ pub async fn serve_endpoint(cfg: Config, workspace: PathBuf, ep: ChannelEndpoint
         "dingtalk" => super::dingtalk::run_gateway(ep, mgr).await,
         "feishu" => super::feishu::run_ws(ep, mgr).await,
         other => Err(Error::msg(format!(
-            "hyper channel {other}: no in-process client"
+            "hyper channel {other}: no in-process client (enable {})",
+            super::IN_PROCESS_HELP
         ))),
     }
 }

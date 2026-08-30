@@ -1,4 +1,4 @@
-//! `hyper --channels`: inbound (webhook + telegram) → Agent → reply.
+//! `hyper --channels`: inbound (webhook / telegram / QQ / WeChat / WeCom / DingTalk / Feishu) → Agent → reply.
 
 use std::process::ExitCode;
 use std::sync::Arc;
@@ -38,26 +38,29 @@ pub async fn run(cli: Cli) -> Result<ExitCode> {
     let effort_locked =
         cli.fast || cli.think.is_some() || matches!(mode, SessionMode::Think | SessionMode::Chat);
 
-    run_channels(cfg.channels.clone(), move |env: NativePayload, cancel, steer| {
-        let cfg = cfg_h.clone();
-        let workspace = workspace.clone();
-        let policy = policy.clone();
-        async move {
-            handle_inbound(
-                cfg,
-                workspace,
-                mode,
-                policy,
-                effort_locked,
-                agents_md,
-                agents_md_head,
-                env,
-                cancel,
-                steer,
-            )
-            .await
-        }
-    })
+    run_channels(
+        cfg.channels.clone(),
+        move |env: NativePayload, cancel, steer| {
+            let cfg = cfg_h.clone();
+            let workspace = workspace.clone();
+            let policy = policy.clone();
+            async move {
+                handle_inbound(
+                    cfg,
+                    workspace,
+                    mode,
+                    policy,
+                    effort_locked,
+                    agents_md,
+                    agents_md_head,
+                    env,
+                    cancel,
+                    steer,
+                )
+                .await
+            }
+        },
+    )
     .await
     .map_err(|e| anyhow::anyhow!("{e}"))?;
     Ok(ExitCode::SUCCESS)

@@ -28,7 +28,7 @@ mod wechat;
 mod wecom;
 pub(crate) mod xfer;
 
-pub use catalog::{catalog_json, endpoint_kind, CATALOG};
+pub use catalog::{catalog_json, endpoint_kind, in_process_kind, CATALOG, IN_PROCESS_HELP};
 pub use envelope::{ChannelAddress, ContentPart, NativePayload};
 pub use inbound::{keep_client_watched, serve_endpoint, serve_qq, spawn_im_pump, ClientWatch};
 pub use mailbox::{
@@ -40,7 +40,9 @@ pub use qrcode::{fetch_qrcode, poll_qrcode};
 pub use router::SessionRouter;
 pub use runtime::run as run_channels;
 
-/// QwenPaw `BUILTIN_CHANNEL_KEYS` plus hyper local surfaces.
+/// QwenPaw leftover names still parse in old `config.toml`. Only
+/// [`catalog::CATALOG`] kinds have an in-process adapter; Discord / Slack /
+/// iMessage / … will not connect if enabled.
 pub const KINDS: &[&str] = &[
     "cli",
     "sidecar",

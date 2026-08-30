@@ -34,7 +34,7 @@ hyper web
 
 浏览器会打开 `http://127.0.0.1:3848/`。也可在控制台 **模型** 页选接入方式（`grok login` 会话 / API key / 自定义 OpenAI 端点），模型名默认 `grok-4.6`。
 
-`hyper web --bind 127.0.0.1:3848 --no-open` 只起服务、不弹浏览器。无头常驻用 `contrib/systemd/hyper-web.service`（`Restart=always`）。`hyper web` 已经带频道 poll，不要再叠一层 `hyper --channels`。
+`hyper web --bind 127.0.0.1:3848 --no-open` 只起服务、不弹浏览器。无头常驻用 [`contrib/systemd/hyper-web.service`](contrib/systemd/hyper-web.service)（`Restart=always`）。**不要原样 `enable` 系统单元**：模板里 `User=` 是注释掉的、`ExecStart=/usr/local/bin/hyper` 多半不是你的二进制。推荐拷到 `~/.config/systemd/user/hyper-web.service`，把 `ExecStart` 改成 `which hyper` 的路径（cargo install 一般是 `%h/.cargo/bin/hyper`），然后 `systemctl --user enable --now hyper-web`。系统单元会以 root 起、或找不到二进制。`hyper web` 已经带频道 poll，不要再叠一层 `hyper --channels`。
 
 确实要在可信局域网访问控制台时，显式使用 `hyper web --bind 0.0.0.0:3848 --allow-lan`。
 
@@ -58,7 +58,7 @@ hyper web
 | 底栏 | 安全 | 审批档位 |
 | 底栏 | 用量 | token / 缓存命中 / 200k 价格悬崖 |
 
-文件页可以粘贴绝对路径或 `~/…`，或用系统选择 / 浏览。快捷方式指向主目录、桌面、文稿、下载。换目录会写入 `~/.grok-hyper/config.toml` 的 `[console] workspace`，以及当前会话 JSONL 的 `session/start.workspace`（否则重启 / 恢复会回到旧目录）。这里不做迷你 IDE：改文稿走聊天里的 Write / StrReplace。
+文件页可以粘贴绝对路径或 `~/…`，或用系统选择 / 浏览。快捷方式指向主目录、桌面、文稿、下载。换目录会写入 `~/.grok-hyper/config.toml` 的 `[console] workspace`，以及当前会话 JSONL 的 `session/start.workspace`（否则重启 / 恢复会回到旧目录）。只有**当前焦点**会话在跑时换目录会 409；停在侧栏里的会话不挡切换，它们若还在跑，Write 仍可能打进**旧**树。这里不做迷你 IDE：改文稿走聊天里的 Write / StrReplace。
 
 默认 ask：写文件、跑命令会先问。可在聊天或安全页改成自动 / yolo。这是本机控制台，不是沙箱产品。
 
@@ -87,7 +87,7 @@ hyper vscode-install              # 可选：装 VS Code / Cursor 侧栏扩展
 
 - `[server]` 端点、key、模型、引擎 profile、家族
 - `[context] working_window` 默认 **500000**，soft compact 80%；超过 200k token 后 xAI 单价翻倍
-- `[policy] default_effort = "auto"` 对 grok-4.6 映射为 **high**；`/think` 仍可覆盖
+- `[policy] default_effort = "auto"` 对 grok-4.6 映射为 **xhigh**（思考关不掉，成本和延迟都按最高档）；`/think` 仍可覆盖
 - `[console] workspace` 控制台上次选的文件夹
 - `[web]` 搜索工具（无 key 也能用；有 Tavily key 自动升级）
 - `[mcp]` / 技能目录 overlay
@@ -103,6 +103,10 @@ cd web/console && npm install && npm run build
 ```
 
 再重启 `hyper web`。开发时 `npm run dev` 会把 `/api` 代理到本机 3848。
+
+## 桌面壳
+
+[`web/desktop`](web/desktop) 的 `npm run dist` 打 **mac arm64**（dmg / zip）和 **win x64** zip。Windows ARM 不在默认产物里：要在 ARM 机器（或交叉）编好 `aarch64-pc-windows-msvc` 的 `hyper.exe` 放进 `web/desktop/resources/win`，再 `npm run dist:win-arm64`。树里若有一份 win-arm64 zip，不是这条脚本打的。Electron 在 `hyper web` 挂掉后会退避再拉起（对等 systemd `Restart=always`）。
 
 ## 可选：VS Code / Cursor
 

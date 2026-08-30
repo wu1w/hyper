@@ -174,38 +174,6 @@ pub const CATALOG: &[KindSpec] = &[
         }],
     },
     KindSpec {
-        id: "discord",
-        name: "Discord",
-        blurb: "填 Bot token",
-        mark: "DC",
-        color: "#5865F2",
-        qr: false,
-        once: true,
-        in_process: false,
-        fields: &[FieldSpec {
-            key: "bot_token",
-            label: "Bot token",
-            secret: true,
-            hint: "",
-        }],
-    },
-    KindSpec {
-        id: "slack",
-        name: "Slack",
-        blurb: "填 Bot token",
-        mark: "S",
-        color: "#611F69",
-        qr: false,
-        once: true,
-        in_process: false,
-        fields: &[FieldSpec {
-            key: "bot_token",
-            label: "Bot token",
-            secret: true,
-            hint: "",
-        }],
-    },
-    KindSpec {
         id: "webhook",
         name: "Webhook",
         blurb: "POST /inbound，控制台进程内接听",
@@ -216,164 +184,15 @@ pub const CATALOG: &[KindSpec] = &[
         in_process: true,
         fields: &[],
     },
-    KindSpec {
-        id: "onebot",
-        name: "OneBot",
-        blurb: "OneBot 协议接入",
-        mark: "OB",
-        color: "#111827",
-        qr: false,
-        once: true,
-        in_process: false,
-        fields: &[
-            FieldSpec {
-                key: "ws_url",
-                label: "WebSocket URL",
-                secret: false,
-                hint: "",
-            },
-            FieldSpec {
-                key: "access_token",
-                label: "Access token",
-                secret: true,
-                hint: "",
-            },
-        ],
-    },
-    KindSpec {
-        id: "imessage",
-        name: "iMessage",
-        blurb: "本机 iMessage 桥",
-        mark: "iM",
-        color: "#34C759",
-        qr: false,
-        once: true,
-        in_process: false,
-        fields: &[],
-    },
-    KindSpec {
-        id: "matrix",
-        name: "Matrix",
-        blurb: "Homeserver + access token",
-        mark: "MX",
-        color: "#0DBD8B",
-        qr: false,
-        once: true,
-        in_process: false,
-        fields: &[
-            FieldSpec {
-                key: "homeserver",
-                label: "Homeserver",
-                secret: false,
-                hint: "",
-            },
-            FieldSpec {
-                key: "access_token",
-                label: "Access token",
-                secret: true,
-                hint: "",
-            },
-        ],
-    },
-    KindSpec {
-        id: "mattermost",
-        name: "Mattermost",
-        blurb: "Bot token + 站点 URL",
-        mark: "MM",
-        color: "#0058CC",
-        qr: false,
-        once: true,
-        in_process: false,
-        fields: &[
-            FieldSpec {
-                key: "url",
-                label: "站点 URL",
-                secret: false,
-                hint: "",
-            },
-            FieldSpec {
-                key: "bot_token",
-                label: "Bot token",
-                secret: true,
-                hint: "",
-            },
-        ],
-    },
-    KindSpec {
-        id: "mqtt",
-        name: "MQTT",
-        blurb: "Broker 主题订阅",
-        mark: "MQ",
-        color: "#660066",
-        qr: false,
-        once: true,
-        in_process: false,
-        fields: &[
-            FieldSpec {
-                key: "broker",
-                label: "Broker",
-                secret: false,
-                hint: "",
-            },
-            FieldSpec {
-                key: "username",
-                label: "用户名",
-                secret: false,
-                hint: "",
-            },
-            FieldSpec {
-                key: "password",
-                label: "密码",
-                secret: true,
-                hint: "",
-            },
-        ],
-    },
-    KindSpec {
-        id: "voice",
-        name: "Voice",
-        blurb: "语音通道",
-        mark: "V",
-        color: "#F59E0B",
-        qr: false,
-        once: true,
-        in_process: false,
-        fields: &[],
-    },
-    KindSpec {
-        id: "sip",
-        name: "SIP",
-        blurb: "SIP 语音",
-        mark: "SIP",
-        color: "#64748B",
-        qr: false,
-        once: true,
-        in_process: false,
-        fields: &[],
-    },
-    KindSpec {
-        id: "xiaoyi",
-        name: "小艺",
-        blurb: "华为小艺",
-        mark: "艺",
-        color: "#CF0A2C",
-        qr: false,
-        once: true,
-        in_process: false,
-        fields: &[],
-    },
-    KindSpec {
-        id: "yuanbao",
-        name: "元宝",
-        blurb: "腾讯元宝",
-        mark: "宝",
-        color: "#0052D9",
-        qr: false,
-        once: true,
-        in_process: false,
-        fields: &[],
-    },
 ];
+
+/// Kinds with an in-process listener (`hyper web` / `hyper --channels`).
+pub const IN_PROCESS_HELP: &str = "telegram, webhook, qq, wechat, wecom, dingtalk, or feishu";
+
+pub fn in_process_kind(kind: &str) -> bool {
+    spec(kind).is_some_and(|s| s.in_process)
+        || matches!(kind.to_ascii_lowercase().as_str(), "http" | "console")
+}
 
 pub fn spec(kind: &str) -> Option<&'static KindSpec> {
     let k = kind.to_ascii_lowercase();
@@ -412,5 +231,16 @@ mod tests {
         assert!(endpoint_kind("webhook"));
         assert!(!endpoint_kind("cli"));
         assert!(!endpoint_kind("console"));
+        for s in CATALOG {
+            assert!(s.in_process, "catalog must not list unimplemented {}", s.id);
+            assert!(
+                IN_PROCESS_HELP.contains(s.id),
+                "{} missing from IN_PROCESS_HELP",
+                s.id
+            );
+        }
+        assert!(in_process_kind("feishu"));
+        assert!(in_process_kind("http"));
+        assert!(!in_process_kind("discord"));
     }
 }

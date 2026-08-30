@@ -57,7 +57,7 @@ Cron / 心跳 / 频道入站也是 **主机定时器或适配器** 去调 `turn.
 
 `Read` · `Write` · `StrReplace` · `Delete` · `Glob` · `Grep` · `ReadLints` · `EditNotebook` · `Shell` · `WebSearch` · `WebFetch` · `GenerateImage` · `TodoWrite` · `AskQuestion` · `SwitchMode` · `Task` · `AwaitShell`
 
-执行层仍接受 Qwen 四件套别名（`read` / `write` / `edit` / `bash`），发给模型的 `function.name` 必须是上表。
+执行层仍接受 Qwen 四件套别名（`read` / `write` / `edit` / `bash`），发给模型的 `function.name` 必须是上表。`Read` 一个目录时先收集名称、排序，再截到 200 条（readdir 顺序下先截断会给出任意子集）。`ToolLimits::default()` 与 `[tools] read_default_lines = 600` 一致。
 
 **按配置追加：**
 
@@ -84,7 +84,7 @@ Cron / 心跳 / 频道入站也是 **主机定时器或适配器** 去调 `turn.
 
 深度 1：孩子不能再 `Task`。explore / plan 只读（plan 可写 `plan.md`）。office / generalPurpose 可写。
 
-`isolation`：`none` 和 `auto`（默认；空字符串也是 auto）共用父 cwd，所以办公目录即使碰巧是 git 仓库，孩子看到的也是用户正在看的未提交稿，Write 也写回那里。`worktree` 必须是 git 仓库，从 **HEAD** 检出到 `~/.grok-hyper/worktrees/<child-id>`（看不见未提交改动），跑完**不拆树**、不 merge；SUMMARY 带 `WORKTREE` 绝对路径。`resume` 用 ChildRecord 里记下的 isolation，漏参数不会掉回 auto。下次 Task 只 prune 崩溃残留（没有 keep 标记的目录）。进程重启后内存 registry 没了，按 id resume 会找不到——那是另一回事。schema 以外的 isolation 值直接报错。
+`isolation`：`none` 和 `auto`（默认；空字符串也是 auto）共用父 cwd，所以办公目录即使碰巧是 git 仓库，孩子看到的也是用户正在看的未提交稿，Write 也写回那里。`worktree` 必须是 git 仓库，从 **HEAD** 检出到 `~/.grok-hyper/worktrees/<child-id>`（看不见未提交改动），跑完**不拆树**、不 merge；SUMMARY 带 `WORKTREE` 绝对路径。`resume` 用 ChildRecord 里记下的 isolation，漏参数不会掉回 auto。下次 Task 只 prune 崩溃残留（没有 keep 标记的目录）。子代理 registry 写 `{id}.task.json`：进程重启后 `get_or_load` / AwaitShell 能从磁盘找到孩子；当时还在跑的记成 `interrupted: process restarted`，不自动重跑。schema 以外的 isolation 值直接报错。
 
 孩子接到父的 `permit` / `clarify` / live sink。父是 ask 时，孩子写文件、跑 Shell、AskQuestion 走同一套收件箱，不会 YOLO，也不会报「需要 interactive channel」。孩子不把思考 / 正文 delta 混进父气泡；完成的工具事件会转发到父 live sink。`/fork --worktree` 仍然只拷会话，不建 git worktree。
 
@@ -94,7 +94,7 @@ Cron / 心跳 / 频道入站也是 **主机定时器或适配器** 去调 `turn.
 2. `SidecarSession` 组 messages：角色边界（只读 `~/.grok-hyper/AGENT.md`，工作区 USER.md/SOUL.md 不能改人设）+ 可选工作区 `AGENTS.md`（项目约定）+ 冻结 tools + 历史。
 3. HTTP 补全；思考 / 正文分通道流式推到 WS。
 4. 工具调用按审批模式停或放行；结果写回 messages，直到模型停或打到 `max_steps`。
-5. 事件追加到会话 JSONL；`stop` 结束本轮。控制台会重放本轮前半段，避免 WS 丢包后画面残缺。
+5. 事件追加到会话 JSONL；`stop` 结束本轮。WS 广播环只推增量；客户端 `Lagged` 时 **这条 socket** 收到 `resync`（state / permit / clarify / 当前会话 `console_events`，与 hello 相同、已去掉 inline `data:`），立刻重绘，不必等 80ms 的 `GET /history`。不要把整份 JSONL 丢回广播总线（Windows 上会卡死）。
 
 默认 `auto` 对 grok-4.6 映射为 **xhigh**（思考关不掉）；Qwen 仍是官方中性 `medium`。`/think`、`--think`、`/fast` 仍可人工覆盖。grok 走 Responses：不回放思考、不回放 tool-hop 助手正文、不把 QwenPaw 的 `[trajectory]` / `[style]` / `[out]` / `[locate]` / `[oracle]` / `[guard]` 注记当用户消息。同参工具第 6 次安静停止（`budget:repeat`）。控制台和 TUI 不把 tool-hop 旁白画成答案气泡。Qwen 本地权重仍走软干预：同参 6 次提醒一次，dump 延后工具并观察一次。
 
@@ -110,7 +110,7 @@ Cron / 心跳 / 频道入站也是 **主机定时器或适配器** 去调 `turn.
 - probe：`~/.grok-hyper/probe.json`
 - 控制台上次工作区：`[console] workspace`
 
-Web 启动时：若 CLI 没传 `--workspace`，用配置里的路径；路径不存在则退回进程 cwd。打开已有会话时 `bind_store` 以 JSONL `session/start.workspace` 为准。在控制台换目录会同时写 `[console] workspace` **和** 当前会话的 `session/start`；`hyper web --workspace PATH` 也会把该路径写入正在打开的会话。只改配置或只改内存、不改 JSONL 时，重启 / 恢复会话会回到旧目录。
+Web 启动时：若 CLI 没传 `--workspace`，用配置里的路径；路径不存在则退回进程 cwd。打开已有会话时 `bind_store` 以 JSONL `session/start.workspace` 为准。在控制台换目录会同时写 `[console] workspace` **和** 当前会话的 `session/start`；`hyper web --workspace PATH` 也会把该路径写入正在打开的会话。只改配置或只改内存、不改 JSONL 时，重启 / 恢复会话会回到旧目录。换目录只在**焦点**会话 `turn_in_flight` 时 409；停放在侧栏的会话不挡切换，它们若还在跑，Write 仍可能打进旧树。
 
 ## HTTP API（本机）
 
@@ -135,7 +135,7 @@ Web 启动时：若 CLI 没传 `--workspace`，用配置里的路径；路径不
 
 ## 频道与插件
 
-`hyper-loop::channel` 把 QQ / 飞书 / Telegram 等收成同一套 mailbox。凭证在配置里，控制台 **频道** 页编辑。适配器任务退出或 panic 后会指数退避再拉起；`hyper web` 与 `hyper --channels` 对同一 bot 互斥（poll lock）。无头进程级保活见 `contrib/systemd/hyper-web.service`。IM 进度走 `EventSink` 聚合，不改 `drive()` / 工具 JSON / xhigh。
+`hyper-loop::channel` 把 QQ / 飞书 / Telegram / 微信 / 企微 / 钉钉 / webhook 收成同一套 mailbox（目录里只有这些 `in_process` 入口）。凭证在配置里，控制台 **频道** 页编辑。适配器任务退出、panic 或 poll lock 冲突后会指数退避再拉起，pill 显示「重试中」而不是「连接错误」。`hyper web` 与 `hyper --channels` 对同一 bot 互斥（poll lock）。无头进程级保活见 `contrib/systemd/hyper-web.service`（请用 **user unit**，不要以 root 原样 enable）。桌面 Electron 在 `hyper web` 退出后会退避再拉起。IM 进度走 `EventSink` 聚合，不改 `drive()` / 工具 JSON / xhigh。终稿先写 durable outbox；坏掉的 pending JSON 进 `quarantine/`，不再永远 skip。
 
 `hyper --sidecar` 是 newline JSON-RPC（stdio）。dsh 插件和 VS Code 扩展只翻译 UI 事件，**禁止**再开一套工具循环。见 `plugins/dsh-plugin-hyper/README.md`、`plugins/vscode-hyper/README.md`。这不是 Cursor.app 那种 VS Code fork：agent 可以住在编辑器侧栏里，工具循环仍是同一份 `hyper --sidecar`。安装：`hyper vscode-install`。
 

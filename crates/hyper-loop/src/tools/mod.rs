@@ -51,12 +51,7 @@ pub struct ToolLimits {
 
 impl Default for ToolLimits {
     fn default() -> Self {
-        Self {
-            read_default_lines: 2000,
-            result_max_chars: 10_000,
-            result_head_chars: 8_000,
-            result_tail_chars: 2_000,
-        }
+        Self::from(&crate::config::ToolsConfig::default())
     }
 }
 
@@ -410,12 +405,18 @@ mod tests {
     }
 
     #[test]
+    fn tool_limits_default_matches_config() {
+        let lim = ToolLimits::default();
+        let cfg = crate::config::ToolsConfig::default();
+        assert_eq!(lim.read_default_lines, cfg.read_default_lines);
+        assert_eq!(lim.read_default_lines, 600);
+    }
+
+    #[test]
     fn confined_read_allows_absolute_outside() {
         let (ws, dir) = scratch();
-        let outside = std::env::temp_dir().join(format!(
-            "hyper-read-out-{}",
-            uuid::Uuid::new_v4().simple()
-        ));
+        let outside =
+            std::env::temp_dir().join(format!("hyper-read-out-{}", uuid::Uuid::new_v4().simple()));
         std::fs::write(&outside, "hello-out\n").unwrap();
         let r = fs::read_file(
             &ws,

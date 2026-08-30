@@ -320,7 +320,10 @@ async fn session_worker<H: ChannelHandler>(
         let cancel = CancelFlag::new();
         let steer = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
         let mut live = if env.channel == "qq" {
-            Some(super::outbound::spawn_live_presence(ep.clone(), env.clone()))
+            Some(super::outbound::spawn_live_presence(
+                ep.clone(),
+                env.clone(),
+            ))
         } else {
             None
         };
@@ -331,6 +334,7 @@ async fn session_worker<H: ChannelHandler>(
                 biased;
                 next = rx.recv() => {
                     let Some(mut next) = next else {
+                        abort_live(live.take()).await;
                         match work.await {
                             Ok(parts) => {
                                 if let Err(e) = super::outbound::deliver_since(
@@ -355,16 +359,15 @@ async fn session_worker<H: ChannelHandler>(
                                 .await;
                             }
                         }
-                        abort_live(live.take()).await;
                         return;
                     };
                     match live_control(&next) {
                         Some(LiveControl::Stop) => {
                             cancel.cancel();
+                            abort_live(live.take()).await;
                             let ep2 = cfg.endpoint_for_payload(&next).cloned();
                             spawn_ack(ep2, next, stop_status(&env));
                             let _ = work.await;
-                            abort_live(live.take()).await;
                             break;
                         }
                         Some(LiveControl::Busy(policy)) => {
@@ -406,8 +409,8 @@ async fn session_worker<H: ChannelHandler>(
                     match busy {
                         BusyPolicy::Interrupt => {
                             cancel.cancel();
-                            let _ = work.await;
                             abort_live(live.take()).await;
+                            let _ = work.await;
                             queued.push_front(next);
                             break;
                         }
@@ -443,6 +446,7 @@ async fn session_worker<H: ChannelHandler>(
                     }
                 }
                 result = &mut work => {
+                    abort_live(live.take()).await;
                     match result {
                         Ok(parts) => {
                             if let Err(e) = super::outbound::deliver_since(
@@ -476,7 +480,6 @@ async fn session_worker<H: ChannelHandler>(
                     if !cancel.is_cancelled() {
                         enqueue_leftover_steer(&env, take_steer(&steer), &mut queued);
                     }
-                    abort_live(live.take()).await;
                     break;
                 }
             }
@@ -485,10 +488,11 @@ async fn session_worker<H: ChannelHandler>(
 }
 
 async fn abort_live(live: Option<tokio::task::JoinHandle<()>>) {
-    if let Some(live) = live {
-        live.abort();
-        let _ = live.await;
-    }
+    let Some(live) = live else {
+        return;
+    };
+    live.abort();
+    let _ = live.await;
 }
 
 enum LiveControl {
@@ -873,6 +877,22 @@ mod tests {
         );
         drop(mgr);
         let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[tokio::test]
+    async fn abort_live_cancels_before_next_await() {
+        let live = tokio::spawn(async {
+            loop {
+                tokio::time::sleep(Duration::from_secs(60)).await;
+            }
+        });
+        let start = Instant::now();
+        abort_live(Some(live)).await;
+        assert!(
+            start.elapsed() < Duration::from_secs(2),
+            "QQ typing/heartbeat must stop as soon as the turn ends"
+        );
+        abort_live(None).await;
     }
 
     fn find_double_crlf(buf: &[u8]) -> Option<usize> {

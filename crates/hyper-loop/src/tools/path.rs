@@ -233,17 +233,13 @@ mod tests {
     #[test]
     fn confined_reads_allow_absolute_outside() {
         let d = temp_dir("read-out");
-        let outside = std::env::temp_dir().join(format!(
-            "hyper-path-read-out-{}",
-            uuid::Uuid::new_v4()
-        ));
+        let outside =
+            std::env::temp_dir().join(format!("hyper-path-read-out-{}", uuid::Uuid::new_v4()));
         std::fs::write(&outside, "ok").unwrap();
         let ws = Workspace::open(&d, true).unwrap();
         let p = ws.resolve(outside.to_str().unwrap()).unwrap();
         assert_eq!(p, outside);
-        let err = ws
-            .resolve_write(outside.to_str().unwrap())
-            .unwrap_err();
+        let err = ws.resolve_write(outside.to_str().unwrap()).unwrap_err();
         assert!(err.contains("outside the workspace"), "{err}");
         std::fs::remove_dir_all(&d).ok();
         std::fs::remove_file(&outside).ok();

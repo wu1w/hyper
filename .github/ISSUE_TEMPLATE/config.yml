@@ -1,0 +1,5 @@
+blank_issues_enabled: true
+contact_links:
+  - name: 技术说明
+    url: https://github.com/wu1w/hyper/blob/main/docs/architecture.md
+    about: 先看 architecture.md，很多「缺功能」其实是有意冻结

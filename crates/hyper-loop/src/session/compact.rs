@@ -1,4 +1,4 @@
-//! 262k live-window compact. JSONL is never rewritten.
+//! 500k live-window compact (`[context] working_window`, default 500000). JSONL is never rewritten.
 //!
 //! Soft trigger: `n + reserve > working_window * compact_ratio` (ratio clamped
 //! 0.10..=1.0) — try compact. Hard trigger: `n + reserve > working_window` —

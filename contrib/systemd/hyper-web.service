@@ -1,10 +1,20 @@
-# Headless Hyper on a home server.
-# Copy, fill User / ExecStart / WorkingDirectory, then:
+# Headless Hyper on a home server. This is a fill-in template, not a drop-in.
+#
+# Prefer a **user** unit (no root, uses your ~/.grok-hyper):
+#   mkdir -p ~/.config/systemd/user
+#   cp contrib/systemd/hyper-web.service ~/.config/systemd/user/
+#   # set ExecStart to `which hyper` (cargo install → %h/.cargo/bin/hyper)
+#   # set WantedBy=default.target
+#   systemctl --user daemon-reload
+#   systemctl --user enable --now hyper-web
+#
+# System unit (runs as root unless you set User=):
 #   sudo cp contrib/systemd/hyper-web.service /etc/systemd/system/
 #   sudo systemctl daemon-reload
 #   sudo systemctl enable --now hyper-web
+# Do not enable this file unchanged: User= is commented out and
+# ExecStart=/usr/local/bin/hyper is often the wrong path.
 #
-# User unit (no root): copy to ~/.config/systemd/user/ and use %h paths.
 # Do not also run `hyper --channels` — this process already long-polls.
 
 [Unit]
@@ -25,3 +35,4 @@ RestartSec=5
 
 [Install]
 WantedBy=multi-user.target
+# user unit: WantedBy=default.target

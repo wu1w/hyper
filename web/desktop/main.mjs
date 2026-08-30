@@ -12,6 +12,10 @@ let backend = null;
 let backendUrl = "";
 let mainWindow = null;
 let quitting = false;
+let starting = null;
+let respawnTimer = null;
+let respawnDelayMs = 1000;
+const RESPAWN_MAX_MS = 15_000;
 
 function repoRoot() {
   return path.resolve(here, "../..");
@@ -196,7 +200,17 @@ function waitForUrl(child) {
 }
 
 async function startBackend() {
-  if (backendUrl) return backendUrl;
+  if (backendUrl && backend && backend.exitCode == null && !backend.killed) {
+    return backendUrl;
+  }
+  if (starting) return starting;
+  starting = startBackendInner().finally(() => {
+    starting = null;
+  });
+  return starting;
+}
+
+async function startBackendInner() {
   const { bin, consoleDir, vendorDir } = sidecarPaths();
   if (!existsSync(bin)) {
     throw new Error(`找不到 hyper 可执行文件: ${bin}`);
@@ -215,17 +229,62 @@ async function startBackend() {
   });
   backend = child;
   attachSidecarLog(child);
-  backendUrl = await waitForUrl(child);
-  child.on("exit", () => {
-    if (!quitting) {
-      backend = null;
-      backendUrl = "";
+  try {
+    backendUrl = await waitForUrl(child);
+  } catch (err) {
+    try {
+      if (process.platform === "win32" && child.pid) {
+        spawn("taskkill", ["/pid", String(child.pid), "/t", "/f"], {
+          stdio: "ignore",
+          windowsHide: true,
+        });
+      } else {
+        child.kill("SIGKILL");
+      }
+    } catch {
+      /* already gone */
     }
+    backend = null;
+    backendUrl = "";
+    throw err;
+  }
+  child.on("exit", () => {
+    backend = null;
+    backendUrl = "";
+    if (!quitting) scheduleRespawn();
   });
   return backendUrl;
 }
 
+function scheduleRespawn() {
+  if (quitting || !mainWindow || mainWindow.isDestroyed()) return;
+  if (respawnTimer || starting) return;
+  respawnTimer = setTimeout(() => {
+    respawnTimer = null;
+    void restartBackend();
+  }, respawnDelayMs);
+}
+
+async function restartBackend() {
+  if (quitting || !mainWindow || mainWindow.isDestroyed()) return;
+  try {
+    const url = await startBackend();
+    respawnDelayMs = 1000;
+    if (mainWindow && !mainWindow.isDestroyed()) {
+      await mainWindow.loadURL(url);
+    }
+  } catch (err) {
+    console.error("hyper web respawn failed:", err);
+    respawnDelayMs = Math.min(respawnDelayMs * 2, RESPAWN_MAX_MS);
+    scheduleRespawn();
+  }
+}
+
 function stopBackend() {
+  if (respawnTimer) {
+    clearTimeout(respawnTimer);
+    respawnTimer = null;
+  }
   if (!backend || backend.killed) return;
   const child = backend;
   backend = null;
@@ -304,7 +363,7 @@ async function createWindow() {
     return { action: "deny" };
   });
   mainWindow.webContents.on("will-navigate", (event, target) => {
-    if (target.startsWith(url)) return;
+    if (backendUrl && target.startsWith(backendUrl)) return;
     event.preventDefault();
     shell.openExternal(target);
   });

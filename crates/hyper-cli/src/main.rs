@@ -76,7 +76,7 @@ struct Cli {
     #[arg(long)]
     sidecar: bool,
 
-    /// Run external message channels (webhook + telegram).
+    /// Run in-process IM adapters (webhook, telegram, QQ, WeChat, WeCom, DingTalk, Feishu).
     #[arg(long)]
     channels: bool,
 

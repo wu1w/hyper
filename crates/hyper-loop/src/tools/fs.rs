@@ -144,6 +144,7 @@ pub fn read_file(
 }
 
 const DIR_LIST_CAP: usize = 200;
+const DIR_SCAN_CAP: usize = 50_000;
 
 fn list_directory(
     shown: &str,
@@ -161,6 +162,7 @@ fn list_directory(
     };
     let mut files = Vec::new();
     let mut dirs = Vec::new();
+    let mut scanned = 0usize;
     for entry in rd.flatten() {
         let name = entry.file_name().to_string_lossy().into_owned();
         if name == ".git" {
@@ -172,26 +174,53 @@ fn list_directory(
         } else {
             files.push(name);
         }
-        if dirs.len() + files.len() >= DIR_LIST_CAP {
+        scanned += 1;
+        if scanned >= DIR_SCAN_CAP {
             break;
         }
     }
     dirs.sort();
     files.sort();
-    let n = dirs.len() + files.len();
-    let mut lines = Vec::with_capacity(n + 2);
-    lines.push(format!("Directory listing of `{shown}` ({n} entries):"));
+    let total = dirs.len() + files.len();
+    let mut listed = 0usize;
+    let mut out_dirs = Vec::new();
+    let mut out_files = Vec::new();
     for name in dirs {
-        lines.push(format!("{name}/"));
+        if listed >= DIR_LIST_CAP {
+            break;
+        }
+        out_dirs.push(name);
+        listed += 1;
     }
     for name in files {
+        if listed >= DIR_LIST_CAP {
+            break;
+        }
+        out_files.push(name);
+        listed += 1;
+    }
+    let mut lines = Vec::with_capacity(listed + 3);
+    lines.push(format!(
+        "Directory listing of `{shown}` ({listed} entries):"
+    ));
+    for name in out_dirs {
+        lines.push(format!("{name}/"));
+    }
+    for name in out_files {
         lines.push(name);
     }
-    if n == 0 {
+    if listed == 0 {
         lines.push("(empty)".into());
     }
-    if n >= DIR_LIST_CAP {
-        lines.push(format!("… truncated at {DIR_LIST_CAP} entries."));
+    if total > listed || scanned >= DIR_SCAN_CAP {
+        lines.push(format!(
+            "… truncated at {DIR_LIST_CAP} entries (sorted; {total} scanned{}).",
+            if scanned >= DIR_SCAN_CAP {
+                format!(", scan cap {DIR_SCAN_CAP}")
+            } else {
+                String::new()
+            }
+        ));
     }
     folded_response(id, lines.join("\n"), ToolState::Success, limits, blobs)
 }
@@ -1086,6 +1115,30 @@ mod tests {
         let n = nested.joined_text();
         assert_eq!(nested.state, ToolState::Success, "{n}");
         assert!(n.contains("lib.rs"), "{n}");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn read_directory_sorts_then_truncates() {
+        let (ws, dir) = workspace();
+        fs::write(dir.join("aaa"), "a\n").unwrap();
+        for i in 0..250 {
+            fs::write(dir.join(format!("z{i:03}")), "z\n").unwrap();
+        }
+        let r = read_file(
+            &ws,
+            &call("read", json!({"path": "."})),
+            ToolLimits::default(),
+            None,
+        );
+        let t = r.joined_text();
+        assert_eq!(r.state, ToolState::Success, "{t}");
+        assert!(t.contains("aaa"), "sorted prefix must include aaa:\n{t}");
+        assert!(t.contains("truncated at 200"), "{t}");
+        assert!(
+            !t.contains("z249"),
+            "late names must not displace early ones:\n{t}"
+        );
         let _ = fs::remove_dir_all(&dir);
     }
 }

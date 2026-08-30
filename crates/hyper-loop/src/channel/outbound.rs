@@ -146,10 +146,9 @@ async fn deliver_intent(ep: Option<&ChannelEndpoint>, intent: &DeliveryIntent) -
 /// Hermes gateway: typing + long-running notices run *while* the agent works,
 /// not after `handle()` returns. QQ C2C uses input_notify; a text heartbeat
 /// lands if the turn is still going after 90s (no message-edit on QQ).
-pub fn spawn_live_presence(
-    ep: Option<ChannelEndpoint>,
-    env: NativePayload,
-) -> JoinHandle<()> {
+/// The session worker must [`JoinHandle::abort`] this task **before** sending
+/// the final reply, or a heartbeat can land after the turn is already done.
+pub fn spawn_live_presence(ep: Option<ChannelEndpoint>, env: NativePayload) -> JoinHandle<()> {
     tokio::spawn(async move {
         let kind = ep
             .as_ref()
@@ -207,11 +206,19 @@ pub(crate) async fn replay_pending(ep: Option<&ChannelEndpoint>) -> Result<usize
         if path.extension().and_then(|s| s.to_str()) != Some("json") {
             continue;
         }
-        let Ok(raw) = fs::read_to_string(&path) else {
-            continue;
+        let raw = match fs::read_to_string(&path) {
+            Ok(s) => s,
+            Err(e) => {
+                quarantine_pending(&path, &format!("read: {e}"));
+                continue;
+            }
         };
-        let Ok(intent) = serde_json::from_str::<DeliveryIntent>(&raw) else {
-            continue;
+        let intent = match serde_json::from_str::<DeliveryIntent>(&raw) {
+            Ok(i) => i,
+            Err(e) => {
+                quarantine_pending(&path, &format!("json: {e}"));
+                continue;
+            }
         };
         if intent.endpoint_id != ep.id && intent.endpoint_id != ep.kind {
             continue;
@@ -406,6 +413,35 @@ fn outbox_root() -> Result<PathBuf> {
     Ok(std::env::temp_dir().join(format!("hyper-loop-outbox-test-{}", std::process::id())))
 }
 
+/// Bad pending JSON used to `continue` forever. Move it aside so replay can
+/// finish and the operator can inspect `channels/outbox/quarantine/`.
+fn quarantine_pending(path: &Path, reason: &str) {
+    eprintln!(
+        "hyper channel outbox: quarantined {} ({reason})",
+        path.display()
+    );
+    let Ok(root) = outbox_root() else {
+        let _ = fs::remove_file(path);
+        return;
+    };
+    let dest_dir = root.join("quarantine");
+    if fs::create_dir_all(&dest_dir).is_err() {
+        let _ = fs::remove_file(path);
+        return;
+    }
+    let name = path
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "pending.json".into());
+    let mut dest = dest_dir.join(&name);
+    if dest.exists() {
+        dest = dest_dir.join(format!("{name}.{}", unix_ms()));
+    }
+    if fs::rename(path, &dest).is_err() {
+        let _ = fs::remove_file(path);
+    }
+}
+
 fn persist_intent(intent: &DeliveryIntent) -> Result<PathBuf> {
     let dir = outbox_root()?.join("pending");
     fs::create_dir_all(&dir)?;
@@ -590,5 +626,24 @@ mod tests {
             delivery_id(&anonymous, &parts),
             delivery_id(&anonymous, &parts)
         );
+    }
+
+    #[tokio::test]
+    async fn bad_pending_json_is_quarantined() {
+        let pending = outbox_root().unwrap().join("pending");
+        fs::create_dir_all(&pending).unwrap();
+        let path = pending.join("hyper-garbage.json");
+        fs::write(&path, "not-json").unwrap();
+        let ep = crate::channel::ChannelEndpoint {
+            id: "wh".into(),
+            kind: "webhook".into(),
+            ..crate::channel::ChannelEndpoint::default()
+        };
+        let n = replay_pending(Some(&ep)).await.unwrap();
+        assert_eq!(n, 0);
+        assert!(!path.exists(), "bad pending must leave the replay queue");
+        let q = outbox_root().unwrap().join("quarantine/hyper-garbage.json");
+        assert!(q.is_file(), "expected {}", q.display());
+        let _ = fs::remove_dir_all(outbox_root().unwrap());
     }
 }

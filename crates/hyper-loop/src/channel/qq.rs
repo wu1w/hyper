@@ -469,26 +469,28 @@ fn typing_due(openid: &str) -> bool {
     true
 }
 
-/// Hermes `_keep_typing`: C2C input_notify, 60s bubble, refresh before expiry.
-pub async fn send_typing(ep: Option<&ChannelEndpoint>, env: &NativePayload) -> Result<()> {
-    let Some(ep) = ep else {
-        return Ok(());
-    };
+fn c2c_typing_ok(env: &NativePayload) -> bool {
     let msg_type = env
         .meta
         .get("message_type")
         .and_then(Value::as_str)
         .unwrap_or("c2c");
     if msg_type != "c2c" {
-        return Ok(());
+        return false;
     }
-    if env
-        .meta
+    !env.meta
         .get("msg_id")
         .and_then(Value::as_str)
         .unwrap_or("")
         .is_empty()
-    {
+}
+
+/// Hermes `_keep_typing`: C2C input_notify, 60s bubble, refresh before expiry.
+pub async fn send_typing(ep: Option<&ChannelEndpoint>, env: &NativePayload) -> Result<()> {
+    let Some(ep) = ep else {
+        return Ok(());
+    };
+    if !c2c_typing_ok(env) {
         return Ok(());
     }
     let openid = env

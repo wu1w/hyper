@@ -378,6 +378,8 @@ async fn client_ws(mut socket: WebSocket, st: AppState) {
                         }
                     }
                     Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {
+                        // Per-socket snapshot, same as hello — not on the
+                        // broadcast bus (dumping JSONL there froze Windows).
                         let resync = {
                             let g = st.inner.lock().await;
                             json!({
@@ -385,6 +387,7 @@ async fn client_ws(mut socket: WebSocket, st: AppState) {
                                 "method": "resync",
                                 "params": {
                                     "state": g.console_state(),
+                                    "events": crate::hub::console_events(g.session.events()),
                                     "permit": g.focused_permit_json(),
                                     "clarify": g.focused_clarify_json(),
                                 }
@@ -1317,7 +1320,11 @@ async fn channels_get(State(st): State<AppState>) -> Json<Value> {
         "enabled": g.cfg.channels.enabled,
         "builtin": g.cfg.channels.list_json(),
         "catalog": catalog_json(),
-        "in_process": ["telegram", "webhook", "qq", "wechat", "wecom", "dingtalk", "feishu"],
+        "in_process": hyper_loop::channel::CATALOG
+            .iter()
+            .filter(|s| s.in_process)
+            .map(|s| s.id)
+            .collect::<Vec<_>>(),
         "endpoints": endpoints,
     }))
 }

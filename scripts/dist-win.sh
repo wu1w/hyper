@@ -1,6 +1,7 @@
 #!/bin/sh
 # Windows x64 zip: console + hyper.exe sidecar + Electron.
 # Cross-compile needs cargo-xwin (or mingw-w64) and Homebrew llvm/lld on macOS.
+# win arm64 is not this script (`npm run dist:win-arm64` in web/desktop; sidecar must already be ARM).
 set -eu
 ROOT="$(CDPATH= cd -- "$(dirname "$0")/.." && pwd)"
 cd "$ROOT/web/desktop"
