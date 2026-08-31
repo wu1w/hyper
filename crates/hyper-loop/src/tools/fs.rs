@@ -34,7 +34,7 @@ pub fn read_file(
         return ToolResponse::text(
             &call.id,
             format!(
-                "Error: {} looks like a media file. Use view(path) for images, video stills, or an audio transcript.",
+                "Error: {} looks like a media file and cannot be read as text.",
                 ws.shown(&raw)
             ),
             ToolState::Error,

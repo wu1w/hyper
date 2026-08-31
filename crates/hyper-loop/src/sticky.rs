@@ -229,13 +229,14 @@ pub const IM_CARD: &str = "\
 [im] Messaging channel. Think and speak in the user's language. \
 Tool hops keep visible text empty. The hop without tools is the answer. \
 If they already named the path, Write it; do not Glob to confirm. \
-Do not Search paraphrases of one symbol. After a Search hit, use that span; do not Read or Shell cat the whole file. \
+Locate a symbol once with Grep; do not re-Grep paraphrases. After a hit, use that span; do not Read or Shell cat the whole file. \
 When Write and Shell are both needed, send them in the same hop. \
-Do not Glob a filename Search already located. \
-Do not Shell git diff / find / ls -R / tree of the whole tree; [workset] already has git status. Do not Glob **/*.";
+Do not Glob a filename Grep already located. \
+Do not Shell git diff / find / ls -R / tree of the whole tree; [workset] already has git status. Do not Glob **/*. \
+If no reply is warranted, reply with exactly NO_REPLY.";
 
 pub const IM_CARD_ZH: &str = "\
-[im] 即时消息。思考过程和回复都必须用中文。不要用英文写思考。工具跳可见正文留空；没有工具的那一跳才是回复。用户已给出路径就直接 Write，不要 Glob 确认。同一符号只 Search 一次，命中后用 Search 给出的片段，不要整文件 Read 或 cat。不要 Glob 已经 Search 到的同名文件。需要写文件和跑命令时同一跳并行 Write 和 Shell。[workset] 已有 git 状态，不要对整仓 git diff、find、ls -R、tree 或 Glob **/*。";
+[im] 即时消息。思考过程和回复都必须用中文。不要用英文写思考。工具跳可见正文留空；没有工具的那一跳才是回复。用户已给出路径就直接 Write，不要 Glob 确认。同一符号只用 Grep 定位一次，命中后用给出的片段，不要整文件 Read 或 cat。不要 Glob 已经定位到的同名文件。需要写文件和跑命令时同一跳并行 Write 和 Shell。[workset] 已有 git 状态，不要对整仓 git diff、find、ls -R、tree 或 Glob **/*。群里被 @ 但无需作答时，整段只回 NO_REPLY。";
 
 pub fn im_card(inbound: &str) -> &'static str {
     if inbound.chars().any(is_cjk) {
@@ -481,12 +482,12 @@ mod tests {
     #[test]
     fn im_card_follows_inbound_script() {
         assert!(im_card("帮我改标题").contains("都必须用中文"));
-        assert!(im_card("帮我改标题").contains("同一符号只 Search 一次"));
+        assert!(im_card("帮我改标题").contains("同一符号只用 Grep 定位一次"));
         assert!(im_card("帮我改标题").contains("不要整文件 Read 或 cat"));
-        assert!(im_card("帮我改标题").contains("不要 Glob 已经 Search 到的同名文件"));
+        assert!(im_card("帮我改标题").contains("不要 Glob 已经定位到的同名文件"));
         assert!(im_card("帮我改标题").contains("不要对整仓 git diff、find、ls -R、tree"));
-        assert!(im_card("fix the title").contains("Do not Search paraphrases"));
-        assert!(im_card("fix the title").contains("Do not Glob a filename Search already located"));
+        assert!(im_card("fix the title").contains("do not re-Grep paraphrases"));
+        assert!(im_card("fix the title").contains("Do not Glob a filename Grep already located"));
         assert!(im_card("fix the title").contains("do not Read or Shell cat the whole file"));
         assert!(im_card("fix the title")
             .contains("Do not Shell git diff / find / ls -R / tree of the whole tree"));

@@ -235,8 +235,12 @@ async fn promote_or_send(
     text: &str,
 ) -> Result<()> {
     // Leave the progress bubble as-is; the spoken answer is a new message.
+    // Long answers split into ordered bubbles instead of being clipped.
     take_bubble(&env.progress_bubble_key());
-    send_message(client, token, chat_id, text).await.map(|_| ())
+    for chunk in super::chunk::chunk_text(text, TG_TEXT_BUBBLE) {
+        send_message(client, token, chat_id, &chunk).await?;
+    }
+    Ok(())
 }
 
 async fn upsert_progress(
@@ -677,6 +681,11 @@ fn conflict_backoff_s(attempt: u32) -> u64 {
     let n = (base * 1.8_f64.powi(attempt.saturating_sub(1) as i32)).min(cap);
     n.ceil() as u64
 }
+
+/// One Telegram bubble (platform max is 4096; keep the old 3900 margin).
+/// Longer finals split via [`super::chunk::chunk_text`]; edit/progress paths
+/// still [`clip`] because a preview bubble must stay one message.
+const TG_TEXT_BUBBLE: usize = 3900;
 
 fn clip(s: &str, n: usize) -> String {
     if s.chars().count() <= n {

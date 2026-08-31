@@ -207,7 +207,7 @@ pub async fn bash(
 
 /// Whole-tree `git diff` dumped 1MB of dist/vendor on Feishu and hung the next hop.
 const TREE_DIFF_HINT: &str = "[workset] already has git status. Whole-tree `git diff` / `git show` / `git log -p` was skipped (dist/vendor dumps blow the window). Diff a specific path: git diff -- path.";
-const TREE_LIST_HINT: &str = "Do not `find` / `ls -R` / `tree` / `git ls-files` / `fd` / `rg --files` the workspace root (it dumps vendor/dist). Search for a symbol, or walk a subdirectory.";
+const TREE_LIST_HINT: &str = "Do not `find` / `ls -R` / `tree` / `git ls-files` / `fd` / `rg --files` the workspace root (it dumps vendor/dist). Grep for a symbol, or walk a subdirectory.";
 
 #[derive(Debug, PartialEq, Eq)]
 enum GitDiffRewrite {
@@ -550,8 +550,7 @@ fn find_expr_is_broad(expr: &[String]) -> bool {
 }
 
 fn name_is_star_glob(val: &str) -> bool {
-    let v = val.trim();
-    v == "*" || v == "*.*" || v.starts_with("*.")
+    super::is_unfiltered_tree_glob(val)
 }
 
 fn ls_is_recursive_root(args: &[String], ws_root: &Path, cwd: &Path) -> bool {
@@ -650,19 +649,13 @@ fn git_index_dump_without_path(args: &[String]) -> bool {
 }
 
 fn pathspec_is_tree_star(raw: &str) -> bool {
-    let p = raw.trim().trim_start_matches("./").replace('\\', "/");
-    p == "*"
-        || p == "*.*"
-        || p.starts_with("*.")
-        || p == "**"
-        || p == "**/*"
-        || p.strip_prefix("**/")
-            .is_some_and(|rest| rest == "*" || rest == "*.*" || rest.starts_with("*."))
+    super::is_unfiltered_tree_glob(raw)
 }
 
 fn fd_is_workspace_dump(args: &[String], ws_root: &Path, cwd: &Path) -> bool {
     let mut pattern: Option<&str> = None;
     let mut paths = Vec::new();
+    let mut narrowing = false;
     let mut i = 0;
     while i < args.len() {
         let a = args[i].as_str();
@@ -675,6 +668,19 @@ fn fd_is_workspace_dump(args: &[String], ws_root: &Path, cwd: &Path) -> bool {
                 paths.extend(rest.iter().map(|s| s.as_str()));
             }
             break;
+        }
+        if matches!(a, "-e" | "--extension") {
+            narrowing = true;
+            i = i.saturating_add(2);
+            continue;
+        }
+        if matches!(a, "-g" | "--glob") {
+            let g = args.get(i + 1).map(|s| s.as_str()).unwrap_or("*");
+            if !super::is_unfiltered_tree_glob(g) {
+                narrowing = true;
+            }
+            i = i.saturating_add(2);
+            continue;
         }
         if fd_flag_takes_value(a) {
             i = i.saturating_add(2);
@@ -695,7 +701,7 @@ fn fd_is_workspace_dump(args: &[String], ws_root: &Path, cwd: &Path) -> bool {
         || paths
             .iter()
             .any(|p| path_is_workspace_root(p, ws_root, cwd));
-    if !root {
+    if !root || narrowing {
         return false;
     }
     match pattern {
@@ -737,12 +743,26 @@ fn rg_files_is_root_dump(args: &[String], ws_root: &Path, cwd: &Path) -> bool {
         return false;
     }
     let mut paths = Vec::new();
+    let mut narrowing = false;
     let mut i = 0;
     while i < args.len() {
         let a = args[i].as_str();
         if a == "--" {
             paths.extend(args.get(i + 1..).unwrap_or(&[]).iter().map(|s| s.as_str()));
             break;
+        }
+        if matches!(a, "-t" | "--type" | "-T" | "--type-not") {
+            narrowing = true;
+            i = i.saturating_add(2);
+            continue;
+        }
+        if matches!(a, "-g" | "--glob") {
+            let g = args.get(i + 1).map(|s| s.as_str()).unwrap_or("*");
+            if !super::is_unfiltered_tree_glob(g) && !g.starts_with('!') {
+                narrowing = true;
+            }
+            i = i.saturating_add(2);
+            continue;
         }
         if rg_flag_takes_value(a) {
             i = i.saturating_add(2);
@@ -754,6 +774,9 @@ fn rg_files_is_root_dump(args: &[String], ws_root: &Path, cwd: &Path) -> bool {
         }
         paths.push(a);
         i += 1;
+    }
+    if narrowing {
+        return false;
     }
     paths.is_empty()
         || paths
@@ -1371,7 +1394,7 @@ mod tests {
         );
         assert_eq!(
             rewrite_skip_whole_tree_listing("find . -name '*.rs'", ws, cwd),
-            GitDiffRewrite::SkipAll
+            GitDiffRewrite::Keep
         );
         assert_eq!(
             rewrite_skip_whole_tree_listing("find . -name sticky.rs", ws, cwd),
@@ -1419,7 +1442,7 @@ mod tests {
         );
         assert_eq!(
             rewrite_skip_whole_tree_listing("git ls-files '*.rs'", ws, cwd),
-            GitDiffRewrite::SkipAll
+            GitDiffRewrite::Keep
         );
         assert_eq!(
             rewrite_skip_whole_tree_listing("git ls-files crates/hyper-loop", ws, cwd),
@@ -1431,7 +1454,7 @@ mod tests {
         );
         assert_eq!(
             rewrite_skip_whole_tree_listing("fd -e rs", ws, cwd),
-            GitDiffRewrite::SkipAll
+            GitDiffRewrite::Keep
         );
         assert_eq!(
             rewrite_skip_whole_tree_listing("fd TREE_LIST_HINT", ws, cwd),
@@ -1447,6 +1470,14 @@ mod tests {
         );
         assert_eq!(
             rewrite_skip_whole_tree_listing("rg --files crates/hyper-loop", ws, cwd),
+            GitDiffRewrite::Keep
+        );
+        assert_eq!(
+            rewrite_skip_whole_tree_listing("rg --files -t rust", ws, cwd),
+            GitDiffRewrite::Keep
+        );
+        assert_eq!(
+            rewrite_skip_whole_tree_listing("rg --files -g '*.rs'", ws, cwd),
             GitDiffRewrite::Keep
         );
         assert_eq!(

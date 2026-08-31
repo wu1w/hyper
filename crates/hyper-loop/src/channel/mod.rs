@@ -5,6 +5,7 @@
 
 mod access;
 pub mod catalog;
+mod chunk;
 mod dingtalk;
 mod envelope;
 mod feishu;
@@ -118,6 +119,40 @@ impl Default for ChannelEndpoint {
 
 fn extra_value_placeholder(v: &str) -> bool {
     v.is_empty() || v == "true" || v == "false" || v.starts_with("****")
+}
+
+/// 沉默 token 归一化：去掉方括号和中英文句读、合并空白、转大写。
+/// `NO_REPLY。` / `[silent].` 也要能命中；整段语义不变（前后多一句
+/// 仍不算沉默）。终稿拦截（manager::is_silence）和流式预览守卫
+/// （progress::content_section）共用同一套归一化，两边不会分叉。
+pub(crate) fn normalize_silence(text: &str) -> String {
+    let stripped: String = text
+        .chars()
+        .filter(|c| {
+            !matches!(
+                c,
+                '[' | ']' | '。' | '．' | '.' | '!' | '！' | '~' | '…' | '?' | '？'
+            )
+        })
+        .collect();
+    stripped
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+        .to_ascii_uppercase()
+}
+
+pub(crate) fn is_silence_token(norm: &str) -> bool {
+    matches!(norm, "NO_REPLY" | "NO REPLY" | "SILENT")
+}
+
+/// 流式期间 token 逐字到达（"N" → "NO" → …）：任何沉默 token 的前缀都
+/// 视为潜在的沉默，先压住不外播。空串（比如只到了一个 `[`）也压住。
+pub(crate) fn is_silence_prefix(norm: &str) -> bool {
+    norm.is_empty()
+        || ["NO_REPLY", "NO REPLY", "SILENT"]
+            .iter()
+            .any(|tok| tok.starts_with(norm))
 }
 
 impl ChannelEndpoint {

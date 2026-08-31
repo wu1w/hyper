@@ -532,6 +532,19 @@ async fn pump_im_progress(
                         )
                         .await;
                     }
+                    // 编辑类渠道（飞书/TG/企微）的终稿是新消息，旧进度泡
+                    // 里还留着「回复中」草稿头部；把它收敛回工具摘要
+                    // （没走工具则收回 ACK），长回答不至于上下看两遍。
+                    if let Some(line) = buf.collapse_draft() {
+                        let parts = super::outbound::reply_text(line);
+                        let _ = super::outbound::deliver_progress_since(
+                            ep.as_ref(),
+                            &env,
+                            &parts,
+                            started,
+                        )
+                        .await;
+                    }
                     if env.channel.eq_ignore_ascii_case("feishu") {
                         super::feishu::stop_typing(ep.as_ref(), &env).await;
                     }

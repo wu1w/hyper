@@ -1335,6 +1335,8 @@ async fn send_text(
 /// cap so a long tool loop does not freeze or spam new bubbles.
 const FEISHU_EDIT_CAP: u32 = 20;
 const FEISHU_ROTATE_AT: u32 = 18;
+/// One Feishu bubble in a final reply (Hermes batches at 4000 chars).
+const FEISHU_TEXT_BUBBLE: usize = 4000;
 
 struct BubbleSlot {
     mid: String,
@@ -1374,11 +1376,14 @@ async fn promote_or_send_text(
     text: &str,
 ) -> Result<()> {
     // Final replies are a new message. Patching the progress bubble hides the
-    // answer at the bottom of the chat after a long Ask wait.
+    // answer at the bottom of the chat after a long Ask wait. Long answers
+    // split into bubbles (Hermes smart chunking) so the plain-text fallback
+    // never has to clip the tail.
     take_bubble(&env.progress_bubble_key());
-    send_text(http, env, base, app_id, secret, text)
-        .await
-        .map(|_| ())
+    for chunk in super::chunk::chunk_text(text, FEISHU_TEXT_BUBBLE) {
+        send_text(http, env, base, app_id, secret, &chunk).await?;
+    }
+    Ok(())
 }
 
 async fn upsert_progress_text(

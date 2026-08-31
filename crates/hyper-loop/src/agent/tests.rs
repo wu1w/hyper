@@ -1841,7 +1841,7 @@ async fn grep_turn_cap_stops_storm() {
         ])),
         meter: false,
     };
-    let mut o = opts(&dir);
+    let mut o = opts_search(&dir);
     o.max_steps = 12;
     let mut agent = Agent::new(scripted, o).unwrap();
     let out = agent.run("find those helpers").await.unwrap();
@@ -1868,6 +1868,56 @@ async fn grep_turn_cap_stops_storm() {
     assert_eq!(
         ran, GREP_TURN_CAP as usize,
         "four Greps must run: {bodies:?}"
+    );
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+#[tokio::test]
+async fn grep_not_capped_when_search_is_off() {
+    let dir = std::env::temp_dir().join(format!(
+        "hyper-grep-nocap-{}",
+        uuid::Uuid::new_v4().simple()
+    ));
+    std::fs::create_dir_all(dir.join("src")).unwrap();
+    std::fs::write(
+        dir.join("src/lib.rs"),
+        "fn alpha() {}\nfn beta() {}\nfn gamma() {}\nfn delta() {}\nfn epsilon_unique_symbol() {}\n",
+    )
+    .unwrap();
+    let scripted = Scripted {
+        turns: Mutex::new(VecDeque::from([
+            turn_tools(vec![
+                ("g1", "grep", json!({"pattern": "alpha"})),
+                ("g2", "grep", json!({"pattern": "beta"})),
+                ("g3", "grep", json!({"pattern": "gamma"})),
+                ("g4", "grep", json!({"pattern": "delta"})),
+                ("g5", "grep", json!({"pattern": "epsilon_unique_symbol"})),
+            ]),
+            turn_text("ok"),
+        ])),
+        meter: false,
+    };
+    let mut o = opts(&dir);
+    o.max_steps = 8;
+    let mut agent = Agent::new(scripted, o).unwrap();
+    assert!(!crate::tools_schema::has_tool(agent.tools(), "Search"));
+    let out = agent.run("find those helpers").await.unwrap();
+    assert_eq!(out.text, "ok");
+    let bodies: Vec<String> = agent
+        .messages
+        .iter()
+        .filter(|m| m.role == "tool")
+        .map(|m| m.content.clone().unwrap_or_default())
+        .collect();
+    assert_eq!(bodies.len(), 5, "{bodies:?}");
+    assert!(
+        bodies.iter().all(|t| !t.contains(GREP_TURN_CAP_MSG)),
+        "Grep must not cap when Search is not mounted: {bodies:?}"
+    );
+    assert!(
+        bodies[4].contains("epsilon_unique_symbol") || bodies[4].contains("src/lib.rs"),
+        "fifth Grep must run: {}",
+        bodies[4]
     );
     let _ = std::fs::remove_dir_all(dir);
 }
@@ -1971,11 +2021,14 @@ async fn user_forbids_glob_folds_without_listing() {
 #[test]
 fn recursive_any_file_glob_detects_tree_stars() {
     assert!(recursive_any_file_glob("**/*"));
-    assert!(recursive_any_file_glob("**/*.{rs,toml,md}"));
-    assert!(recursive_any_file_glob("**/*.rs"));
+    assert!(recursive_any_file_glob("**"));
+    assert!(recursive_any_file_glob("**/*.*"));
+    assert!(!recursive_any_file_glob("**/*.{rs,toml,md}"));
+    assert!(!recursive_any_file_glob("**/*.rs"));
     assert!(!recursive_any_file_glob("**/sticky.rs"));
     assert!(!recursive_any_file_glob("crates/**/*.rs"));
     assert!(!recursive_any_file_glob("overnight/*"));
+    assert!(!recursive_any_file_glob("*.md"));
 }
 
 #[test]
@@ -2008,7 +2061,7 @@ async fn workspace_root_star_glob_folds() {
             turn_tool(
                 "glob",
                 json!({
-                    "glob_pattern": "**/*.{rs,toml,md}",
+                    "glob_pattern": "**/*",
                     "target_directory": dir.to_string_lossy(),
                 }),
             ),
@@ -2034,6 +2087,51 @@ async fn workspace_root_star_glob_folds() {
     assert!(
         !bodies[0].contains("crates/a.rs"),
         "must not walk the tree: {}",
+        bodies[0]
+    );
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+#[tokio::test]
+async fn workspace_root_ext_glob_still_runs() {
+    let dir =
+        std::env::temp_dir().join(format!("hyper-glob-ext-{}", uuid::Uuid::new_v4().simple()));
+    std::fs::create_dir_all(dir.join("crates")).unwrap();
+    std::fs::write(dir.join("crates/a.rs"), "fn a() {}\n").unwrap();
+    let mut o = opts(&dir);
+    o.max_steps = 6;
+    o.peripheral = false;
+    let scripted = Scripted {
+        turns: Mutex::new(VecDeque::from([
+            turn_tool(
+                "glob",
+                json!({
+                    "glob_pattern": "**/*.rs",
+                    "target_directory": dir.to_string_lossy(),
+                }),
+            ),
+            turn_text("ok"),
+        ])),
+        meter: false,
+    };
+    let mut agent = Agent::new(scripted, o).unwrap();
+    let out = agent.run("审计仓库").await.unwrap();
+    assert_eq!(out.text, "ok");
+    let bodies: Vec<String> = agent
+        .messages
+        .iter()
+        .filter(|m| m.role == "tool")
+        .map(|m| m.content.clone().unwrap_or_default())
+        .collect();
+    assert_eq!(bodies.len(), 1, "{bodies:?}");
+    assert!(
+        bodies[0].contains("a.rs"),
+        "root **/*.rs must walk: {}",
+        bodies[0]
+    );
+    assert!(
+        !bodies[0].contains(GLOB_TREE_MSG),
+        "filtered root glob must not fold: {}",
         bodies[0]
     );
     let _ = std::fs::remove_dir_all(dir);
@@ -3334,6 +3432,11 @@ fn parallel_safe_batch_only_read_and_view() {
         call("t2", "Task")
     ]));
     assert!(parallel_safe_batch(&[read.clone(), call("t", "Task")]));
+    assert!(parallel_safe_batch(&[read.clone(), call("l", "ReadLints")]));
+    assert!(parallel_safe_batch(&[
+        read.clone(),
+        call("td", "TodoWrite")
+    ]));
     assert!(!parallel_safe_batch(&[read.clone(), call("q", "ask")]));
     assert!(!parallel_safe_batch(&[
         read.clone(),
@@ -6252,6 +6355,119 @@ async fn view_dispatch_attaches_when_caps_allow() {
             || viewed.parts[0].url.starts_with("data:image/png;base64,"),
         "live window should keep a disk path, not a multi-MB data URI: {}",
         viewed.parts[0].url
+    );
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+#[tokio::test]
+async fn view_unmounted_is_unknown_tool() {
+    let dir =
+        std::env::temp_dir().join(format!("hyper-view-off-{}", uuid::Uuid::new_v4().simple()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let png = base64::Engine::decode(
+        &base64::engine::general_purpose::STANDARD,
+        crate::media::PROBE_IMAGE_B64,
+    )
+    .unwrap();
+    std::fs::write(dir.join("red.png"), png).unwrap();
+    let scripted = Scripted {
+        turns: Mutex::new(VecDeque::from([
+            turn_tool("view", json!({"path": "red.png"})),
+            turn_text("ok"),
+        ])),
+        meter: false,
+    };
+    let mut agent = Agent::new(scripted, opts(&dir)).unwrap();
+    assert!(!crate::tools_schema::has_tool(agent.tools(), "view"));
+    let out = agent.run("what color is red.png").await.unwrap();
+    assert_eq!(out.text, "ok");
+    let body = agent
+        .messages
+        .iter()
+        .find(|m| m.role == "tool")
+        .expect("tool")
+        .text();
+    assert!(
+        body.contains("unknown tool") && body.contains("view"),
+        "hallucinated view must not execute: {body}"
+    );
+    assert!(!body.contains("Image loaded"), "{body}");
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+#[tokio::test]
+async fn read_png_loads_image_when_view_is_off() {
+    let dir =
+        std::env::temp_dir().join(format!("hyper-read-png-{}", uuid::Uuid::new_v4().simple()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let png = base64::Engine::decode(
+        &base64::engine::general_purpose::STANDARD,
+        crate::media::PROBE_IMAGE_B64,
+    )
+    .unwrap();
+    std::fs::write(dir.join("red.png"), png).unwrap();
+    let scripted = Scripted {
+        turns: Mutex::new(VecDeque::from([
+            turn_tool("Read", json!({"path": "red.png"})),
+            turn_text("red"),
+        ])),
+        meter: false,
+    };
+    let mut agent = Agent::new(scripted, opts(&dir)).unwrap();
+    assert!(!crate::tools_schema::has_tool(agent.tools(), "view"));
+    let out = agent.run("what color is red.png").await.unwrap();
+    assert_eq!(out.text, "red");
+    let read = agent
+        .messages
+        .iter()
+        .find(|m| m.role == "tool")
+        .expect("Read tool message");
+    assert!(
+        read.text().contains("Image loaded: red.png"),
+        "{}",
+        read.text()
+    );
+    assert!(!read.text().contains("unknown tool"), "{}", read.text());
+    assert!(
+        !read.text().contains("cannot be read as text"),
+        "{}",
+        read.text()
+    );
+    assert_eq!(read.parts.len(), 1);
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+#[tokio::test]
+async fn read_lints_tsx_without_tsconfig_is_not_clean() {
+    let dir =
+        std::env::temp_dir().join(format!("hyper-lints-tsx-{}", uuid::Uuid::new_v4().simple()));
+    std::fs::create_dir_all(dir.join("web/console/src")).unwrap();
+    std::fs::write(dir.join("web/console/src/App.tsx"), "export const x = 1;\n").unwrap();
+    let scripted = Scripted {
+        turns: Mutex::new(VecDeque::from([
+            turn_tool("ReadLints", json!({"paths": ["web/console/src/App.tsx"]})),
+            turn_text("ok"),
+        ])),
+        meter: false,
+    };
+    let mut o = opts(&dir);
+    o.max_steps = 6;
+    let mut agent = Agent::new(scripted, o).unwrap();
+    let out = agent.run("check App.tsx").await.unwrap();
+    assert_eq!(out.text, "ok");
+    let body = agent
+        .messages
+        .iter()
+        .find(|m| m.role == "tool")
+        .expect("ReadLints")
+        .text();
+    assert!(
+        !body.contains("No compiler or linter errors"),
+        "missing tsconfig must not look clean: {body}"
+    );
+    assert!(
+        body.contains("tsconfig") || body.contains("tsc") || body.starts_with("Error:"),
+        "{body}"
     );
     let _ = std::fs::remove_dir_all(dir);
 }

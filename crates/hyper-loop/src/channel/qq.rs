@@ -419,29 +419,45 @@ pub async fn send(
     let token = access_token(&http, &app_id, &secret).await?;
     let bases = api_bases(ep);
     let text = super::im_md::separated_plain(&super::xfer::spoken_text(parts));
-    if !text.trim().is_empty() {
-        send_typed(
-            &http,
-            &token,
-            &bases,
-            env,
-            0,
-            json!({ "content": clip_qq(&text) }),
-        )
-        .await?;
+    // Hermes smart chunking: long answers split into bubbles at natural
+    // boundaries instead of being truncated. Only the first bubble rides the
+    // passive-reply `msg_id`; the rest go out as active messages.
+    let chunks = super::chunk::chunk_text(&text, QQ_TEXT_BUBBLE);
+    for (i, chunk) in chunks.iter().enumerate() {
+        let mut owned;
+        let target = if i == 0 {
+            env
+        } else {
+            owned = env.clone();
+            owned.meta.remove("msg_id");
+            &owned
+        };
+        send_typed(&http, &token, &bases, target, 0, json!({ "content": chunk })).await?;
     }
+    // 被动回复的 msg_id 已被首个文本泡用掉；其后的媒体和失败兜底一律走
+    // 主动消息，否则平台会拒绝重复的 msg_id。
+    let mut passive_used = !chunks.is_empty();
     for part in parts {
         if matches!(part, ContentPart::Text { .. }) {
             continue;
         }
-        if let Err(e) = send_media(&http, &token, &bases, env, part).await {
+        let mut owned;
+        let target = if passive_used {
+            owned = env.clone();
+            owned.meta.remove("msg_id");
+            &owned
+        } else {
+            passive_used = true;
+            env
+        };
+        if let Err(e) = send_media(&http, &token, &bases, target, part).await {
             eprintln!("hyper qq media: {e}");
             let line = part.fallback_line().unwrap_or_else(|| "[文件]".into());
             let _ = send_typed(
                 &http,
                 &token,
                 &bases,
-                env,
+                target,
                 0,
                 json!({ "content": clip_qq(&line) }),
             )
@@ -519,6 +535,9 @@ pub async fn send_typing(ep: Option<&ChannelEndpoint>, env: &NativePayload) -> R
     )
     .await
 }
+
+/// One QQ text bubble. Longer replies split via [`super::chunk::chunk_text`].
+const QQ_TEXT_BUBBLE: usize = 2000;
 
 fn clip_qq(text: &str) -> String {
     text.chars().take(2000).collect()

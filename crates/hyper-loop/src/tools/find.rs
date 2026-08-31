@@ -38,6 +38,19 @@ const HYPER_SKIP_DIR: &[&str] = &["sessions", "blobs", "doc-cache"];
 
 const GLOB_CAP: usize = 200;
 const GREP_CAP: usize = 80;
+
+/// Unfiltered any-file globs. `**/*.rs` / `*.{rs,md}` / `**/AGENT.md` are not.
+pub(crate) fn is_unfiltered_tree_glob(pattern: &str) -> bool {
+    let p = pattern
+        .trim()
+        .trim_matches('\'')
+        .trim_matches('"')
+        .replace('\\', "/")
+        .trim_start_matches("./")
+        .to_string();
+    matches!(p.as_str(), "*" | "*.*" | "**" | "**/*" | "**/*.*")
+}
+
 const MAX_FILE_BYTES: u64 = 1_048_576;
 /// Fallback Glob/Grep walk cap. Windows home/Documents as workspace used to
 /// freeze the hop when `rg` was missing from PATH.
@@ -91,7 +104,7 @@ pub fn glob_files(ws: &Workspace, call: &ToolCall, limits: ToolLimits) -> ToolRe
     };
     if n >= GLOB_CAP {
         text.push_str(&format!(
-            "\n… truncated at {GLOB_CAP} paths. Narrow the glob or use Search."
+            "\n… truncated at {GLOB_CAP} paths. Narrow the glob or use Grep."
         ));
     } else if end == WalkEnd::Budget {
         text.push_str(&format!(
@@ -736,6 +749,17 @@ mod tests {
             name: "Glob".into(),
             arguments: args,
         }
+    }
+
+    #[test]
+    fn unfiltered_tree_glob_is_only_star_stars() {
+        assert!(is_unfiltered_tree_glob("**/*"));
+        assert!(is_unfiltered_tree_glob("*"));
+        assert!(is_unfiltered_tree_glob("*.*"));
+        assert!(!is_unfiltered_tree_glob("**/*.rs"));
+        assert!(!is_unfiltered_tree_glob("**/*.{rs,toml,md}"));
+        assert!(!is_unfiltered_tree_glob("**/AGENT.md"));
+        assert!(!is_unfiltered_tree_glob("*.md"));
     }
 
     #[test]

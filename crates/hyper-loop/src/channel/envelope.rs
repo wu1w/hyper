@@ -303,6 +303,17 @@ impl NativePayload {
         let mut text = self.query_text();
         if text.trim().is_empty() {
             text = " ".into();
+        } else if self.is_group() {
+            // Hermes `[nickname|user_id]`: a shared group transcript is
+            // meaningless to the model unless each line says who spoke.
+            let who = if !self.sender_name.is_empty() {
+                &self.sender_name
+            } else {
+                &self.sender_id
+            };
+            if !who.is_empty() {
+                text = format!("[{who}] {text}");
+            }
         }
         let mut msg = ChatMessage::user(text);
         msg.parts = self.media_parts();
@@ -468,6 +479,25 @@ mod tests {
         assert_eq!(p.query_text(), "what color");
         assert_eq!(p.media_parts().len(), 1);
         assert_eq!(p.route_key(), "telegram:dm:9");
+    }
+
+    #[test]
+    fn group_message_carries_speaker_prefix() {
+        let mut env = NativePayload::text_only("feishu", "这个方案不行");
+        env.sender_id = "ou_1".into();
+        env.sender_name = "小明".into();
+        env.meta.insert("is_group".into(), json!(true));
+        env.meta.insert("chat_id".into(), json!("g1"));
+        let msg = env.to_chat_message();
+        assert_eq!(msg.text(), "[小明] 这个方案不行");
+
+        env.sender_name.clear();
+        let msg = env.to_chat_message();
+        assert_eq!(msg.text(), "[ou_1] 这个方案不行");
+
+        env.meta.insert("is_group".into(), json!(false));
+        let msg = env.to_chat_message();
+        assert_eq!(msg.text(), "这个方案不行", "DM has no speaker prefix");
     }
 
     #[test]

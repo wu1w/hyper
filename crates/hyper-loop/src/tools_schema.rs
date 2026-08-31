@@ -9,13 +9,13 @@ use serde_json::Value;
 pub const HARNESS_SYSTEM: &str = "Workspace assistant. Paths are relative.";
 
 const READ: &str = r#"{"type":"function","function":{"name":"Read","description":"Read a file. Path is workspace-relative unless absolute. For text, page with offset (1-based line) and limit. Prefer this over Shell cat. Parallel-safe with Glob and Grep.","parameters":{"type":"object","properties":{"path":{"type":"string","description":"Workspace-relative or absolute path."},"offset":{"type":"integer","description":"1-based start line. Omit to read from the start."},"limit":{"type":"integer","description":"Max lines."}},"required":["path"]}}}"#;
-const WRITE: &str = r#"{"type":"function","function":{"name":"Write","description":"Create or overwrite a file. Pass contents. Read first if it exists. No placeholder ellipses. Not parallel-safe with other writes to the same path.","parameters":{"type":"object","properties":{"path":{"type":"string"},"contents":{"type":"string","description":"Full file body."}},"required":["path"]}}}"#;
+const WRITE: &str = r#"{"type":"function","function":{"name":"Write","description":"Create or overwrite a file. Pass contents. Read first if it exists. No placeholder ellipses. Not parallel-safe with other writes to the same path.","parameters":{"type":"object","properties":{"path":{"type":"string"},"contents":{"type":"string","description":"Full file body."}},"required":["path","contents"]}}}"#;
 const STR_REPLACE: &str = r#"{"type":"function","function":{"name":"StrReplace","description":"Replace one unique old_string with new_string. Widen old_string until it matches once, unless replace_all. Not parallel-safe with Write/Delete on the same path.","parameters":{"type":"object","properties":{"path":{"type":"string"},"old_string":{"type":"string","description":"Exact text to find. Must be unique unless replace_all."},"new_string":{"type":"string","description":"Replacement text."},"replace_all":{"type":"boolean","description":"Replace every match. Default false."}},"required":["path","old_string","new_string"]}}}"#;
 const DELETE: &str = r#"{"type":"function","function":{"name":"Delete","description":"Delete a file. Prefer StrReplace or Write to change contents. Not parallel-safe with other mutations on the same path.","parameters":{"type":"object","properties":{"path":{"type":"string"}},"required":["path"]}}}"#;
 const GLOB: &str = r#"{"type":"function","function":{"name":"Glob","description":"Find paths matching glob_pattern (for example **/*.md). Optional target_directory. Returns paths, not contents. Parallel-safe with Read and Grep.","parameters":{"type":"object","properties":{"glob_pattern":{"type":"string"},"target_directory":{"type":"string","description":"Directory to search under. Default is the workspace root."}},"required":["glob_pattern"]}}}"#;
 const GREP: &str = r#"{"type":"function","function":{"name":"Grep","description":"ripgrep over the workspace. Prefer this over Shell rg. Optional path, glob, type, head_limit, -i, -A/-B/-C, output_mode (content | files_with_matches | count), multiline, offset. Parallel-safe with Read, Glob, and WebSearch.","parameters":{"type":"object","properties":{"pattern":{"type":"string","description":"Regex pattern."},"path":{"type":"string","description":"File or directory. Default is the workspace root."},"glob":{"type":"string","description":"Glob to filter files, e.g. *.rs."},"output_mode":{"type":"string","description":"content (default), files_with_matches, or count."},"-B":{"type":"integer","description":"Lines before each match."},"-A":{"type":"integer","description":"Lines after each match."},"-C":{"type":"integer","description":"Lines before and after."},"-i":{"type":"boolean"},"type":{"type":"string","description":"ripgrep --type, e.g. rust."},"head_limit":{"type":"integer"},"multiline":{"type":"boolean"},"offset":{"type":"integer","description":"Skip first N matches."}},"required":["pattern"]}}}"#;
 const READ_LINTS: &str = r#"{"type":"function","function":{"name":"ReadLints","description":"Read current compiler or linter errors for code files. Use after edits when diagnostics are needed explicitly; successful Write/StrReplace calls also attach diagnostics automatically.","parameters":{"type":"object","properties":{"paths":{"type":"array","items":{"type":"string"},"description":"Workspace-relative code files to check."},"path":{"type":"string","description":"Single-file compatibility alias."}}}}}"#;
-const EDIT_NOTEBOOK: &str = r#"{"type":"function","function":{"name":"EditNotebook","description":"Edit a Jupyter notebook (.ipynb). cell_idx is 0-based. is_new_cell true inserts a cell at that index. old_string and new_string are cell source, not notebook JSON. Prefer this over Write for .ipynb.","parameters":{"type":"object","properties":{"target_notebook":{"type":"string"},"path":{"type":"string","description":"Alias for target_notebook."},"cell_idx":{"type":"integer"},"is_new_cell":{"type":"boolean"},"cell_language":{"type":"string","description":"python, markdown, javascript, typescript, r, sql, shell, raw, or other."},"old_string":{"type":"string"},"new_string":{"type":"string"}},"required":["cell_idx","is_new_cell","cell_language","old_string","new_string"]}}}"#;
+const EDIT_NOTEBOOK: &str = r#"{"type":"function","function":{"name":"EditNotebook","description":"Edit a Jupyter notebook (.ipynb). cell_idx is 0-based. is_new_cell true inserts a cell at that index. old_string and new_string are cell source, not notebook JSON. Prefer this over Write for .ipynb.","parameters":{"type":"object","properties":{"target_notebook":{"type":"string"},"path":{"type":"string","description":"Alias for target_notebook."},"cell_idx":{"type":"integer"},"is_new_cell":{"type":"boolean"},"cell_language":{"type":"string","description":"python, markdown, javascript, typescript, r, sql, shell, raw, or other."},"old_string":{"type":"string"},"new_string":{"type":"string"}},"required":["target_notebook","cell_idx","is_new_cell","cell_language","old_string","new_string"]}}}"#;
 const SHELL: &str = r#"{"type":"function","function":{"name":"Shell","description":"Run a command in the workspace. Optional working_directory, block_until_ms, background. Prefer Read/Grep/Glob over cat/ls/rg. Do not parallel Shell calls that touch the same path.","parameters":{"type":"object","properties":{"command":{"type":"string"},"working_directory":{"type":"string"},"block_until_ms":{"type":"integer","description":"How long to wait before backgrounding. Default is the tool timeout."},"background":{"type":"boolean","description":"Return immediately with this call id; wait with AwaitShell."}},"required":["command"]}}}"#;
 const WEB_SEARCH: &str = r#"{"type":"function","function":{"name":"WebSearch","description":"Search the public web. Not for files in this workspace. Parallel-safe with Read, Glob, Grep, and WebFetch.","parameters":{"type":"object","properties":{"search_term":{"type":"string"}},"required":["search_term"]}}}"#;
 const WEB_FETCH: &str = r#"{"type":"function","function":{"name":"WebFetch","description":"Fetch a URL and extract readable text. Parallel-safe with WebSearch and Read.","parameters":{"type":"object","properties":{"url":{"type":"string"}},"required":["url"]}}}"#;
@@ -84,6 +84,8 @@ pub fn is_parallel_safe(name: &str) -> bool {
             | "search"
             | "web"
             | "task"
+            | "readlints"
+            | "todowrite"
             | "getdynamictools"
             | "fetchmcpresource"
     )
@@ -276,6 +278,21 @@ mod tests {
         assert!(web_search["properties"]["search_term"].is_object());
         assert!(web_search["properties"].get("query").is_none());
         assert_eq!(
+            tools[1]["function"]["parameters"]["required"],
+            serde_json::json!(["path", "contents"])
+        );
+        assert_eq!(
+            tools[7]["function"]["parameters"]["required"],
+            serde_json::json!([
+                "target_notebook",
+                "cell_idx",
+                "is_new_cell",
+                "cell_language",
+                "old_string",
+                "new_string"
+            ])
+        );
+        assert_eq!(
             tools[8]["function"]["parameters"]["properties"]["background"]["type"].as_str(),
             Some("boolean")
         );
@@ -334,6 +351,8 @@ mod tests {
         assert!(is_parallel_safe("WebSearch"));
         assert!(is_parallel_safe("Task"));
         assert!(is_parallel_safe("task"));
+        assert!(is_parallel_safe("ReadLints"));
+        assert!(is_parallel_safe("TodoWrite"));
         assert!(!is_parallel_safe("Write"));
         assert!(!is_parallel_safe("Shell"));
         assert!(!is_parallel_safe("AskQuestion"));

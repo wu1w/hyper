@@ -512,15 +512,24 @@ pub async fn send(
         }
         caption.push_str(&notes.join("\n"));
     }
-    if !caption.trim().is_empty() {
+    // Hermes smart chunking: one markdown bubble per natural segment,
+    // numbered when the reply needs more than one.
+    let chunks = super::chunk::chunk_text(&caption, MAX_MARKDOWN);
+    let total = chunks.len();
+    for (i, chunk) in chunks.iter().enumerate() {
+        let title = if total > 1 {
+            format!("hyper ({}/{total})", i + 1)
+        } else {
+            "hyper".to_string()
+        };
         post_webhook(
             &http,
             &url,
             &json!({
                 "msgtype": "markdown",
                 "markdown": {
-                    "title": "hyper",
-                    "text": caption.chars().take(MAX_MARKDOWN).collect::<String>(),
+                    "title": title,
+                    "text": chunk,
                 },
             }),
         )

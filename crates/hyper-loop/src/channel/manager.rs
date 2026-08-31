@@ -23,6 +23,20 @@ use super::ChannelsConfig;
 const DEBOUNCE: Duration = Duration::from_millis(300);
 const QUEUE_CAP: usize = 64;
 
+/// Hermes per-adapter quiet period: mobile IM users type in bursts, and
+/// 300ms only catches same-second pastes. WeChat iLink polls slowly, so its
+/// window is widest; Feishu media gets a touch longer than text.
+fn debounce_for(env: &NativePayload) -> Duration {
+    let media = !env.media_parts().is_empty();
+    match env.channel.to_ascii_lowercase().as_str() {
+        "wechat" => Duration::from_millis(3000),
+        "qq" => Duration::from_millis(1000),
+        "feishu" if media => Duration::from_millis(800),
+        "feishu" | "telegram" | "dingtalk" | "wecom" => Duration::from_millis(600),
+        _ => DEBOUNCE,
+    }
+}
+
 pub struct IngestResult {
     pub session_id: String,
     pub denied: Option<&'static str>,
@@ -197,29 +211,55 @@ async fn dispatch_loop<H: ChannelHandler>(
                 // abort / manager 被丢弃）时这里拿到 None，直接退出。
                 let Some(env) = env else { break };
                 let key = env.session_id.clone();
+                // 斜杠控制指令（/stop /steer /queue…）不等防抖：微信要等 3s
+                // 才 cancel，且同窗口的「帮我改」+ /stop 会被 merge 成一段
+                // 正文，parse_slash 要求整段以 / 开头，/stop 进了模型而任务
+                // 不停。先按原序 flush 该会话已攒的普通消息，再直接投递。
+                if env.query_text().trim_start().starts_with('/') {
+                    flush_pending(&inner, &handler, &mut pending, &mut ticks, &key).await;
+                    let tx = session_tx(&inner, &key, handler.clone()).await;
+                    let _ = tx.send(env).await;
+                    continue;
+                }
+                let wait = debounce_for(&env);
                 pending.entry(key.clone()).or_default().push(env);
                 if let Some(old) = ticks.remove(&key) {
                     old.abort();
                 }
                 let tx = flush_tx.clone();
                 ticks.insert(key.clone(), tokio::spawn(async move {
-                    sleep(DEBOUNCE).await;
+                    sleep(wait).await;
                     let _ = tx.send(key);
                 }));
             }
             Some(key) = flush_rx.recv() => {
-                ticks.remove(&key);
-                let Some(batch) = pending.remove(&key) else { continue };
-                for group in sender_batches(batch) {
-                    let Some(merged) = NativePayload::merge(group) else { continue };
-                    let tx = session_tx(&inner, &merged.session_id, handler.clone()).await;
-                    let _ = tx.send(merged).await;
-                }
+                flush_pending(&inner, &handler, &mut pending, &mut ticks, &key).await;
             }
         }
     }
     for (_, tick) in ticks {
         tick.abort();
+    }
+}
+
+/// 按到达顺序把一个会话的防抖缓存排进它的 worker。
+async fn flush_pending<H: ChannelHandler>(
+    inner: &Arc<Mutex<Inner>>,
+    handler: &Arc<H>,
+    pending: &mut HashMap<String, Vec<NativePayload>>,
+    ticks: &mut HashMap<String, tokio::task::JoinHandle<()>>,
+    key: &str,
+) {
+    if let Some(old) = ticks.remove(key) {
+        old.abort();
+    }
+    let Some(batch) = pending.remove(key) else {
+        return;
+    };
+    for group in sender_batches(batch) {
+        let Some(merged) = NativePayload::merge(group) else { continue };
+        let tx = session_tx(inner, &merged.session_id, handler.clone()).await;
+        let _ = tx.send(merged).await;
     }
 }
 
@@ -337,16 +377,7 @@ async fn session_worker<H: ChannelHandler>(
                         abort_live(live.take()).await;
                         match work.await {
                             Ok(parts) => {
-                                if let Err(e) = super::outbound::deliver_since(
-                                    ep.as_ref(),
-                                    &env,
-                                    &parts,
-                                    started,
-                                )
-                                .await
-                                {
-                                    eprintln!("hyper channel deliver: {e}");
-                                }
+                                deliver_final(ep.as_ref(), &env, &parts, started).await;
                             }
                             Err(e) => {
                                 let parts = super::outbound::reply_text(format!("error: {e}"));
@@ -449,16 +480,7 @@ async fn session_worker<H: ChannelHandler>(
                     abort_live(live.take()).await;
                     match result {
                         Ok(parts) => {
-                            if let Err(e) = super::outbound::deliver_since(
-                                ep.as_ref(),
-                                &env,
-                                &parts,
-                                started,
-                            )
-                            .await
-                            {
-                                eprintln!("hyper channel deliver: {e}");
-                            }
+                            deliver_final(ep.as_ref(), &env, &parts, started).await;
                         }
                         Err(e) => {
                             let s = e.to_string();
@@ -538,6 +560,51 @@ mod tests {
     use super::*;
 
     #[test]
+    fn silence_tokens_suppress_outbound() {
+        use super::super::outbound::reply_text;
+        assert!(is_silence(&reply_text("NO_REPLY")));
+        assert!(is_silence(&reply_text("[silent]")));
+        assert!(is_silence(&reply_text(" no reply \n")));
+        assert!(is_silence(&reply_text("[NO_REPLY]")));
+        // 尾标点不破坏沉默判定；空括号不算沉默。
+        assert!(is_silence(&reply_text("NO_REPLY。")));
+        assert!(is_silence(&reply_text("NO_REPLY.")));
+        assert!(is_silence(&reply_text("[NO_REPLY]。")));
+        assert!(!is_silence(&reply_text("[]")));
+        assert!(!is_silence(&reply_text("好的，已修改。")));
+        assert!(!is_silence(&reply_text("NO_REPLY 是什么意思？")));
+        let mut with_media = reply_text("NO_REPLY");
+        with_media.push(super::super::envelope::ContentPart::Image {
+            image_url: "https://x/i.png".into(),
+            url: String::new(),
+            mime: String::new(),
+        });
+        assert!(!is_silence(&with_media), "attachments are real content");
+        assert!(!is_silence(&[]));
+    }
+
+    #[test]
+    fn debounce_is_per_channel() {
+        let qq = NativePayload::text_only("qq", "在吗");
+        assert_eq!(debounce_for(&qq), Duration::from_millis(1000));
+        let wechat = NativePayload::text_only("wechat", "在吗");
+        assert_eq!(debounce_for(&wechat), Duration::from_millis(3000));
+        let feishu = NativePayload::text_only("feishu", "在吗");
+        assert_eq!(debounce_for(&feishu), Duration::from_millis(600));
+        let mut feishu_media = NativePayload::text_only("feishu", "看图");
+        feishu_media
+            .content_parts
+            .push(super::super::envelope::ContentPart::Image {
+                image_url: "https://x/i.png".into(),
+                url: String::new(),
+                mime: String::new(),
+            });
+        assert_eq!(debounce_for(&feishu_media), Duration::from_millis(800));
+        let hook = NativePayload::text_only("webhook", "hi");
+        assert_eq!(debounce_for(&hook), DEBOUNCE);
+    }
+
+    #[test]
     fn debounce_never_merges_adjacent_messages_from_different_senders() {
         let mut a1 = NativePayload::text_only("feishu", "a1");
         a1.sender_id = "alice".into();
@@ -575,6 +642,50 @@ mod tests {
             .await
             .expect("dispatch_loop must exit once all ingest senders drop")
             .unwrap();
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[tokio::test]
+    async fn slash_control_skips_debounce() {
+        let dir =
+            std::env::temp_dir().join(format!("hyper-slash-dbc-{}", uuid::Uuid::new_v4().simple()));
+        let router = SessionRouter::open(dir.join("routes.json")).unwrap();
+        let cancelled = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let cancelled_h = cancelled.clone();
+        let mgr = ChannelManager::start(
+            ChannelsConfig::default(),
+            router,
+            move |_env, cancel: crate::tool_calls::CancelFlag, _steer| {
+                let cancelled_h = cancelled_h.clone();
+                async move {
+                    let deadline = Instant::now() + Duration::from_secs(5);
+                    while !cancel.is_cancelled() && Instant::now() < deadline {
+                        sleep(Duration::from_millis(20)).await;
+                    }
+                    cancelled_h.store(cancel.is_cancelled(), std::sync::atomic::Ordering::SeqCst);
+                    Ok(Vec::new())
+                }
+            },
+        );
+        // 微信防抖 3s：先发的普通消息进 pending，/stop 必须绕开防抖直接
+        // cancel，而不是等窗口或和「帮我改」merge 成一段正文。
+        let first = mgr
+            .ingest(NativePayload::text_only("wechat", "帮我改"))
+            .await
+            .unwrap();
+        assert!(first.denied.is_none());
+        sleep(Duration::from_millis(100)).await;
+        let mut stop = NativePayload::text_only("wechat", "/stop");
+        stop.session_id = first.session_id.clone();
+        mgr.ingest(stop).await.unwrap();
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while !cancelled.load(std::sync::atomic::Ordering::SeqCst) && Instant::now() < deadline {
+            sleep(Duration::from_millis(50)).await;
+        }
+        assert!(
+            cancelled.load(std::sync::atomic::Ordering::SeqCst),
+            "/stop must cancel the live turn inside the 3s wechat debounce window"
+        );
         let _ = std::fs::remove_dir_all(dir);
     }
 
@@ -953,4 +1064,34 @@ fn spawn_ack(
         let parts = super::outbound::reply_text(text);
         let _ = super::outbound::deliver_since(ep.as_ref(), &env, &parts, Instant::now()).await;
     });
+}
+
+/// Hermes intentional-silence tokens: when the agent's whole reply is
+/// NO_REPLY / SILENT it read the chat and chose not to speak. The turn stays
+/// in the transcript; only the outbound message is held back. Errors still
+/// report through the `Err` path, and the wrap-up contract is untouched
+/// because the reply text is non-empty.
+fn is_silence(parts: &[super::envelope::ContentPart]) -> bool {
+    if parts.is_empty() || parts.iter().any(|p| p.as_text().is_none()) {
+        // Media attachments are real content, never a silence token.
+        return false;
+    }
+    let text = super::outbound::parts_to_text(parts);
+    let norm = super::normalize_silence(&text);
+    // 空串（比如整段只有 "[]"）不是沉默。
+    !norm.is_empty() && super::is_silence_token(&norm)
+}
+
+async fn deliver_final(
+    ep: Option<&super::ChannelEndpoint>,
+    env: &NativePayload,
+    parts: &[super::envelope::ContentPart],
+    started: Instant,
+) {
+    if is_silence(parts) {
+        return;
+    }
+    if let Err(e) = super::outbound::deliver_since(ep, env, parts, started).await {
+        eprintln!("hyper channel deliver: {e}");
+    }
 }

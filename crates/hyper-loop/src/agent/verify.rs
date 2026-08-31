@@ -4,12 +4,13 @@
 //! Commands stay cheap: `cargo test -p <pkg> --lib` or `pytest` on related
 //! files. Full-workspace `cargo test` is never the default.
 
+use std::collections::HashMap;
 use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 
-use crate::tool_calls::CancelFlag;
+use crate::tool_calls::{CancelFlag, ToolState};
 use serde_json::Value;
 
 const DIAG_TIMEOUT: Duration = Duration::from_secs(12);
@@ -95,25 +96,122 @@ pub fn scoped_test_cmd(root: &Path, edited: &[String]) -> Option<String> {
     python_unittest(root)
 }
 
-/// Compile/lint after a successful Write/StrReplace. Empty = clean (append nothing).
+/// Compile/lint after a successful Write/StrReplace. `None` = clean or nothing
+/// to attach (timeouts stay off this path so a Write is not tagged `[diagnostics]`
+/// for a checker that never finished).
 /// Runs on a blocking thread so `cargo check` cannot stall the agent runtime.
 pub async fn run_diagnostics_async(
     root: &Path,
     edited: &[String],
     cancel: &CancelFlag,
 ) -> Option<String> {
+    match run_lints_async(root, edited, cancel).await {
+        LintReport::Findings(s) => Some(truncate_diag(format!("[diagnostics]\n{s}"))),
+        _ => None,
+    }
+}
+
+pub async fn run_lints_async(root: &Path, edited: &[String], cancel: &CancelFlag) -> LintReport {
     let root = root.to_path_buf();
     let edited = edited.to_vec();
     let cancel = cancel.clone();
-    tokio::task::spawn_blocking(move || run_diagnostics(&root, &edited, &cancel))
+    tokio::task::spawn_blocking(move || run_lints(&root, &edited, &cancel))
         .await
-        .ok()
-        .flatten()
+        .unwrap_or(LintReport::Cancelled)
+}
+
+/// Honest ReadLints / cargo-check outcome. Timeout and "never ran" are not Clean.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum LintReport {
+    Clean,
+    Findings(String),
+    Incomplete(String),
+    Cancelled,
+}
+
+pub fn read_lints_reply(report: &LintReport, paths: &[String]) -> (String, ToolState) {
+    match report {
+        LintReport::Clean => (
+            format!(
+                "No compiler or linter errors found for: {}",
+                paths.join(", ")
+            ),
+            ToolState::Success,
+        ),
+        LintReport::Findings(s) => (
+            truncate_diag(format!("[diagnostics]\n{s}")),
+            ToolState::Success,
+        ),
+        LintReport::Incomplete(s) => (format!("Error: {s}"), ToolState::Error),
+        LintReport::Cancelled => ("Error: lint check aborted".into(), ToolState::Interrupted),
+    }
+}
+
+fn truncate_diag(mut out: String) -> String {
+    if out.len() > DIAG_MAX {
+        out.truncate(DIAG_MAX);
+        while !out.is_char_boundary(out.len()) {
+            out.pop();
+        }
+    }
+    out
 }
 
 pub fn run_diagnostics(root: &Path, edited: &[String], cancel: &CancelFlag) -> Option<String> {
+    match run_lints(root, edited, cancel) {
+        LintReport::Findings(s) => Some(truncate_diag(format!("[diagnostics]\n{s}"))),
+        _ => None,
+    }
+}
+
+enum Check {
+    Clean,
+    Findings(String),
+    Timeout(&'static str),
+    Skip(String),
+    Cancelled,
+}
+
+fn merge_checks(checks: Vec<Check>) -> LintReport {
+    let mut findings = Vec::new();
+    let mut notes = Vec::new();
+    let mut ran = false;
+    for c in checks {
+        match c {
+            Check::Cancelled => return LintReport::Cancelled,
+            Check::Findings(s) => {
+                ran = true;
+                findings.push(s);
+            }
+            Check::Clean => ran = true,
+            Check::Timeout(what) => notes.push(format!(
+                "{what} timed out after {}s. That is not a clean result.",
+                DIAG_TIMEOUT.as_secs()
+            )),
+            Check::Skip(why) => notes.push(why),
+        }
+    }
+    if !findings.is_empty() {
+        let mut s = findings.join("\n");
+        if !notes.is_empty() {
+            s.push('\n');
+            s.push_str(&notes.join("\n"));
+        }
+        return LintReport::Findings(s);
+    }
+    if !notes.is_empty() {
+        return LintReport::Incomplete(notes.join("\n"));
+    }
+    if ran {
+        LintReport::Clean
+    } else {
+        LintReport::Incomplete("no compiler or linter ran for these paths".into())
+    }
+}
+
+pub fn run_lints(root: &Path, edited: &[String], cancel: &CancelFlag) -> LintReport {
     if cancel.is_cancelled() {
-        return None;
+        return LintReport::Cancelled;
     }
     let code: Vec<String> = edited
         .iter()
@@ -121,37 +219,34 @@ pub fn run_diagnostics(root: &Path, edited: &[String], cancel: &CancelFlag) -> O
         .filter(|p| is_code_path(p))
         .collect();
     if code.is_empty() {
-        return None;
+        return LintReport::Incomplete("no code files to check".into());
     }
-    let raw = cargo_diag(root, &code, cancel)
-        .or_else(|| tsc_diag(root, &code, cancel))
-        .or_else(|| ruff_diag(root, &code, cancel))?;
-    let text = raw.trim();
-    if text.is_empty() {
-        return None;
+    let mut checks = Vec::new();
+    if code.iter().any(|p| p.ends_with(".rs")) {
+        checks.push(cargo_check(root, &code, cancel));
     }
-    let mut out = String::from("[diagnostics]\n");
-    out.push_str(text);
-    if out.len() > DIAG_MAX {
-        out.truncate(DIAG_MAX);
-        while !out.is_char_boundary(out.len()) {
-            out.pop();
-        }
+    if has_ts_path(&code) {
+        checks.push(tsc_check(root, &code, cancel));
     }
-    Some(out)
+    if code.iter().any(|p| p.ends_with(".py")) {
+        checks.push(ruff_check(root, &code, cancel));
+    }
+    merge_checks(checks)
 }
 
-fn cargo_diag(root: &Path, edited: &[String], cancel: &CancelFlag) -> Option<String> {
+fn cargo_check(root: &Path, edited: &[String], cancel: &CancelFlag) -> Check {
     let rust: Vec<&str> = edited
         .iter()
         .map(|s| s.as_str())
         .filter(|p| p.ends_with(".rs"))
         .collect();
     if rust.is_empty() {
-        return None;
+        return Check::Skip("no Rust files".into());
     }
-    let (_, name) = nearest_cargo_package(root, rust[0])?;
-    let stdout = run_cmd(
+    let Some((_, name)) = nearest_cargo_package(root, rust[0]) else {
+        return Check::Skip(format!("no Cargo.toml package for {}", rust[0]));
+    };
+    match run_cmd(
         "cargo",
         &[
             "check",
@@ -163,88 +258,208 @@ fn cargo_diag(root: &Path, edited: &[String], cancel: &CancelFlag) -> Option<Str
         ],
         root,
         cancel,
-    )?;
-    let mut errors = Vec::new();
-    for line in stdout.lines() {
-        let Ok(v) = serde_json::from_str::<Value>(line) else {
+    ) {
+        CmdFinish::Cancelled => Check::Cancelled,
+        CmdFinish::Timeout => Check::Timeout("cargo check"),
+        CmdFinish::Failed => Check::Skip("cargo check could not start".into()),
+        CmdFinish::Output(stdout) => {
+            let mut errors = Vec::new();
+            for line in stdout.lines() {
+                let Ok(v) = serde_json::from_str::<Value>(line) else {
+                    continue;
+                };
+                if v["reason"].as_str() != Some("compiler-message") {
+                    continue;
+                }
+                let msg = &v["message"];
+                if msg["level"].as_str() != Some("error") {
+                    continue;
+                }
+                if let Some(rendered) = msg["rendered"].as_str() {
+                    let t = rendered.trim();
+                    if !t.is_empty() && !errors.iter().any(|e: &String| e == t) {
+                        errors.push(t.to_string());
+                    }
+                } else if let Some(m) = msg["message"].as_str() {
+                    if !errors.iter().any(|e: &String| e == m) {
+                        errors.push(m.to_string());
+                    }
+                }
+            }
+            if errors.is_empty() {
+                Check::Clean
+            } else {
+                Check::Findings(errors.join("\n"))
+            }
+        }
+    }
+}
+
+fn has_ts_path(edited: &[String]) -> bool {
+    edited.iter().any(|p| is_ts_path(p))
+}
+
+fn is_ts_path(p: &str) -> bool {
+    matches!(
+        p.rsplit('.').next().unwrap_or(""),
+        "ts" | "tsx" | "js" | "jsx" | "mjs" | "cjs"
+    )
+}
+
+pub(crate) fn nearest_tsconfig(root: &Path, rel: &str) -> Option<PathBuf> {
+    let mut dir = root.join(rel);
+    if dir.is_file() || dir.extension().is_some() {
+        dir.pop();
+    }
+    loop {
+        if dir.join("tsconfig.json").is_file() {
+            return Some(dir);
+        }
+        if dir == *root || !dir.pop() {
+            break;
+        }
+    }
+    None
+}
+
+fn shown_dir(root: &Path, dir: &Path) -> String {
+    dir.strip_prefix(root)
+        .map(|p| {
+            let s = p.to_string_lossy().replace('\\', "/");
+            if s.is_empty() {
+                ".".into()
+            } else {
+                s
+            }
+        })
+        .unwrap_or_else(|_| dir.display().to_string())
+}
+
+fn tsc_bin(dir: &Path, root: &Path) -> Option<PathBuf> {
+    for base in [dir, root] {
+        let unix = base.join("node_modules/.bin/tsc");
+        if unix.is_file() {
+            return Some(unix);
+        }
+        #[cfg(windows)]
+        {
+            let cmd = base.join("node_modules/.bin/tsc.cmd");
+            if cmd.is_file() {
+                return Some(cmd);
+            }
+        }
+    }
+    None
+}
+
+fn tsc_check(root: &Path, edited: &[String], cancel: &CancelFlag) -> Check {
+    let ts_files: Vec<&str> = edited
+        .iter()
+        .map(|s| s.as_str())
+        .filter(|p| is_ts_path(p))
+        .collect();
+    if ts_files.is_empty() {
+        return Check::Skip("no TypeScript files".into());
+    }
+    let mut by_dir: HashMap<PathBuf, Vec<&str>> = HashMap::new();
+    let mut unconfigured = Vec::new();
+    for p in &ts_files {
+        match nearest_tsconfig(root, p) {
+            Some(dir) => by_dir.entry(dir).or_default().push(*p),
+            None => unconfigured.push(*p),
+        }
+    }
+    let mut findings = Vec::new();
+    let mut notes = Vec::new();
+    let mut ran = false;
+    for (dir, _) in &by_dir {
+        if cancel.is_cancelled() {
+            return Check::Cancelled;
+        }
+        let rel = shown_dir(root, dir);
+        let Some(bin) = tsc_bin(dir, root) else {
+            notes.push(format!(
+                "tsc not found for {rel} (no node_modules/.bin/tsc). That is not a clean TypeScript check."
+            ));
             continue;
         };
-        if v["reason"].as_str() != Some("compiler-message") {
-            continue;
-        }
-        let msg = &v["message"];
-        if msg["level"].as_str() != Some("error") {
-            continue;
-        }
-        if let Some(rendered) = msg["rendered"].as_str() {
-            let t = rendered.trim();
-            if !t.is_empty() && !errors.iter().any(|e: &String| e == t) {
-                errors.push(t.to_string());
+        match run_cmd(
+            &bin.to_string_lossy(),
+            &["--noEmit", "--pretty", "false"],
+            dir,
+            cancel,
+        ) {
+            CmdFinish::Cancelled => return Check::Cancelled,
+            CmdFinish::Timeout => notes.push(format!(
+                "tsc timed out after {}s in {rel}. That is not a clean result.",
+                DIAG_TIMEOUT.as_secs()
+            )),
+            CmdFinish::Failed => {
+                notes.push(format!("tsc could not start in {rel}"));
             }
-        } else if let Some(m) = msg["message"].as_str() {
-            if !errors.iter().any(|e: &String| e == m) {
-                errors.push(m.to_string());
+            CmdFinish::Output(out) => {
+                ran = true;
+                let err: String = out
+                    .lines()
+                    .filter(|l| l.contains("error TS"))
+                    .take(12)
+                    .collect::<Vec<_>>()
+                    .join("\n");
+                if !err.trim().is_empty() {
+                    findings.push(err);
+                }
             }
         }
     }
-    if errors.is_empty() {
-        return None;
+    for p in unconfigured {
+        notes.push(format!(
+            "no tsconfig.json for {p} (looked in parent directories). That is not a clean TypeScript check."
+        ));
     }
-    Some(errors.join("\n"))
-}
-
-fn tsc_diag(root: &Path, edited: &[String], cancel: &CancelFlag) -> Option<String> {
-    let ts = edited.iter().any(|p| {
-        let e = p.rsplit('.').next().unwrap_or("");
-        matches!(e, "ts" | "tsx" | "js" | "jsx" | "mjs" | "cjs")
-    });
-    if !ts || !root.join("tsconfig.json").is_file() {
-        return None;
+    if !findings.is_empty() {
+        let mut s = findings.join("\n");
+        if !notes.is_empty() {
+            s.push('\n');
+            s.push_str(&notes.join("\n"));
+        }
+        return Check::Findings(s);
     }
-    let bin = root.join("node_modules/.bin/tsc");
-    let (prog, args): (String, Vec<String>) = if bin.is_file() {
-        (
-            bin.to_string_lossy().into_owned(),
-            vec!["--noEmit".into(), "--pretty".into(), "false".into()],
-        )
+    if !notes.is_empty() {
+        return Check::Skip(notes.join("\n"));
+    }
+    if ran {
+        Check::Clean
     } else {
-        return None;
-    };
-    let arg_refs: Vec<&str> = args.iter().map(|s| s.as_str()).collect();
-    let out = run_cmd(&prog, &arg_refs, root, cancel)?;
-    let err: String = out
-        .lines()
-        .filter(|l| l.contains("error TS"))
-        .take(12)
-        .collect::<Vec<_>>()
-        .join("\n");
-    if err.trim().is_empty() {
-        None
-    } else {
-        Some(err)
+        Check::Skip("TypeScript checker did not run".into())
     }
 }
 
-fn ruff_diag(root: &Path, edited: &[String], cancel: &CancelFlag) -> Option<String> {
+fn ruff_check(root: &Path, edited: &[String], cancel: &CancelFlag) -> Check {
     let py: Vec<&str> = edited
         .iter()
         .map(|s| s.as_str())
         .filter(|p| p.ends_with(".py"))
         .collect();
     if py.is_empty() {
-        return None;
+        return Check::Skip("no Python files".into());
     }
     if !cmd_exists("ruff") {
-        return None;
+        return Check::Skip("ruff not found on PATH. That is not a clean Python check.".into());
     }
     let mut args = vec!["check", "--quiet"];
     args.extend(py.iter().copied());
-    let out = run_cmd("ruff", &args, root, cancel)?;
-    let t = out.trim();
-    if t.is_empty() {
-        None
-    } else {
-        Some(t.to_string())
+    match run_cmd("ruff", &args, root, cancel) {
+        CmdFinish::Cancelled => Check::Cancelled,
+        CmdFinish::Timeout => Check::Timeout("ruff"),
+        CmdFinish::Failed => Check::Skip("ruff could not start".into()),
+        CmdFinish::Output(out) => {
+            let t = out.trim();
+            if t.is_empty() {
+                Check::Clean
+            } else {
+                Check::Findings(t.to_string())
+            }
+        }
     }
 }
 
@@ -257,25 +472,35 @@ fn cmd_exists(name: &str) -> bool {
         .is_ok_and(|s| s.success())
 }
 
-fn run_cmd(prog: &str, args: &[&str], cwd: &Path, cancel: &CancelFlag) -> Option<String> {
+enum CmdFinish {
+    Output(String),
+    Timeout,
+    Cancelled,
+    Failed,
+}
+
+fn run_cmd(prog: &str, args: &[&str], cwd: &Path, cancel: &CancelFlag) -> CmdFinish {
     let mut cmd = Command::new(prog);
     crate::proc_spawn::hide_window(&mut cmd);
     cmd.args(args)
         .current_dir(cwd)
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
-    if prog == "cargo" {
+    if prog == "cargo" || prog.ends_with("cargo") || prog.ends_with("cargo.exe") {
         cmd.env("CARGO_TARGET_DIR", cwd.join("target"));
         cmd.env("CARGO_TERM_COLOR", "never");
         cmd.env("CARGO_INCREMENTAL", "0");
     }
-    let mut child = cmd.spawn().ok()?;
+    let mut child = match cmd.spawn() {
+        Ok(c) => c,
+        Err(_) => return CmdFinish::Failed,
+    };
     let started = Instant::now();
     loop {
         if cancel.is_cancelled() {
             let _ = child.kill();
             let _ = child.wait();
-            return None;
+            return CmdFinish::Cancelled;
         }
         match child.try_wait() {
             Ok(Some(_)) => {
@@ -288,17 +513,17 @@ fn run_cmd(prog: &str, args: &[&str], cwd: &Path, cancel: &CancelFlag) -> Option
                         let _ = err.read_to_end(&mut buf);
                     }
                 }
-                return Some(String::from_utf8_lossy(&buf).into_owned());
+                return CmdFinish::Output(String::from_utf8_lossy(&buf).into_owned());
             }
             Ok(None) if started.elapsed() > DIAG_TIMEOUT => {
                 let _ = child.kill();
                 let _ = child.wait();
-                return None;
+                return CmdFinish::Timeout;
             }
             Ok(None) => std::thread::sleep(Duration::from_millis(40)),
             Err(_) => {
                 let _ = child.kill();
-                return None;
+                return CmdFinish::Failed;
             }
         }
     }
@@ -463,7 +688,7 @@ pub fn python_launcher() -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::tool_calls::CancelFlag;
+    use crate::tool_calls::{CancelFlag, ToolState};
 
     #[test]
     fn code_path_skips_office_docs() {
@@ -583,6 +808,79 @@ mod tests {
         std::fs::write(dir.join("src/lib.rs"), "pub fn f() -> i32 { 1 }\n").unwrap();
         let cancel = CancelFlag::new();
         assert!(run_diagnostics(&dir, &["src/lib.rs".into()], &cancel).is_none());
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn timeout_and_skip_are_not_clean() {
+        assert_eq!(
+            merge_checks(vec![Check::Timeout("cargo check")]),
+            LintReport::Incomplete(
+                "cargo check timed out after 12s. That is not a clean result.".into()
+            )
+        );
+        assert_eq!(
+            merge_checks(vec![Check::Clean, Check::Timeout("cargo check")]),
+            LintReport::Incomplete(
+                "cargo check timed out after 12s. That is not a clean result.".into()
+            )
+        );
+        assert_eq!(merge_checks(vec![Check::Clean]), LintReport::Clean);
+        let skip = merge_checks(vec![Check::Skip(
+            "no tsconfig.json for App.tsx (looked in parent directories). That is not a clean TypeScript check.".into(),
+        )]);
+        match skip {
+            LintReport::Incomplete(s) => assert!(s.contains("App.tsx"), "{s}"),
+            other => panic!("{other:?}"),
+        }
+        let (text, state) = read_lints_reply(
+            &LintReport::Incomplete(
+                "cargo check timed out after 12s. That is not a clean result.".into(),
+            ),
+            &["find.rs".into()],
+        );
+        assert_eq!(state, ToolState::Error);
+        assert!(text.starts_with("Error:"), "{text}");
+        assert!(!text.contains("No compiler or linter errors"), "{text}");
+        let (ok, st) = read_lints_reply(&LintReport::Clean, &["src/lib.rs".into()]);
+        assert_eq!(st, ToolState::Success);
+        assert!(ok.contains("No compiler or linter errors"), "{ok}");
+    }
+
+    #[test]
+    fn nearest_tsconfig_walks_from_the_file() {
+        let dir =
+            std::env::temp_dir().join(format!("hyper-tsconfig-{}", uuid::Uuid::new_v4().simple()));
+        std::fs::create_dir_all(dir.join("web/console/src")).unwrap();
+        std::fs::write(dir.join("web/console/tsconfig.json"), "{}\n").unwrap();
+        std::fs::write(dir.join("web/console/src/App.tsx"), "export {}\n").unwrap();
+        let found = nearest_tsconfig(&dir, "web/console/src/App.tsx").unwrap();
+        assert_eq!(found, dir.join("web/console"));
+        assert!(nearest_tsconfig(&dir, "crates/hyper-loop/src/lib.rs").is_none());
+        let report = run_lints(
+            &dir,
+            &[
+                "crates/hyper-loop/src/find.rs".into(),
+                "web/console/src/App.tsx".into(),
+            ],
+            &CancelFlag::new(),
+        );
+        match report {
+            LintReport::Incomplete(s) => {
+                assert!(
+                    s.contains("App.tsx") || s.contains("tsc not found") || s.contains("no Cargo"),
+                    "{s}"
+                );
+                assert!(!s.contains("No compiler or linter errors"), "{s}");
+            }
+            LintReport::Findings(s) => {
+                assert!(
+                    s.contains("tsc") || s.contains("Cargo") || s.contains("App.tsx"),
+                    "{s}"
+                );
+            }
+            other => panic!("mixed rust+ts without root tsconfig must not look clean: {other:?}"),
+        }
         let _ = std::fs::remove_dir_all(dir);
     }
 }

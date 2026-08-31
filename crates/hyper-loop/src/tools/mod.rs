@@ -36,6 +36,7 @@ pub use code_index::{
     bash_search_query, render_query_spans, run_search, search_dump_too_big, CodeIndex,
     SEARCH_WARMING,
 };
+pub(crate) use find::is_unfiltered_tree_glob;
 pub use fold::{fold_text, BlobStore, Folded};
 pub use path::{is_reparse_or_symlink, Workspace};
 pub use view::view;
@@ -123,7 +124,21 @@ pub async fn run_tool(
     blobs: Option<&BlobStore>,
 ) -> ToolResponse {
     match crate::tools_schema::dispatch_name(&call.name) {
-        "read" => fs::read_file(workspace, call, limits, blobs),
+        "read" => {
+            if crate::tools::arg_path(&call.arguments)
+                .is_some_and(|p| crate::media::is_media_ext(&p))
+            {
+                return view::view(
+                    workspace,
+                    call,
+                    &crate::media::MediaCaps::default(),
+                    &crate::media::MediaBins::detect(),
+                    crate::media::MAX_INLINE_MEDIA_BYTES,
+                )
+                .await;
+            }
+            fs::read_file(workspace, call, limits, blobs)
+        }
         "write" => fs::write_file(workspace, call),
         "edit" => fs::edit_file(workspace, call),
         "delete" => fs::delete_file(workspace, call),

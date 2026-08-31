@@ -27,7 +27,7 @@ use crate::tool_calls::{
     CancelFlag, TextBlock, ToolCall, ToolResponse, ToolState, OFFLOAD_TIMEOUT_RATIO,
 };
 use crate::tools::{run_search, run_tool, view, CodeIndex, Workspace};
-use crate::tools_schema::{dispatch_name, is_parallel_safe};
+use crate::tools_schema::{dispatch_name, has_tool, is_parallel_safe};
 
 /// Per user turn. Hop-1 can still fire four symbols in parallel; later
 /// paraphrases get a Success nudge to Read instead of another index scan.
@@ -42,8 +42,7 @@ pub(crate) fn claim_search_slot(calls: &std::sync::atomic::AtomicU32) -> bool {
 pub(crate) const GREP_TURN_CAP: u32 = 4;
 pub(crate) const GREP_TURN_CAP_MSG: &str =
     "Grep budget for this turn is used. Search or Read instead of more Grep.";
-pub(crate) const GREP_FORBIDDEN_MSG: &str =
-    "The user forbade Grep this turn. Search or Read instead.";
+pub(crate) const GREP_FORBIDDEN_MSG: &str = "The user forbade Grep this turn. Read instead.";
 const STEER_SKIPPED_MSG: &str =
     "Skipped before launch because the user sent a steering update. Continue from the steering instruction after the paired tool results.";
 
@@ -118,9 +117,9 @@ pub(crate) const READ_SEARCH_SPAN_MSG: &str =
 pub(crate) const GLOB_NAMED_WRITE_MSG: &str =
     "The user already named the file to Write. Do not Glob the parent directory to copy neighbors.";
 pub(crate) const GLOB_FORBIDDEN_MSG: &str =
-    "The user forbade Glob this turn. Write the named path or Search/Read instead.";
+    "The user forbade Glob this turn. Write the named path or Read instead.";
 pub(crate) const GLOB_TREE_MSG: &str =
-    "Do not Glob **/* of the workspace root (it dumps vendor/dist and caps at 200 paths). Search for a symbol, or Glob inside a subdirectory.";
+    "Do not Glob **/* of the workspace root (it dumps vendor/dist and caps at 200 paths). Grep for a symbol, or Glob with an extension / inside a subdirectory.";
 pub(crate) const GLOB_AFTER_SEARCH_MSG: &str =
     "Search already located this file this turn. Use that path; do not Glob for the same name.";
 pub(crate) const SHELL_CAT_SEARCH_MSG: &str =
@@ -835,7 +834,7 @@ impl<C: Completer> Agent<C> {
                 return Some(grep_after_search_reply(&self.messages));
             }
         }
-        if !claim_grep_slot(&self.grep_calls) {
+        if has_tool(&self.tools, "Search") && !claim_grep_slot(&self.grep_calls) {
             return Some(search_nudge_reply(GREP_TURN_CAP_MSG, &self.messages));
         }
         None
@@ -976,6 +975,9 @@ impl<C: Completer> Agent<C> {
             if let Some(msg) = self.read_gate(call) {
                 return ToolResponse::text(&call.id, msg, ToolState::Success);
             }
+            if media_read_path(call).is_some() {
+                return self.dispatch_view(call).await;
+            }
         }
         if dispatch_name(&call.name) == "glob" {
             if let Some(msg) = self.glob_gate(call) {
@@ -998,17 +1000,24 @@ impl<C: Completer> Agent<C> {
                     ToolState::Error,
                 ),
             },
-            "search" => match &self.code_index {
-                Some(idx) => {
-                    if let Some(msg) = self.search_gate(call) {
-                        return ToolResponse::text(&call.id, msg, ToolState::Success);
+            "search" => {
+                if !has_tool(&self.tools, "Search") {
+                    return unknown_tool_reply(&call.id, &call.name);
+                }
+                match &self.code_index {
+                    Some(idx) => {
+                        if let Some(msg) = self.search_gate(call) {
+                            return ToolResponse::text(&call.id, msg, ToolState::Success);
+                        }
+                        run_search(idx, &self.workspace, call, self.limits)
                     }
-                    run_search(idx, &self.workspace, call, self.limits)
+                    None => ToolResponse::text(
+                        &call.id,
+                        crate::tools::SEARCH_WARMING,
+                        ToolState::Success,
+                    ),
                 }
-                None => {
-                    ToolResponse::text(&call.id, crate::tools::SEARCH_WARMING, ToolState::Success)
-                }
-            },
+            }
             "readlints" => {
                 let mut paths: Vec<String> = call
                     .arguments
@@ -1042,26 +1051,10 @@ impl<C: Completer> Agent<C> {
                         ToolState::Error,
                     );
                 }
-                match verify::run_diagnostics_async(self.workspace.root(), &paths, &self.cancel)
-                    .await
-                {
-                    Some(diagnostics) => {
-                        ToolResponse::text(&call.id, diagnostics, ToolState::Success)
-                    }
-                    None if self.cancel.is_cancelled() => ToolResponse::text(
-                        &call.id,
-                        "Error: lint check aborted",
-                        ToolState::Interrupted,
-                    ),
-                    None => ToolResponse::text(
-                        &call.id,
-                        format!(
-                            "No compiler or linter errors found for: {}",
-                            paths.join(", ")
-                        ),
-                        ToolState::Success,
-                    ),
-                }
+                let report =
+                    verify::run_lints_async(self.workspace.root(), &paths, &self.cancel).await;
+                let (text, state) = verify::read_lints_reply(&report, &paths);
+                ToolResponse::text(&call.id, text, state)
             }
             "web" => {
                 let Some(web) = self.web.clone() else {
@@ -1229,28 +1222,10 @@ impl<C: Completer> Agent<C> {
             // Not in tools[]. XML / hallucinated native calls still need a result.
             "skill" => run_skill(&self.skills, call, self.limits, Some(&self.blobs)),
             "view" => {
-                let ws = self.workspace.clone();
-                let caps = self.media_caps.clone();
-                let bins = self.media_bins.clone();
-                let max_bytes = self.media_max_bytes;
-                let owned = call.clone();
-                let agent_cancel = self.cancel.clone();
-                self.coordinator
-                    .execute(call.clone(), "hyper", None, move |per_call| async move {
-                        let (merged, link) = spawn_cancel_bridge(agent_cancel, per_call);
-                        let res = tokio::select! {
-                            biased;
-                            _ = merged.cancelled() => ToolResponse::text(
-                                &owned.id,
-                                "Error: tool task aborted",
-                                ToolState::Interrupted,
-                            ),
-                            r = view(&ws, &owned, &caps, &bins, max_bytes) => r,
-                        };
-                        link.abort();
-                        res
-                    })
-                    .await
+                if !has_tool(&self.tools, "view") {
+                    return unknown_tool_reply(&call.id, &call.name);
+                }
+                self.dispatch_view(call).await
             }
             "computeruse" => {
                 let owned = call.clone();
@@ -1299,9 +1274,34 @@ impl<C: Completer> Agent<C> {
         }
     }
 
+    async fn dispatch_view(&self, call: &ToolCall) -> ToolResponse {
+        let ws = self.workspace.clone();
+        let caps = self.media_caps.clone();
+        let bins = self.media_bins.clone();
+        let max_bytes = self.media_max_bytes;
+        let owned = call.clone();
+        let agent_cancel = self.cancel.clone();
+        self.coordinator
+            .execute(call.clone(), "hyper", None, move |per_call| async move {
+                let (merged, link) = spawn_cancel_bridge(agent_cancel, per_call);
+                let res = tokio::select! {
+                    biased;
+                    _ = merged.cancelled() => ToolResponse::text(
+                        &owned.id,
+                        "Error: tool task aborted",
+                        ToolState::Interrupted,
+                    ),
+                    r = view(&ws, &owned, &caps, &bins, max_bytes) => r,
+                };
+                link.abort();
+                res
+            })
+            .await
+    }
+
     pub(crate) async fn dispatch_parallel(&self, calls: &[ToolCall]) -> Vec<ToolResponse> {
         // Same handlers as the serial path. `parallel_safe_batch` admits
-        // read/view/search/web/ask; mutating tools still run serially.
+        // read/view/search/web/readlints/todowrite; mutating tools still run serially.
         futures::future::join_all(calls.iter().map(|c| self.dispatch_one(c))).await
     }
 
@@ -1935,21 +1935,14 @@ pub(crate) fn glob_target_is_workspace_root(ws: &Workspace, target_directory: &s
     }
 }
 
-/// `**/*`, `**/*.rs`, `**/*.{rs,md}` from the walk root. `**/sticky.rs` is not.
+/// `**` / `**/*` / `**/*.*` from the walk root. `**/*.rs` and `**/*.{rs,md}` are not.
 pub(crate) fn recursive_any_file_glob(pattern: &str) -> bool {
     let p = pattern
         .trim()
         .replace('\\', "/")
         .trim_start_matches("./")
         .to_string();
-    let rest = if p == "**" {
-        return true;
-    } else if let Some(r) = p.strip_prefix("**/") {
-        r
-    } else {
-        return false;
-    };
-    rest == "*" || rest == "*.*" || rest.starts_with("*.")
+    crate::tools::is_unfiltered_tree_glob(&p) && (p == "**" || p.starts_with("**/"))
 }
 
 fn glob_parent_stem(pattern: &str) -> Option<String> {
@@ -2116,6 +2109,27 @@ pub(crate) fn openai_stored(calls: &[ToolCall]) -> Vec<OpenAiToolCall> {
 
 pub(crate) fn parallel_safe_batch(calls: &[ToolCall]) -> bool {
     calls.len() > 1 && calls.iter().all(|c| is_parallel_safe(&c.name))
+}
+
+pub(crate) fn media_read_path(call: &ToolCall) -> Option<String> {
+    if dispatch_name(&call.name) != "read" {
+        return None;
+    }
+    let path = crate::tools::arg_path(&call.arguments)?;
+    crate::media::is_media_ext(&path).then_some(path)
+}
+
+fn unknown_tool_reply(id: &str, name: &str) -> ToolResponse {
+    let hint = match dispatch_name(name) {
+        "view" => " Use Read for images.",
+        "search" => " Use Grep.",
+        _ => "",
+    };
+    ToolResponse::text(
+        id,
+        format!("Error: unknown tool '{name}'.{hint}"),
+        ToolState::Error,
+    )
 }
 
 /// Merge agent-level stop with the coordinator's per-call flag. Native tools

@@ -62,6 +62,14 @@ impl ImLocale {
         }
     }
 
+    /// Hermes interim-assistant preview: the answer draft as it streams.
+    fn reply_label(self) -> &'static str {
+        match self {
+            Self::Zh => "回复中",
+            Self::En => "Replying",
+        }
+    }
+
     fn think_label(self) -> &'static str {
         match self {
             Self::Zh => "思考中",
@@ -186,7 +194,9 @@ const IM_CARD_ECHO: &[&str] = &[
     "没有工具的那一跳才是回复",
     "用户已给出路径就直接 Write",
     "同一符号只 Search 一次",
+    "同一符号只用 Grep 定位一次",
     "命中后用 Search 给出的片段",
+    "命中后用给出的片段",
     "不要整文件 Read",
     "不要整文件 Read 或 cat",
     "不要 Glob 已经 Search 到的同名文件",
@@ -201,14 +211,20 @@ const IM_CARD_ECHO: &[&str] = &[
     "The hop without tools is the answer",
     "do not Glob to confirm",
     "Do not Search paraphrases",
+    "Locate a symbol once with Grep",
+    "do not re-Grep paraphrases",
     "do not Read the whole file",
     "do not Read or Shell cat",
     "Do not Glob a filename Search already located",
+    "Do not Glob a filename Grep already located",
+    "不要 Glob 已经定位到的同名文件",
     "send them in the same hop",
     "Do not Shell git diff",
     "Do not Glob **/*",
     "这一跳思考用中文",
     "This hop: think in the user's language",
+    "整段只回 NO_REPLY",
+    "reply with exactly NO_REPLY",
 ];
 
 pub const ACK_TEXT: &str = "收到，正在处理…";
@@ -221,6 +237,12 @@ pub const THINK_FLUSH: Duration = Duration::from_secs(12);
 pub const TOOL_GAP: Duration = Duration::from_secs(4);
 pub const HEARTBEAT: Duration = Duration::from_secs(20);
 pub const THINK_TAIL: usize = 1200;
+/// Answer-draft preview tail; the full text still arrives as the final reply.
+pub const CONTENT_TAIL: usize = 600;
+/// Append-only channels (QQ / WeChat / DingTalk) cannot edit a bubble: a
+/// short draft posted early would repeat right above the final reply. Only
+/// stack a draft preview once the answer is long enough to be worth it.
+pub const STACK_DRAFT_MIN: usize = 400;
 pub const MIN_THINK_FLUSH: usize = 40;
 /// CJK sentences are short; 40 latin chars would hide Chinese CoT all turn.
 pub const MIN_THINK_FLUSH_ZH: usize = 16;
@@ -261,6 +283,11 @@ pub struct ProgressBuf {
     typed_tools: bool,
     /// Inbound user text; CoT that only restates it is dropped.
     user_text: String,
+    /// Visible answer text streaming in on DeltaChannel::Content. Shown as a
+    /// live preview (Hermes interim messages); the final reply is unchanged.
+    content: String,
+    /// Last content section actually posted, for dedupe.
+    content_shown: String,
 }
 
 impl ProgressBuf {
@@ -304,6 +331,8 @@ impl ProgressBuf {
             last_tool_line: String::new(),
             typed_tools: false,
             user_text: String::new(),
+            content: String::new(),
+            content_shown: String::new(),
         }
     }
 
@@ -311,10 +340,16 @@ impl ProgressBuf {
         let mut out = Vec::new();
         match ev {
             SessionEvent::Delta(d) if d.reset => {
-                if let Some(line) = self.flush_think(now, false) {
-                    out.push(line);
+                if !d.content_only {
+                    if let Some(line) = self.flush_think(now, false) {
+                        out.push(line);
+                    }
+                    self.think.clear();
                 }
-                self.think.clear();
+                // New step or a retracted answer bubble (tool hop after
+                // visible text): the old draft preview is stale either way.
+                self.content.clear();
+                self.content_shown.clear();
             }
             SessionEvent::Delta(d) if d.channel == DeltaChannel::Reasoning => {
                 if is_prepare_hint(&d.text) {
@@ -324,6 +359,11 @@ impl ProgressBuf {
                 if let Some(line) = self.flush_think(now, false) {
                     out.push(line);
                 }
+            }
+            SessionEvent::Delta(d) if d.channel == DeltaChannel::Content => {
+                // Accumulate only; emission rides tick()/stack pacing so a
+                // token stream never floods the chat.
+                self.content.push_str(&d.text);
             }
             SessionEvent::Delta(_) => {}
             SessionEvent::Assistant(a) => {
@@ -416,12 +456,70 @@ impl ProgressBuf {
                 stacked = vec![line];
             }
         }
+        if stacked.is_empty() {
+            if let Some(line) = self.flush_content(now) {
+                stacked = vec![line];
+            }
+        }
         if stacked.is_empty() && self.pending.is_empty() {
             if let Some(line) = self.heartbeat(now) {
                 return vec![line];
             }
         }
         stacked
+    }
+
+    /// Answer-draft section under the tool/think lines. None while empty.
+    fn content_section(&self) -> Option<String> {
+        let t = self.content.trim();
+        if t.is_empty() {
+            return None;
+        }
+        // 沉默 token 逐字流入（"N" → "NO" → … → "NO_REPLY"）。草稿若原样
+        // 外播，QQ/微信/钉钉会立刻发出「回复中\nNO_REPLY」，终稿又被
+        // is_silence 吞掉，群里就看到沉默 token。命中沉默前缀就不渲染。
+        if super::is_silence_prefix(&super::normalize_silence(t)) {
+            return None;
+        }
+        Some(format!(
+            "{}\n{}",
+            self.locale.reply_label(),
+            think_tail(t, CONTENT_TAIL)
+        ))
+    }
+
+    /// Append the live answer draft under a tool/think bubble.
+    fn with_content(&self, base: String) -> String {
+        match self.content_section() {
+            Some(sec) if base.is_empty() => sec,
+            Some(sec) => format!("{base}\n\n{sec}"),
+            None => base,
+        }
+    }
+
+    /// Edit-in-place channels: the answer draft refreshes the bubble on the
+    /// same THINK_FLUSH cadence as tool lines (Feishu edit cap applies).
+    /// Stack channels get their draft through `stack_out` instead.
+    fn flush_content(&mut self, now: Instant) -> Option<String> {
+        if self.stack_lines || self.content.is_empty() || self.content == self.content_shown {
+            return None;
+        }
+        if now.duration_since(self.last_emit_at) < THINK_FLUSH {
+            return None;
+        }
+        let base = if self.posted_tool {
+            self.tool_think_snapshot(&self.last_tool_line.clone())
+        } else {
+            String::new()
+        };
+        let line = self.with_content(base);
+        if line.is_empty() || line == self.last_sent {
+            return None;
+        }
+        self.content_shown = self.content.clone();
+        self.note_posted(&line);
+        self.last_emit_at = now;
+        Some(line)
     }
 
     fn post_tool_line(&mut self, line: String, now: Instant) -> Option<String> {
@@ -436,8 +534,9 @@ impl ProgressBuf {
             self.pending = line;
             return self.flush_paced(now);
         }
-        let snap = self.tool_think_snapshot(&line);
+        let snap = self.with_content(self.tool_think_snapshot(&line));
         self.note_posted(&snap);
+        self.content_shown = self.content.clone();
         self.last_emit_at = now;
         Some(snap)
     }
@@ -456,11 +555,12 @@ impl ProgressBuf {
         } else {
             return None;
         };
-        let line = self.tool_think_snapshot(&tool);
+        let line = self.with_content(self.tool_think_snapshot(&tool));
         if line == self.last_sent {
             return None;
         }
         self.note_posted(&line);
+        self.content_shown = self.content.clone();
         self.last_emit_at = now;
         Some(line)
     }
@@ -511,6 +611,11 @@ impl ProgressBuf {
         if !self.stack_lines && !self.last_think.is_empty() && self.last_think != EN_THINK_STUB {
             return None;
         }
+        // A live answer draft in the bubble is better proof of life than
+        // 「还在处理…」; never patch over it.
+        if !self.stack_lines && !self.content.is_empty() {
+            return None;
+        }
         if self.ack_covers_wait && !self.posted_tool {
             return None;
         }
@@ -528,6 +633,33 @@ impl ProgressBuf {
         }
         let lines: Vec<String> = self.flush_think(now, true).into_iter().collect();
         self.stack_out(lines, now, true)
+    }
+
+    /// Edit-in-place channels: the final reply goes out as a new message
+    /// while the old progress bubble keeps whatever draft was last shown.
+    /// After `finish`, collapse that bubble back to its bare tool/think
+    /// snapshot (or the ACK, when no tool line ran) so a long answer is
+    /// not readable twice (「回复中」 head above, full reply below).
+    /// Stack channels cannot edit; short drafts there are already held
+    /// back by STACK_DRAFT_MIN.
+    pub fn collapse_draft(&mut self) -> Option<String> {
+        if self.stack_lines || self.content_shown.is_empty() {
+            return None;
+        }
+        let snap = if self.posted_tool {
+            self.tool_think_snapshot(&self.last_tool_line.clone())
+        } else {
+            // 没工具行可留：收回 ACK，避免写成空泡，也避免纯聊天长回答
+            // 上面「回复中」、下面终稿叠两层。
+            self.locale.ack().to_string()
+        };
+        if snap.is_empty() || snap == self.last_sent {
+            return None;
+        }
+        self.content.clear();
+        self.content_shown.clear();
+        self.note_posted(&snap);
+        Some(snap)
     }
 
     fn push_pending(&mut self, line: &str) {
@@ -560,6 +692,8 @@ impl ProgressBuf {
 
     /// Append-only chats: first progress line goes out; later think/tool
     /// lines wait until THINK_FLUSH or finish so QQ/WeChat do not flood.
+    /// The streaming answer draft rides the same batch — but never in a
+    /// `force` (finish) flush, where the final reply is already imminent.
     fn stack_out(&mut self, lines: Vec<String>, now: Instant, force: bool) -> Vec<String> {
         if !self.stack_lines {
             return lines;
@@ -569,18 +703,48 @@ impl ProgressBuf {
         }
         let due =
             force || !self.stack_sent || now.duration_since(self.last_stack_at) >= THINK_FLUSH;
-        if !due || self.pending.is_empty() {
+        // Append-only channels cannot edit the draft away later; a short
+        // answer would repeat right above the final reply. Hold the draft
+        // until it is long enough to be worth a second bubble.
+        let fresh = !force
+            && char_len(&self.content) >= STACK_DRAFT_MIN
+            && self.content_section().is_some_and(|s| s != self.content_shown);
+        if !due {
+            return Vec::new();
+        }
+        if self.pending.is_empty() {
+            if fresh {
+                return vec![self.mark_content_shown(now)];
+            }
             return Vec::new();
         }
         if self.pending == self.last_sent {
             self.pending.clear();
+            if fresh {
+                return vec![self.mark_content_shown(now)];
+            }
             return Vec::new();
         }
-        let line = std::mem::take(&mut self.pending);
+        let mut line = std::mem::take(&mut self.pending);
+        if fresh {
+            let sec = self.content_section().expect("fresh checked");
+            line.push_str("\n\n");
+            line.push_str(&sec);
+            self.content_shown = sec;
+        }
         self.last_sent = line.clone();
         self.last_stack_at = now;
         self.stack_sent = true;
         vec![line]
+    }
+
+    fn mark_content_shown(&mut self, now: Instant) -> String {
+        let sec = self.content_section().unwrap_or_default();
+        self.content_shown = sec.clone();
+        self.last_sent = sec.clone();
+        self.last_stack_at = now;
+        self.stack_sent = true;
+        sec
     }
 
     fn flush_think(&mut self, now: Instant, force: bool) -> Option<String> {
@@ -744,6 +908,160 @@ mod tests {
             reset: false,
             content_only: false,
         })
+    }
+
+    fn content(text: &str) -> SessionEvent {
+        SessionEvent::Delta(DeltaEvent {
+            channel: DeltaChannel::Content,
+            text: text.into(),
+            delta: true,
+            reset: false,
+            content_only: false,
+        })
+    }
+
+    #[test]
+    fn answer_draft_stacks_on_append_only_chats() {
+        let t0 = Instant::now();
+        let mut b = ProgressBuf::for_channel(t0, "帮我写个周报", "qq");
+        // 草稿要长过 STACK_DRAFT_MIN 才会在 append-only 渠道提前外播；
+        // 短回答直接等终稿，避免「回复中」和终稿重复。
+        let draft = "本周完成了 IM 体验改造，包括分段、防抖、流式预览。".repeat(17);
+        // First visible text goes out right away so QQ does not look frozen.
+        let first = b.ingest(&content(&draft), t0);
+        assert_eq!(first.len(), 1, "{first:?}");
+        assert!(first[0].starts_with("回复中\n"), "{}", first[0]);
+        assert!(first[0].contains("本周完成"), "{}", first[0]);
+        // More tokens inside the pacing window do not flood the chat.
+        assert!(b.ingest(&content("继续写。"), t0 + Duration::from_secs(1)).is_empty());
+        let next = b.tick(t0 + THINK_FLUSH);
+        assert_eq!(next.len(), 1, "{next:?}");
+        assert!(next[0].contains("继续写"), "{next:?}");
+    }
+
+    #[test]
+    fn short_draft_waits_for_the_final_reply_on_append_only_chats() {
+        let t0 = Instant::now();
+        let mut b = ProgressBuf::for_channel(t0, "帮我改标题", "qq");
+        assert!(
+            b.ingest(&content("已改好。"), t0).is_empty(),
+            "append-only chats cannot edit; a short draft would duplicate the final reply"
+        );
+        assert!(b.tick(t0 + THINK_FLUSH).is_empty());
+    }
+
+    #[test]
+    fn answer_draft_rides_the_edit_bubble() {
+        let t0 = Instant::now();
+        let mut b = ProgressBuf::for_channel(t0, "帮我改标题", "feishu");
+        assert_eq!(b.ingest(&read_tool("src/main.rs"), t0), vec!["读取 src/main.rs"]);
+        let draft = "已把标题改成更短的版本。".repeat(4);
+        assert!(b.ingest(&content(&draft), t0 + Duration::from_secs(1)).is_empty());
+        let lines = b.tick(t0 + THINK_FLUSH);
+        assert_eq!(lines.len(), 1, "{lines:?}");
+        assert!(lines[0].contains("读取 src/main.rs"), "{}", lines[0]);
+        assert!(lines[0].contains("回复中\n"), "{}", lines[0]);
+        assert!(lines[0].contains("已把标题改成"), "{}", lines[0]);
+        // Unchanged draft does not spend another Feishu edit.
+        assert!(b.tick(t0 + THINK_FLUSH + THINK_FLUSH).is_empty());
+    }
+
+    #[test]
+    fn hop_reset_drops_the_old_draft() {
+        let t0 = Instant::now();
+        let mut b = ProgressBuf::for_channel(t0, "写个文件", "qq");
+        let draft = "第一跳的正文。".repeat(60);
+        assert_eq!(b.ingest(&content(&draft), t0).len(), 1);
+        b.ingest(
+            &SessionEvent::Delta(DeltaEvent {
+                channel: DeltaChannel::Content,
+                text: String::new(),
+                delta: true,
+                reset: true,
+                content_only: false,
+            }),
+            t0 + Duration::from_secs(1),
+        );
+        assert!(
+            b.tick(t0 + THINK_FLUSH).is_empty(),
+            "reset hop must not replay the previous draft"
+        );
+    }
+
+    #[test]
+    fn finish_flush_drops_draft_before_final_reply() {
+        let t0 = Instant::now();
+        let mut b = ProgressBuf::for_channel(t0, "写个文件", "wechat");
+        b.ingest(&content("最终答案全文。"), t0);
+        let out = b.finish(t0 + Duration::from_secs(2));
+        assert!(
+            !out.iter().any(|l| l.contains("回复中")),
+            "the final reply follows immediately; draft preview must not duplicate: {out:?}"
+        );
+    }
+
+    #[test]
+    fn silence_token_never_leaks_into_the_draft_preview() {
+        let t0 = Instant::now();
+        // Append-only: 沉默 token 一到就发出去的话，终稿拦截就晚了。
+        let mut b = ProgressBuf::for_channel(t0, "群里闲聊", "qq");
+        assert!(b.ingest(&content("NO"), t0).is_empty(), "prefix of NO_REPLY");
+        assert!(b.ingest(&content("_REPLY"), t0).is_empty(), "NO_REPLY complete");
+        assert!(b.tick(t0 + THINK_FLUSH).is_empty(), "tick must not flush it");
+        // 编辑类渠道（飞书 tick 刷草稿）同样不渲染沉默段。
+        let mut f = ProgressBuf::for_channel(t0, "群里闲聊", "feishu");
+        f.ingest(&content("NO_REPLY"), t0);
+        assert!(
+            f.tick(t0 + THINK_FLUSH).is_empty(),
+            "feishu tick must not paint NO_REPLY into the bubble"
+        );
+        // 以 No 开头的正常回答只被压住前几个 token，成形后照常预览。
+        let mut n = ProgressBuf::for_channel(t0, "帮我写个回答", "feishu");
+        n.ingest(&content("No problem — here is the full answer.".repeat(12).as_str()), t0);
+        let lines = n.tick(t0 + THINK_FLUSH);
+        assert_eq!(lines.len(), 1, "{lines:?}");
+        assert!(lines[0].contains("No problem"), "{}", lines[0]);
+    }
+
+    #[test]
+    fn collapse_draft_strips_the_reply_section_off_the_old_bubble() {
+        let t0 = Instant::now();
+        let mut b = ProgressBuf::for_channel(t0, "帮我改标题", "feishu");
+        assert_eq!(b.ingest(&read_tool("src/main.rs"), t0), vec!["读取 src/main.rs"]);
+        let draft = "已把标题改成更短的版本。".repeat(30);
+        assert!(b.ingest(&content(&draft), t0 + Duration::from_secs(1)).is_empty());
+        let lines = b.tick(t0 + THINK_FLUSH);
+        assert_eq!(lines.len(), 1, "{lines:?}");
+        assert!(lines[0].contains("回复中\n"), "{}", lines[0]);
+        let collapsed = b.collapse_draft().expect("draft was shown; collapse it");
+        assert!(collapsed.contains("读取 src/main.rs"), "{collapsed}");
+        assert!(!collapsed.contains("回复中"), "{collapsed}");
+        assert!(!collapsed.contains("已把标题"), "{collapsed}");
+        // 没播过草稿（短回答被阈值挡住/编辑渠道未刷过）时无事可做。
+        let mut quiet = ProgressBuf::for_channel(t0, "帮我改标题", "feishu");
+        quiet.ingest(&read_tool("src/main.rs"), t0);
+        assert!(quiet.collapse_draft().is_none());
+        // 纯聊天、生成超过 12s：旧泡里只有「回复中」，收回 ACK。
+        let mut chat = ProgressBuf::for_channel(t0, "在吗", "feishu");
+        chat.ingest(&content(&"你好，我在。".repeat(40)), t0);
+        assert_eq!(chat.tick(t0 + THINK_FLUSH).len(), 1);
+        let collapsed = chat.collapse_draft().expect("draft-only bubble");
+        assert_eq!(collapsed, ACK_TEXT);
+        assert!(!collapsed.contains("回复中"), "{collapsed}");
+    }
+
+    #[test]
+    fn heartbeat_never_patches_over_answer_draft() {
+        let t0 = Instant::now();
+        let mut b = ProgressBuf::for_channel(t0, "写个长一点的回答", "telegram");
+        b.ingest(&content("正文正在生成…"), t0);
+        let first = b.tick(t0 + THINK_FLUSH);
+        assert_eq!(first.len(), 1, "{first:?}");
+        let later = b.tick(t0 + THINK_FLUSH + HEARTBEAT + HEARTBEAT);
+        assert!(
+            later.is_empty(),
+            "draft bubble is liveness; 还在处理 must not replace it: {later:?}"
+        );
     }
 
     #[test]

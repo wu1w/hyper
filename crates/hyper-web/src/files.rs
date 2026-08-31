@@ -36,7 +36,10 @@ pub fn max_upload(media_max: u64) -> u64 {
 
 pub fn safe_join(root: &Path, rel: &str) -> Result<PathBuf> {
     let ws = Workspace::open(root, true).map_err(|e| anyhow::anyhow!("{e}"))?;
-    ws.resolve(rel).map_err(|e| anyhow::anyhow!("{e}"))
+    // The file manager stays confined even though agent reads were unfenced:
+    // `resolve` is the read path and allows `..`; the web file manager's
+    // reads AND writes must both go through the confined write check.
+    ws.resolve_write(rel).map_err(|e| anyhow::anyhow!("{e}"))
 }
 
 /// Overwrite a workspace-relative file (preview save). Atomic tmp + rename.

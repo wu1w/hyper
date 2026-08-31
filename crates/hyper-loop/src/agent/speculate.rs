@@ -54,6 +54,8 @@ pub struct SpeculateCtx {
     pub search_located: Vec<String>,
     /// Snake/camel tokens already printed in this turn's Search dumps.
     pub search_shown_idents: Vec<String>,
+    /// `view` is in tools[] (media.enabled). Hallucinated view is not prefetched.
+    pub view_mounted: bool,
 }
 
 impl SpeculativeSlot {
@@ -97,6 +99,9 @@ impl SpeculativeSlot {
                 continue;
             }
             if name == "search" && skip_search_prefetch(&self.ctx, call) {
+                continue;
+            }
+            if name == "view" && !self.ctx.view_mounted {
                 continue;
             }
             if name == "glob" && skip_named_glob_prefetch(&self.ctx, call) {
@@ -176,6 +181,21 @@ impl SpeculateCtx {
                     ToolResponse::text(&call.id, crate::tools::SEARCH_WARMING, ToolState::Success)
                 }
             },
+            "view" if !self.view_mounted => ToolResponse::text(
+                &call.id,
+                format!("Error: unknown tool '{}'. Use Read for images.", call.name),
+                ToolState::Error,
+            ),
+            "read" if super::dispatch::media_read_path(&call).is_some() => {
+                view(
+                    &self.workspace,
+                    &call,
+                    &self.media_caps,
+                    &self.media_bins,
+                    self.media_max_bytes,
+                )
+                .await
+            }
             "view" => {
                 view(
                     &self.workspace,
@@ -461,6 +481,7 @@ mod tests {
             named_new: Vec::new(),
             search_located: Vec::new(),
             search_shown_idents: Vec::new(),
+            view_mounted: false,
         });
         slot.offer(&[ToolCall {
             id: "call_1".into(),
@@ -499,6 +520,7 @@ mod tests {
             named_new: Vec::new(),
             search_located: Vec::new(),
             search_shown_idents: Vec::new(),
+            view_mounted: false,
         });
         slot.offer(&[ToolCall {
             id: "call_g".into(),
@@ -539,6 +561,7 @@ mod tests {
             named_new: Vec::new(),
             search_located: Vec::new(),
             search_shown_idents: Vec::new(),
+            view_mounted: false,
         });
         slot.offer(&[ToolCall {
             id: "call_s".into(),
@@ -595,6 +618,7 @@ mod tests {
             named_new,
             search_located: Vec::new(),
             search_shown_idents: Vec::new(),
+            view_mounted: false,
         }
     }
 
@@ -753,9 +777,11 @@ mod tests {
             slot.take("call_tree").await.is_none(),
             "workspace-root Glob **/* must not prefetch"
         );
+        let rs = slot.take("call_rs").await.unwrap();
+        assert_eq!(rs.state, ToolState::Success);
         assert!(
-            slot.take("call_rs").await.is_none(),
-            "workspace-root Glob **/*.rs must not prefetch"
+            rs.joined_text().contains("a.rs"),
+            "workspace-root Glob **/*.rs must still prefetch: {rs:?}"
         );
         let sub = slot.take("call_sub").await.unwrap();
         assert_eq!(sub.state, ToolState::Success);

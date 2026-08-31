@@ -92,40 +92,60 @@ pub async fn send(
     }
     let context_token = meta_str(env, "context_token");
     let http = crate::llm_http::env_aware_client(30, &base)?;
-    let mut items: Vec<Value> = Vec::new();
-    let text = clip(
-        &super::im_md::separated_plain(&super::xfer::spoken_text(parts)),
-        TEXT_CLIP,
-    );
-    if !text.trim().is_empty() {
-        items.push(json!({"type": 1, "text_item": {"text": text}}));
-    }
+    // Hermes smart chunking: split long answers at natural boundaries instead
+    // of clipping away the tail. iLink glues one item_list into a single
+    // message, so multiple chunks must go out as separate sendmessage calls —
+    // otherwise the joined total still hits the length cap.
+    let text = super::im_md::separated_plain(&super::xfer::spoken_text(parts));
+    let chunks = super::chunk::chunk_text(&text, TEXT_CLIP);
+    let mut media_items: Vec<Value> = Vec::new();
     for part in parts {
         if matches!(part, ContentPart::Text { .. }) {
             continue;
         }
         match send_cdn_item(&http, &token, &base, &to, part).await {
-            Ok(item) => items.push(item),
+            Ok(item) => media_items.push(item),
             Err(e) => {
                 eprintln!("hyper wechat media: {e}");
                 let line = part.fallback_line().unwrap_or_else(|| "[文件]".into());
-                items.push(json!({"type": 1, "text_item": {"text": clip(&line, TEXT_CLIP)}}));
+                media_items.push(json!({"type": 1, "text_item": {"text": clip(&line, TEXT_CLIP)}}));
             }
         }
     }
-    if items.is_empty() {
-        return Ok(());
-    }
     let url = format!("{base}/ilink/bot/sendmessage");
+    let n = chunks.len();
+    for (i, chunk) in chunks.into_iter().enumerate() {
+        let mut items = vec![json!({"type": 1, "text_item": {"text": chunk}})];
+        if i + 1 == n {
+            items.append(&mut media_items);
+        }
+        post_items(&http, &url, &token, &to, items, &context_token).await?;
+    }
+    if n == 0 && !media_items.is_empty() {
+        post_items(&http, &url, &token, &to, media_items, &context_token).await?;
+    }
+    Ok(())
+}
+
+/// One sendmessage call; on failure with a context_token, retry once without
+/// it before giving up.
+async fn post_items(
+    http: &reqwest::Client,
+    url: &str,
+    token: &str,
+    to: &str,
+    items: Vec<Value>,
+    context_token: &str,
+) -> Result<()> {
     let mut data = post_json(
-        &http,
-        &url,
-        &token,
-        &send_body(&to, items.clone(), &context_token),
+        http,
+        url,
+        token,
+        &send_body(to, items.clone(), context_token),
     )
     .await?;
     if !api_ok(&data) && !context_token.is_empty() {
-        data = post_json(&http, &url, &token, &send_body(&to, items, "")).await?;
+        data = post_json(http, url, token, &send_body(to, items, "")).await?;
     }
     if !api_ok(&data) {
         return Err(Error::msg(format!(
@@ -451,6 +471,10 @@ fn native_from_msg(ep: &ChannelEndpoint, msg: &Value) -> Option<NativePayload> {
     let group_id = js_str(&msg["group_id"]);
     let is_group = !group_id.is_empty();
     let chat_id = if is_group { group_id } else { from.clone() };
+    // iLink 群消息不带 at 列表，@ 只会以「@昵称 」前缀落在正文开头。
+    // 以 @ 开头的群消息视为 mention；否则默认 group_policy = mention 下
+    // 微信群消息会被 gate 全部挡掉，机器人看起来像没反应。
+    let mentioned = is_group && text.trim_start().starts_with('@');
     let mut env = NativePayload {
         channel: if ep.kind.is_empty() {
             "wechat".into()
@@ -464,6 +488,9 @@ fn native_from_msg(ep: &ChannelEndpoint, msg: &Value) -> Option<NativePayload> {
     };
     env.meta.insert("chat_id".into(), json!(chat_id));
     env.meta.insert("is_group".into(), json!(is_group));
+    if mentioned {
+        env.meta.insert("is_mentioned".into(), json!(true));
+    }
     env.meta
         .insert("context_token".into(), json!(js_str(&msg["context_token"])));
     env.meta
@@ -873,6 +900,24 @@ mod tests {
         let env = native_from_msg(&ep, &group).expect("group");
         assert_eq!(env.meta["chat_id"], json!("g9"));
         assert_eq!(env.meta["is_group"], json!(true));
+        assert!(!env.is_mentioned(), "no @ prefix → not mentioned");
+        // iLink 不带 at 列表；@ 只会以「@昵称 」前缀落在正文开头。
+        let at_group = json!({
+            "message_type": 1,
+            "from_user_id": "u1",
+            "group_id": "g9",
+            "item_list": [{"type": 1, "text_item": {"text": "@小助手 在吗"}}],
+        });
+        let env = native_from_msg(&ep, &at_group).expect("group @");
+        assert!(env.is_mentioned(), "@ prefix in a group counts as a mention");
+        // 单聊里 @ 只是普通正文，不算 mention。
+        let at_dm = json!({
+            "message_type": 1,
+            "from_user_id": "u1",
+            "item_list": [{"type": 1, "text_item": {"text": "@朋友 你看"}}],
+        });
+        let env = native_from_msg(&ep, &at_dm).expect("dm @");
+        assert!(!env.is_mentioned());
     }
 
     #[test]

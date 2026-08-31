@@ -310,15 +310,23 @@ pub async fn send(
         caption.push_str(&notes.join("\n"));
     }
     let req = reply_req_id(env);
+    // Hermes smart chunking: the first bubble promotes/closes the progress
+    // stream; overflow bubbles follow as plain frames. No tail is clipped.
+    let chunks = super::chunk::chunk_text(&caption, MAX_MARKDOWN);
     if !req.is_empty() {
         if let Some(stream_id) = take_stream(&req) {
-            let body = if caption.trim().is_empty() {
-                "…"
-            } else {
-                caption.as_str()
+            // 只有图没有正文时，close 帧说明内容是什么，不留一个「…」。
+            let body = match chunks.first() {
+                Some(first) => first.as_str(),
+                None if !image_urls.is_empty() => "[图片]",
+                None => "…",
             };
             tx.send(stream_frame(env, &stream_id, body, true)?)
                 .map_err(|_| Error::msg("wecom send: websocket not connected"))?;
+            for chunk in chunks.iter().skip(1) {
+                tx.send(outbound_frame(env, chunk)?)
+                    .map_err(|_| Error::msg("wecom send: websocket not connected"))?;
+            }
             for url in image_urls {
                 tx.send(outbound_image_frame(env, &url)?)
                     .map_err(|_| Error::msg("wecom send: websocket not connected"))?;
@@ -326,8 +334,8 @@ pub async fn send(
             return Ok(());
         }
     }
-    if !caption.trim().is_empty() {
-        tx.send(outbound_frame(env, &caption)?)
+    for chunk in &chunks {
+        tx.send(outbound_frame(env, chunk)?)
             .map_err(|_| Error::msg("wecom send: websocket not connected"))?;
     }
     for url in image_urls {
@@ -570,8 +578,14 @@ fn native_from_callback(ep: &ChannelEndpoint, payload: &Value) -> Option<NativeP
         .unwrap_or("")
         .eq_ignore_ascii_case("group");
     let mut parts = extract_parts(body);
+    let mut mentioned = false;
     if is_group {
-        if let Some(ContentPart::Text { text }) = parts.first_mut() {
+        if let Some(ContentPart::Text { text }) = parts.iter_mut().find(|p| p.as_text().is_some())
+        {
+            // 企微把开头 @Bot 一并塞在正文里；剥离之前先据此标注 mention。
+            // 否则默认 group_policy = mention 下群消息全被 access gate 挡掉，
+            // 机器人看起来像没反应。
+            mentioned = text.trim_start().starts_with('@');
             *text = strip_leading_mention(text);
         }
     }
@@ -606,6 +620,9 @@ fn native_from_callback(ep: &ChannelEndpoint, payload: &Value) -> Option<NativeP
     };
     env.meta.insert("chat_id".into(), json!(chat_id));
     env.meta.insert("is_group".into(), json!(is_group));
+    if is_group && mentioned {
+        env.meta.insert("is_mentioned".into(), json!(true));
+    }
     if !reply_req_id.is_empty() {
         env.meta.insert("reply_req_id".into(), json!(reply_req_id));
     }
@@ -920,7 +937,32 @@ mod tests {
         assert_eq!(env.meta["reply_req_id"], json!("req-abc"));
         assert_eq!(env.meta["msgid"], json!("m9"));
         assert!(env.is_group());
+        // 剥离 @Bot 之前先标注，否则默认 mention 策略把群消息全挡掉。
+        assert!(env.is_mentioned());
         assert_eq!(env.chat_id(), "wr-group");
+    }
+
+    #[test]
+    fn group_text_without_at_is_not_mentioned() {
+        let ep = ChannelEndpoint {
+            kind: "wecom".into(),
+            ..ChannelEndpoint::default()
+        };
+        let payload = json!({
+            "cmd": "aibot_callback",
+            "headers": {"req_id": "req-x"},
+            "body": {
+                "msgid": "m10",
+                "from": {"userid": "user-2"},
+                "chatid": "wr-group",
+                "chattype": "group",
+                "msgtype": "text",
+                "text": {"content": "hello all"}
+            }
+        });
+        let env = native_from_callback(&ep, &payload).unwrap();
+        assert!(env.is_group());
+        assert!(!env.is_mentioned());
     }
 
     #[test]

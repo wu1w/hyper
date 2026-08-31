@@ -296,6 +296,7 @@ impl<C: Completer> Agent<C> {
                 .map(|p| super::dispatch::canon_ws_path(&self.workspace, &p))
                 .collect(),
             search_shown_idents: super::dispatch::shown_dump_idents(&self.messages),
+            view_mounted: crate::tools_schema::has_tool(&self.tools, "view"),
         }
     }
 }
