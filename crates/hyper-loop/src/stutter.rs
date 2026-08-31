@@ -28,6 +28,69 @@ pub fn is_substantial_reply(s: &str) -> bool {
     reply_units(s) >= MIN_RESTATE_CHARS
 }
 
+/// Thinking that is still planning, not a finished user-facing answer.
+/// Flash-Next / grok-4.6 sometimes stop with this still in `reasoning`.
+pub fn is_scratch_think(s: &str) -> bool {
+    let l = s.to_ascii_lowercase();
+    const EN: &[&str] = &[
+        "let me ",
+        "let's ",
+        "i need to",
+        "i should",
+        "i will ",
+        "i'll ",
+        "need to check",
+        "need to find",
+        "need to look",
+        "need to verify",
+        "need to read",
+        "i didn't see",
+        "didn't find",
+        "search for",
+        "grep for",
+        "where is ",
+        "wait —",
+        "but wait",
+        "the user wants",
+        "the user asked",
+        "user wants me",
+    ];
+    if EN.iter().any(|m| l.contains(m)) {
+        return true;
+    }
+    zh_planning_opens(s)
+}
+
+/// Chinese planning collocations at a sentence start. Bare `让我` / `我再`
+/// match finished prose ("这让我想到", "我再强调").
+fn zh_planning_opens(s: &str) -> bool {
+    const HEAD: &[&str] = &[
+        "接下来我",
+        "接下来看",
+        "接下来查",
+        "接下来读",
+        "先看",
+        "再查",
+        "再看一下",
+        "再看这",
+        "让我看",
+        "让我查",
+        "让我读",
+        "让我检查",
+        "需要检查",
+        "需要看",
+        "待查",
+        "我再看",
+        "我再查",
+        "我再读",
+    ];
+    s.split(|c: char| matches!(c, '\n' | '。' | '！' | '？' | ';' | '；'))
+        .any(|sent| {
+            let t = sent.trim();
+            HEAD.iter().any(|m| t.starts_with(m))
+        })
+}
+
 /// Same essay restated on a later hop (pi-style answer stagnation).
 /// Short status lines never match, so read/edit narration is untouched.
 pub fn is_restated_reply(prev: &str, next: &str) -> bool {
@@ -508,5 +571,21 @@ This is a different task from architecture review and names different files on p
         assert!(promote_dumped_reply("ok", &[body.as_str()]).is_none());
         let code = "fn main() { println!(\"hi\"); }\n".repeat(8);
         assert!(promote_dumped_reply(ESSAY, &[code.as_str()]).is_none());
+    }
+
+    #[test]
+    fn scratch_think_is_planning_not_an_answer() {
+        assert!(is_scratch_think(
+            "Let me look at agent/mod.rs next and verify finish(turn.content)."
+        ));
+        assert!(is_scratch_think(
+            "The user wants me to continue checking if the tools feel smooth."
+        ));
+        assert!(is_scratch_think("接下来我再看一下 agent/mod.rs 的主循环。"));
+        assert!(is_scratch_think("先看 family.rs 再决定。"));
+        assert!(!is_scratch_think("这让我想到 finish 路径的空回复问题。"));
+        let done = "已经把登录页标题改好并核对路由配置。空回复必须有兜底，控制台不能交空白气泡。";
+        assert!(is_substantial_reply(&done.repeat(3)));
+        assert!(!is_scratch_think(&done.repeat(3)));
     }
 }

@@ -39,9 +39,11 @@ pub(crate) fn claim_search_slot(calls: &std::sync::atomic::AtomicU32) -> bool {
     calls.fetch_add(1, Ordering::Relaxed) < SEARCH_TURN_CAP
 }
 
-pub(crate) const GREP_TURN_CAP: u32 = 4;
+pub(crate) const GREP_TURN_CAP: u32 = 12;
 pub(crate) const GREP_TURN_CAP_MSG: &str =
     "Grep budget for this turn is used. Read the files already located instead of more Grep.";
+pub(crate) const GREP_REPEAT_MSG: &str =
+    "Already Grep'd a similar pattern this turn. Read the hits already returned instead of paraphrasing.";
 pub(crate) const GREP_FORBIDDEN_MSG: &str = "The user forbade Grep this turn. Read instead.";
 const STEER_SKIPPED_MSG: &str =
     "Skipped before launch because the user sent a steering update. Continue from the steering instruction after the paired tool results.";
@@ -73,6 +75,7 @@ pub(crate) fn located_search_paths(messages: &[ChatMessage]) -> Vec<String> {
             || body.contains(SEARCH_PARAPHRASE_MSG)
             || body.contains(GREP_AFTER_SEARCH_MSG)
             || body.contains(GREP_TURN_CAP_MSG)
+            || body.contains(GREP_REPEAT_MSG)
             || body.contains(READ_SEARCH_SPAN_MSG)
             || body.contains(GLOB_AFTER_SEARCH_MSG)
             || body.contains(SHELL_CAT_SEARCH_MSG)
@@ -118,8 +121,7 @@ pub(crate) const GLOB_NAMED_WRITE_MSG: &str =
     "The user already named the file to Write. Do not Glob the parent directory to copy neighbors.";
 pub(crate) const GLOB_FORBIDDEN_MSG: &str =
     "The user forbade Glob this turn. Write the named path or Read instead.";
-pub(crate) const GLOB_TREE_MSG: &str =
-    "Do not Glob **/* of the workspace root (it dumps vendor/dist and caps at 200 paths). Grep for a symbol, or Glob with an extension / inside a subdirectory.";
+pub(crate) use crate::tools::GLOB_TREE_MSG;
 pub(crate) const GLOB_AFTER_SEARCH_MSG: &str =
     "Search already located this file this turn. Use that path; do not Glob for the same name.";
 pub(crate) const SHELL_CAT_SEARCH_MSG: &str =
@@ -333,6 +335,7 @@ fn dump_is_fold_nudge(body: &str) -> bool {
         || body.contains(SEARCH_PARAPHRASE_MSG)
         || body.contains(GREP_AFTER_SEARCH_MSG)
         || body.contains(GREP_TURN_CAP_MSG)
+        || body.contains(GREP_REPEAT_MSG)
         || body.contains(READ_SEARCH_SPAN_MSG)
         || body.contains(GLOB_AFTER_SEARCH_MSG)
         || body.contains(SHELL_CAT_SEARCH_MSG)
@@ -625,6 +628,9 @@ impl<C: Completer> Agent<C> {
             return Some(denied);
         }
         let name = call.name.as_str();
+        if dispatch_name(name) == "computeruse" && !has_tool(&self.tools, "ComputerUse") {
+            return Some(unknown_tool_reply(&call.id, name));
+        }
         if self.plan_mode && permit::plan_mode_blocks(name, &call.arguments) {
             return Some(ToolResponse::text(
                 &call.id,
@@ -700,7 +706,17 @@ impl<C: Completer> Agent<C> {
                 turn = self.completer.complete(&wire, tools) => turn,
             };
             match result {
-                Ok(turn) => return Ok(Some(turn)),
+                Ok(turn) => {
+                    if attempt == 0 && is_blank_transport(&turn) {
+                        attempt += 1;
+                        if let Some(slot) = self.completer.speculate() {
+                            slot.abort();
+                        }
+                        self.note("[net] empty completion; retry once");
+                        continue;
+                    }
+                    return Ok(Some(turn));
+                }
                 Err(e) if crate::llm_http::is_transient(&e) => {
                     attempt += 1;
                     if let Some(slot) = self.completer.speculate() {
@@ -736,6 +752,11 @@ impl<C: Completer> Agent<C> {
     /// completion only; restore afterwards so a later coding hop keeps the
     /// session policy. `--think` lock is honored (left alone).
     pub(crate) fn widen_no_tool_think(&self) -> Option<ThinkPolicy> {
+        if self.force_synthesis {
+            // Wrap hops use a tight max_output_tokens / think cap. Raising to
+            // the generic 8k floor is what let Grok think for 14 minutes.
+            return None;
+        }
         if self.effort.user_locked {
             return None;
         }
@@ -789,7 +810,14 @@ impl<C: Completer> Agent<C> {
     }
 
     pub(crate) fn arm_sink(&self) {
-        self.completer.set_token_sink(self.live_sink());
+        let sink = self.live_sink().map(|sink| {
+            if self.force_synthesis {
+                sink.content_only()
+            } else {
+                sink
+            }
+        });
+        self.completer.set_token_sink(sink);
     }
 
     pub(crate) fn live_sink(&self) -> Option<TokenSink> {
@@ -838,15 +866,27 @@ impl<C: Completer> Agent<C> {
             return Some(search_nudge_reply(GREP_FORBIDDEN_MSG, &self.messages));
         }
         if let Some(pattern) = crate::tools::arg_str(&call.arguments, "pattern") {
-            let queries = crate::lock_unpoison(&self.search_queries);
-            if grep_covered_by_search(&pattern, &queries) {
+            let covered = {
+                let queries = crate::lock_unpoison(&self.search_queries);
+                grep_covered_by_search(&pattern, &queries)
+            };
+            if covered {
                 return Some(grep_after_search_reply(&self.messages));
             }
+            let mut prev = crate::lock_unpoison(&self.grep_queries);
+            if !pattern.trim().is_empty() && prev.iter().any(|p| is_search_paraphrase(p, &pattern))
+            {
+                return Some(search_nudge_reply(GREP_REPEAT_MSG, &self.messages));
+            }
+            if !self.grep_is_file_scoped(call) && !claim_grep_slot(&self.grep_calls) {
+                return Some(search_nudge_reply(GREP_TURN_CAP_MSG, &self.messages));
+            }
+            if !pattern.trim().is_empty() {
+                prev.push(pattern);
+            }
+            return None;
         }
-        if has_tool(&self.tools, "Search")
-            && !self.grep_is_file_scoped(call)
-            && !claim_grep_slot(&self.grep_calls)
-        {
+        if !self.grep_is_file_scoped(call) && !claim_grep_slot(&self.grep_calls) {
             return Some(search_nudge_reply(GREP_TURN_CAP_MSG, &self.messages));
         }
         None
@@ -897,9 +937,6 @@ impl<C: Completer> Agent<C> {
         }
         let pat = crate::tools::arg_str(&call.arguments, "glob_pattern").unwrap_or_default();
         let dir = crate::tools::arg_str(&call.arguments, "target_directory").unwrap_or_default();
-        if recursive_any_file_glob(&pat) && glob_target_is_workspace_root(&self.workspace, &dir) {
-            return Some(search_nudge_reply(GLOB_TREE_MSG, &self.messages));
-        }
         if glob_covered_by_search(&pat, &self.messages) {
             return Some(search_nudge_reply(GLOB_AFTER_SEARCH_MSG, &self.messages));
         }
@@ -1250,6 +1287,9 @@ impl<C: Completer> Agent<C> {
                 self.dispatch_view(call).await
             }
             "computeruse" => {
+                if !has_tool(&self.tools, "ComputerUse") {
+                    return unknown_tool_reply(&call.id, &call.name);
+                }
                 let owned = call.clone();
                 let agent_cancel = self.cancel.clone();
                 let session_id = self.session_id.clone();
@@ -1834,6 +1874,16 @@ fn stored_to_live_parts(stored: &[StoredMedia], fallback: &[MediaPart]) -> Vec<M
         .collect()
 }
 
+fn is_blank_transport(turn: &super::ModelTurn) -> bool {
+    turn.content.trim().is_empty()
+        && turn.reasoning.trim().is_empty()
+        && turn.tool_calls.is_empty()
+        && !turn.watchdog_hit
+        && !turn.parse_fail
+        && turn.prompt_tokens == 0
+        && turn.completion_tokens == 0
+}
+
 fn clip_lifecycle_summary(text: &str) -> String {
     let one = text.split_whitespace().collect::<Vec<_>>().join(" ");
     if one.chars().count() <= 180 {
@@ -2145,6 +2195,7 @@ fn unknown_tool_reply(id: &str, name: &str) -> ToolResponse {
     let hint = match dispatch_name(name) {
         "view" => " Use Read for images.",
         "search" => " Use Grep.",
+        "computeruse" => " Desktop control is off unless features.computer_use is enabled.",
         _ => "",
     };
     ToolResponse::text(

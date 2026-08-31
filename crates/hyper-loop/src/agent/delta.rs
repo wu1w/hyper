@@ -43,6 +43,7 @@ impl StdioState {
 #[derive(Clone)]
 pub struct TokenSink {
     kind: TokenSinkKind,
+    paint_reasoning: bool,
 }
 
 #[derive(Clone)]
@@ -57,19 +58,30 @@ impl TokenSink {
     pub fn events(emit: EventSink) -> Self {
         Self {
             kind: TokenSinkKind::Events(emit),
+            paint_reasoning: true,
         }
     }
 
     pub(super) fn stdio(state: Arc<StdioState>) -> Self {
         Self {
             kind: TokenSinkKind::Stdio(state),
+            paint_reasoning: true,
         }
     }
 
     pub(super) fn discard() -> Self {
         Self {
             kind: TokenSinkKind::Discard,
+            paint_reasoning: false,
         }
+    }
+
+    /// Keep streaming the answer while withholding scratch reasoning. Cursor
+    /// and Grok CLI keep thought and message chunks as separate channels; a
+    /// forced wrap-up only needs the latter on the live surface.
+    pub(super) fn content_only(mut self) -> Self {
+        self.paint_reasoning = false;
+        self
     }
 
     pub fn reset(&self) {
@@ -94,7 +106,7 @@ impl TokenSink {
     }
 
     pub fn reasoning(&self, text: &str) {
-        if text.is_empty() {
+        if text.is_empty() || !self.paint_reasoning {
             return;
         }
         match &self.kind {

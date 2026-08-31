@@ -36,7 +36,7 @@ pub use code_index::{
     bash_search_query, render_query_spans, run_search, search_dump_too_big, CodeIndex,
     SEARCH_WARMING,
 };
-pub(crate) use find::is_unfiltered_tree_glob;
+pub(crate) use find::{is_unfiltered_tree_glob, shallow_listing, GLOB_TREE_MSG};
 pub use fold::{fold_text, BlobStore, Folded};
 pub use path::{is_reparse_or_symlink, Workspace};
 pub use view::view;

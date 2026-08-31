@@ -132,7 +132,13 @@ pub async fn bash(
         match rewrite_skip_whole_tree_listing(&command, ws.root(), &cwd) {
             GitDiffRewrite::Keep => (command, false),
             GitDiffRewrite::SkipAll => {
-                return ToolResponse::text(&call.id, TREE_LIST_HINT, ToolState::Success);
+                let sample = super::shallow_listing(&cwd, ws.root(), 40);
+                let mut text = TREE_LIST_HINT.to_string();
+                if !sample.is_empty() {
+                    text.push_str("\n\nTop-level:\n");
+                    text.push_str(&sample.join("\n"));
+                }
+                return ToolResponse::text(&call.id, text, ToolState::Success);
             }
             GitDiffRewrite::Rest(rest) => (rest, true),
         };
@@ -207,7 +213,10 @@ pub async fn bash(
 
 /// Whole-tree `git diff` dumped 1MB of dist/vendor on Feishu and hung the next hop.
 const TREE_DIFF_HINT: &str = "[workset] already has git status. Whole-tree `git diff` / `git show` / `git log -p` was skipped (dist/vendor dumps blow the window). Diff a specific path: git diff -- path.";
-const TREE_LIST_HINT: &str = "Do not `find` / `ls -R` / `tree` / `git ls-files` / `fd` / `rg --files` the workspace root (it dumps vendor/dist). Grep for a symbol, or walk a subdirectory.";
+const TREE_LIST_HINT: &str = "\
+Workspace-root `find` / `ls -R` / `tree` / `git ls-files` / `fd` / `rg --files` \
+is a top-level sample only (vendor / release / out skipped). Grep a symbol, or \
+walk a subdirectory.";
 
 #[derive(Debug, PartialEq, Eq)]
 enum GitDiffRewrite {

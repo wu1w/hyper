@@ -802,6 +802,7 @@ fn is_fold_noise(s: &str) -> bool {
     s.contains("Search already dumped")
         || s.contains("Already searched a similar query")
         || s.contains("Grep budget for this turn")
+        || s.contains("Already Grep'd a similar pattern")
         || s.contains("Already located via Search")
         || s.contains("Read with offset") && s.contains("Search already")
 }

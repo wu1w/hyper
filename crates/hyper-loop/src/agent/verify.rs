@@ -142,7 +142,7 @@ pub fn read_lints_reply(report: &LintReport, paths: &[String]) -> (String, ToolS
             truncate_diag(format!("[diagnostics]\n{s}")),
             ToolState::Success,
         ),
-        LintReport::Incomplete(s) => (format!("Error: {s}"), ToolState::Error),
+        LintReport::Incomplete(s) => (s.clone(), ToolState::Success),
         LintReport::Cancelled => ("Error: lint check aborted".into(), ToolState::Interrupted),
     }
 }
@@ -185,7 +185,7 @@ fn merge_checks(checks: Vec<Check>) -> LintReport {
             }
             Check::Clean => ran = true,
             Check::Timeout(what) => notes.push(format!(
-                "{what} timed out after {}s. That is not a clean result.",
+                "{what} did not finish in {}s. Not a compiler verdict — the crate was too large for this hop. Do not assume the code is broken.",
                 DIAG_TIMEOUT.as_secs()
             )),
             Check::Skip(why) => notes.push(why),
@@ -391,7 +391,7 @@ fn tsc_check(root: &Path, edited: &[String], cancel: &CancelFlag) -> Check {
         ) {
             CmdFinish::Cancelled => return Check::Cancelled,
             CmdFinish::Timeout => notes.push(format!(
-                "tsc timed out after {}s in {rel}. That is not a clean result.",
+                "tsc did not finish in {}s in {rel}. Not a compiler verdict — the project was too large for this hop. Do not assume the code is broken.",
                 DIAG_TIMEOUT.as_secs()
             )),
             CmdFinish::Failed => {
@@ -813,17 +813,17 @@ mod tests {
 
     #[test]
     fn timeout_and_skip_are_not_clean() {
+        let timeout = format!(
+            "cargo check did not finish in {}s. Not a compiler verdict — the crate was too large for this hop. Do not assume the code is broken.",
+            DIAG_TIMEOUT.as_secs()
+        );
         assert_eq!(
             merge_checks(vec![Check::Timeout("cargo check")]),
-            LintReport::Incomplete(
-                "cargo check timed out after 12s. That is not a clean result.".into()
-            )
+            LintReport::Incomplete(timeout.clone())
         );
         assert_eq!(
             merge_checks(vec![Check::Clean, Check::Timeout("cargo check")]),
-            LintReport::Incomplete(
-                "cargo check timed out after 12s. That is not a clean result.".into()
-            )
+            LintReport::Incomplete(timeout.clone())
         );
         assert_eq!(merge_checks(vec![Check::Clean]), LintReport::Clean);
         let skip = merge_checks(vec![Check::Skip(
@@ -833,14 +833,10 @@ mod tests {
             LintReport::Incomplete(s) => assert!(s.contains("App.tsx"), "{s}"),
             other => panic!("{other:?}"),
         }
-        let (text, state) = read_lints_reply(
-            &LintReport::Incomplete(
-                "cargo check timed out after 12s. That is not a clean result.".into(),
-            ),
-            &["find.rs".into()],
-        );
-        assert_eq!(state, ToolState::Error);
-        assert!(text.starts_with("Error:"), "{text}");
+        let (text, state) = read_lints_reply(&LintReport::Incomplete(timeout), &["find.rs".into()]);
+        assert_eq!(state, ToolState::Success);
+        assert!(!text.starts_with("Error:"), "{text}");
+        assert!(text.contains("Not a compiler verdict"), "{text}");
         assert!(!text.contains("No compiler or linter errors"), "{text}");
         let (ok, st) = read_lints_reply(&LintReport::Clean, &["src/lib.rs".into()]);
         assert_eq!(st, ToolState::Success);

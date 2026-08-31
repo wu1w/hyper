@@ -7,19 +7,22 @@ use super::dispatch::{
     observed_from_messages, parallel_safe_batch, read_is_full, read_repeats_search_span,
     recursive_any_file_glob, search_cap_reply, search_fold_shrinks, search_ident_already_shown,
     GLOB_AFTER_SEARCH_MSG, GLOB_FORBIDDEN_MSG, GLOB_NAMED_WRITE_MSG, GLOB_TREE_MSG,
-    GREP_AFTER_SEARCH_MSG, GREP_FORBIDDEN_MSG, GREP_TURN_CAP, GREP_TURN_CAP_MSG, READ_ALREADY_MSG,
-    READ_NAMED_NEW_MSG, READ_SEARCH_SPAN_MSG, READ_SIBLING_MSG, SEARCH_NAMED_WRITE_MSG,
-    SEARCH_PARAPHRASE_MSG, SEARCH_TURN_CAP, SEARCH_TURN_CAP_MSG, SHELL_CAT_SEARCH_MSG,
+    GREP_AFTER_SEARCH_MSG, GREP_FORBIDDEN_MSG, GREP_REPEAT_MSG, GREP_TURN_CAP, GREP_TURN_CAP_MSG,
+    READ_ALREADY_MSG, READ_NAMED_NEW_MSG, READ_SEARCH_SPAN_MSG, READ_SIBLING_MSG,
+    SEARCH_NAMED_WRITE_MSG, SEARCH_PARAPHRASE_MSG, SEARCH_TURN_CAP, SEARCH_TURN_CAP_MSG,
+    SHELL_CAT_SEARCH_MSG,
 };
 use super::notes::{
     forbids_glob, forbids_grep, forbids_tools, wants_auto_locate, wants_numeric_check,
     wants_web_check,
 };
 use super::progress::{
-    FORCED_SYNTHESIS_NOTE, STOP_NO_PROGRESS_EMPTY, STOP_NO_PROGRESS_SYNTHESIZED,
+    FORCED_SYNTHESIS_NOTE, INSPECT_STREAK, STOP_NO_PROGRESS_EMPTY, STOP_NO_PROGRESS_SYNTHESIZED,
 };
 use super::turn::{
-    NO_TOOL_THINK_FLOOR, PARSE_REPAIR_NOTE, PHYSICS_WRAP_NOTE, THINK_DIVERGENCE_NOTE,
+    EMPTY_CHANNEL_NOTE, EMPTY_STOP_FALLBACK, NO_TOOL_THINK_FLOOR, PARSE_REPAIR_NOTE,
+    PHYSICS_WRAP_NOTE, SYNTHESIS_ANSWER_RESERVE, SYNTHESIS_OUTPUT_CAP, SYNTHESIS_THINK_CAP,
+    THINK_DIVERGENCE_NOTE,
 };
 use super::*;
 use crate::error::Error;
@@ -136,6 +139,19 @@ fn turn_text(content: &str) -> ModelTurn {
         decode_tok_s: None,
         media: Vec::new(),
     }
+}
+
+fn turn_think(reasoning: &str) -> ModelTurn {
+    let mut t = turn_text("");
+    t.reasoning = reasoning.into();
+    t
+}
+
+fn turn_blank_transport() -> ModelTurn {
+    let mut t = turn_text("");
+    t.prompt_tokens = 0;
+    t.completion_tokens = 0;
+    t
 }
 
 fn turn_tool(name: &str, args: Value) -> ModelTurn {
@@ -626,6 +642,131 @@ async fn im_empty_after_wrap_emits_explainer() {
         out.text.contains("没有可见回复"),
         "expected explainer, got {:?}",
         out.text
+    );
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+#[tokio::test]
+async fn console_empty_hop_wraps_then_keeps_real_answer() {
+    let dir = std::env::temp_dir().join(format!(
+        "hyper-console-empty-{}",
+        uuid::Uuid::new_v4().simple()
+    ));
+    std::fs::create_dir_all(&dir).unwrap();
+    let mut o = opts(&dir);
+    o.max_steps = 8;
+    o.peripheral = false;
+    let scripted = Scripted {
+        turns: Mutex::new(VecDeque::from([
+            turn_text(""),
+            turn_text("here is the answer"),
+        ])),
+        meter: false,
+    };
+    let mut agent = Agent::new(scripted, o).unwrap();
+    let out = agent.run("what did you find").await.unwrap();
+    assert_eq!(out.text, "here is the answer", "{:?}", out.stop_reason);
+    let hidden: Vec<_> = agent
+        .messages
+        .iter()
+        .filter(|m| m.role == "user")
+        .map(|m| m.content.clone().unwrap_or_default())
+        .filter(|c| crate::template::is_hidden_user_text(c))
+        .collect();
+    assert!(
+        hidden.iter().any(|c| c.contains(EMPTY_CHANNEL_NOTE)),
+        "console empty hop must wrap once: {hidden:?}"
+    );
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+#[tokio::test]
+async fn console_dual_empty_uses_fallback() {
+    let dir = std::env::temp_dir().join(format!(
+        "hyper-console-fallback-{}",
+        uuid::Uuid::new_v4().simple()
+    ));
+    std::fs::create_dir_all(&dir).unwrap();
+    let mut o = opts(&dir);
+    o.max_steps = 8;
+    o.peripheral = false;
+    let scripted = Scripted {
+        turns: Mutex::new(VecDeque::from([turn_text(""), turn_text("")])),
+        meter: false,
+    };
+    let mut agent = Agent::new(scripted, o).unwrap();
+    let out = agent.run("what did you find").await.unwrap();
+    assert_eq!(out.text, EMPTY_STOP_FALLBACK, "{:?}", out.stop_reason);
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+#[tokio::test]
+async fn blank_transport_retries_then_keeps_real_answer() {
+    let dir = std::env::temp_dir().join(format!(
+        "hyper-blank-transport-{}",
+        uuid::Uuid::new_v4().simple()
+    ));
+    std::fs::create_dir_all(&dir).unwrap();
+    let mut o = opts(&dir);
+    o.max_steps = 6;
+    o.peripheral = false;
+    let scripted = Scripted {
+        turns: Mutex::new(VecDeque::from([
+            turn_blank_transport(),
+            turn_text("recovered after empty stream"),
+        ])),
+        meter: false,
+    };
+    let mut agent = Agent::new(scripted, o).unwrap();
+    let out = agent.run("say something").await.unwrap();
+    assert_eq!(
+        out.text, "recovered after empty stream",
+        "{:?}",
+        out.stop_reason
+    );
+    assert_eq!(
+        out.steps, 1,
+        "transport retry is the same hop: {:?}",
+        out.steps
+    );
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+#[tokio::test]
+async fn think_only_scratch_gets_one_wrap_up() {
+    let dir = std::env::temp_dir().join(format!(
+        "hyper-think-scratch-{}",
+        uuid::Uuid::new_v4().simple()
+    ));
+    std::fs::create_dir_all(&dir).unwrap();
+    let mut o = opts(&dir);
+    o.max_steps = 8;
+    o.peripheral = false;
+    let scripted = Scripted {
+        turns: Mutex::new(VecDeque::from([
+            turn_think("Let me look at agent/mod.rs next and verify finish(turn.content)."),
+            turn_text("核心循环缺空回复兜底，已记下。空跳不能当成功结束。"),
+        ])),
+        meter: false,
+    };
+    let mut agent = Agent::new(scripted, o).unwrap();
+    let out = agent.run("再查核心循环").await.unwrap();
+    assert_eq!(
+        out.text, "核心循环缺空回复兜底，已记下。空跳不能当成功结束。",
+        "{:?}",
+        out.stop_reason
+    );
+    assert_eq!(out.steps, 2);
+    let hidden: Vec<_> = agent
+        .messages
+        .iter()
+        .filter(|m| m.role == "user")
+        .map(|m| m.content.clone().unwrap_or_default())
+        .filter(|c| crate::template::is_hidden_user_text(c))
+        .collect();
+    assert!(
+        hidden.iter().any(|c| c.contains(EMPTY_CHANNEL_NOTE)),
+        "scratch think must wrap, not promote: {hidden:?}"
     );
     let _ = std::fs::remove_dir_all(dir);
 }
@@ -1865,28 +2006,27 @@ async fn grep_turn_cap_stops_storm() {
     let mut agent = Agent::new(scripted, o).unwrap();
     let out = agent.run("find those helpers").await.unwrap();
     assert_eq!(out.text, "ok");
+    assert!(
+        GREP_TURN_CAP >= 8,
+        "storm cap must stay above a short audit"
+    );
     let bodies: Vec<String> = agent
         .messages
         .iter()
         .filter(|m| m.role == "tool")
         .map(|m| m.content.clone().unwrap_or_default())
         .collect();
-    assert_eq!(bodies.len(), GREP_TURN_CAP as usize + 2, "{bodies:?}");
-    let capped = bodies
-        .iter()
-        .filter(|t| t.contains(GREP_TURN_CAP_MSG))
-        .count();
-    assert_eq!(
-        capped, 2,
-        "fifth parallel + follow-up Grep must cap: {bodies:?}"
+    assert_eq!(bodies.len(), 6, "{bodies:?}");
+    assert!(
+        bodies[..5]
+            .iter()
+            .all(|t| !t.contains(GREP_TURN_CAP_MSG) && !t.contains(GREP_REPEAT_MSG)),
+        "five distinct directory Greps must run even with Search on: {bodies:?}"
     );
-    let ran = bodies
-        .iter()
-        .filter(|t| !t.contains(GREP_TURN_CAP_MSG))
-        .count();
-    assert_eq!(
-        ran, GREP_TURN_CAP as usize,
-        "four Greps must run: {bodies:?}"
+    assert!(
+        bodies[5].contains(GREP_REPEAT_MSG),
+        "repeat pattern must fold: {}",
+        bodies[5]
     );
     let _ = std::fs::remove_dir_all(dir);
 }
@@ -2153,12 +2293,17 @@ async fn workspace_root_star_glob_folds() {
     assert_eq!(bodies.len(), 1, "{bodies:?}");
     assert!(
         bodies[0].contains(GLOB_TREE_MSG),
-        "root **/* glob must fold: {}",
+        "root **/* glob must sample, not dump: {}",
+        bodies[0]
+    );
+    assert!(
+        bodies[0].contains("crates"),
+        "top-level sample must list crates/: {}",
         bodies[0]
     );
     assert!(
         !bodies[0].contains("crates/a.rs"),
-        "must not walk the tree: {}",
+        "must not recurse into crates: {}",
         bodies[0]
     );
     let _ = std::fs::remove_dir_all(dir);
@@ -3879,7 +4024,7 @@ async fn watchdog_second_cap_stops_without_disabling_thinking() {
     let seen = watch.seen.clone();
     let mut agent = Agent::new(watch, opts(&dir)).unwrap();
     let out = agent.run("hi").await.unwrap();
-    assert!(out.text.is_empty(), "{}", out.text);
+    assert_eq!(out.text, EMPTY_STOP_FALLBACK, "{}", out.text);
     assert_eq!(out.stop_reason, None);
     let seen = seen.lock().expect("seen").clone();
     assert_eq!(
@@ -3984,7 +4129,7 @@ async fn watchdog_second_empty_cap_ends_quietly() {
     let mut agent = Agent::new(scripted, opts(&dir)).unwrap();
     let out = agent.run("hi").await.unwrap();
     assert_eq!(out.stop_reason, None);
-    assert!(out.text.is_empty(), "{}", out.text);
+    assert_eq!(out.text, EMPTY_STOP_FALLBACK, "{}", out.text);
     let _ = std::fs::remove_dir_all(dir);
 }
 
@@ -6468,6 +6613,101 @@ async fn view_unmounted_is_unknown_tool() {
 }
 
 #[tokio::test]
+async fn computer_use_unmounted_is_unknown_tool() {
+    let dir = std::env::temp_dir().join(format!("hyper-cu-off-{}", uuid::Uuid::new_v4().simple()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let scripted = Scripted {
+        turns: Mutex::new(VecDeque::from([
+            turn_tool("ComputerUse", json!({"action": "screenshot"})),
+            turn_text("ok"),
+        ])),
+        meter: false,
+    };
+    let mut agent = Agent::new(scripted, opts(&dir)).unwrap();
+    assert!(!crate::tools_schema::has_tool(agent.tools(), "ComputerUse"));
+    let out = agent.run("screenshot the desktop").await.unwrap();
+    assert_eq!(out.text, "ok");
+    let body = agent
+        .messages
+        .iter()
+        .find(|m| m.role == "tool")
+        .expect("tool")
+        .text();
+    assert!(
+        body.contains("unknown tool") && body.contains("ComputerUse"),
+        "hallucinated ComputerUse must not execute: {body}"
+    );
+    assert!(
+        !body.contains("image "),
+        "must not capture a display: {body}"
+    );
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+#[tokio::test]
+async fn computer_use_mounted_dispatches() {
+    let dir = std::env::temp_dir().join(format!("hyper-cu-on-{}", uuid::Uuid::new_v4().simple()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let scripted = Scripted {
+        turns: Mutex::new(VecDeque::from([
+            turn_tool("ComputerUse", json!({"action": "wait", "ms": 1})),
+            turn_text("ok"),
+        ])),
+        meter: false,
+    };
+    let mut o = opts(&dir);
+    o.computer_use = true;
+    let mut agent = Agent::new(scripted, o).unwrap();
+    assert!(crate::tools_schema::has_tool(agent.tools(), "ComputerUse"));
+    let out = agent.run("wait a tick").await.unwrap();
+    assert_eq!(out.text, "ok");
+    let body = agent
+        .messages
+        .iter()
+        .find(|m| m.role == "tool")
+        .expect("tool")
+        .text();
+    assert!(
+        body.contains("waited") && !body.contains("unknown tool"),
+        "mounted ComputerUse must run: {body}"
+    );
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn computer_use_unmounted_skips_permit() {
+    let dir = std::env::temp_dir().join(format!("hyper-cu-ask-{}", uuid::Uuid::new_v4().simple()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let (hub, _rx) = crate::permit::PermitHub::pair(crate::permit::ApprovalMode::Ask);
+    let scripted = Scripted {
+        turns: Mutex::new(VecDeque::from([
+            turn_tool("ComputerUse", json!({"action": "click", "x": 1, "y": 1})),
+            turn_text("ok"),
+        ])),
+        meter: false,
+    };
+    let mut o = opts(&dir);
+    o.permit = Some(hub);
+    let mut agent = Agent::new(scripted, o).unwrap();
+    let out = tokio::time::timeout(std::time::Duration::from_secs(5), agent.run("click"))
+        .await
+        .expect("unadvertised ComputerUse must not block on permit")
+        .unwrap();
+    assert_eq!(out.text, "ok");
+    let body = agent
+        .messages
+        .iter()
+        .find(|m| m.role == "tool")
+        .expect("tool")
+        .text();
+    assert!(
+        body.contains("unknown tool") && body.contains("ComputerUse"),
+        "{body}"
+    );
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+#[tokio::test]
 async fn read_png_loads_image_when_view_is_off() {
     let dir =
         std::env::temp_dir().join(format!("hyper-read-png-{}", uuid::Uuid::new_v4().simple()));
@@ -6583,6 +6823,20 @@ async fn agent_default_tools_are_frozen_cursor_set() {
     )
     .unwrap();
     assert!(crate::tools_schema::has_tool(with_search.tools(), "Search"));
+    let mut o = opts(&dir);
+    o.computer_use = true;
+    let with_cu = Agent::new(
+        Scripted {
+            turns: Mutex::new(VecDeque::from([turn_text("ok")])),
+            meter: false,
+        },
+        o,
+    )
+    .unwrap();
+    assert!(crate::tools_schema::has_tool(
+        with_cu.tools(),
+        "ComputerUse"
+    ));
     let _ = std::fs::remove_dir_all(dir);
 }
 
@@ -6896,6 +7150,292 @@ async fn no_progress_permuted_hops_force_synthesis() {
 }
 
 #[tokio::test]
+async fn synthesis_uses_short_policy_and_does_not_paint_reasoning() {
+    let dir = std::env::temp_dir().join(format!(
+        "hyper-synth-private-think-{}",
+        uuid::Uuid::new_v4().simple()
+    ));
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(dir.join("a.rs"), "fn ping() {}\n").unwrap();
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+    let seen = Arc::new(Mutex::new(Vec::new()));
+
+    struct StreamingPolicyScript {
+        turns: Mutex<VecDeque<ModelTurn>>,
+        sink: Mutex<Option<TokenSink>>,
+        policy: Mutex<ThinkPolicy>,
+        seen: Arc<Mutex<Vec<ThinkPolicy>>>,
+    }
+    impl Completer for StreamingPolicyScript {
+        async fn complete(
+            &self,
+            _messages: &[ChatMessage],
+            _tools: Option<&[Value]>,
+        ) -> Result<ModelTurn> {
+            let turn = self
+                .turns
+                .lock()
+                .expect("turns")
+                .pop_front()
+                .ok_or_else(|| Error::msg("script exhausted"))?;
+            if let Some(sink) = self.sink.lock().expect("sink").clone() {
+                for ch in turn.reasoning.chars() {
+                    sink.reasoning(&ch.to_string());
+                }
+                for ch in turn.content.chars() {
+                    sink.content(&ch.to_string());
+                }
+            }
+            Ok(turn)
+        }
+
+        fn set_policy(&self, p: ThinkPolicy) {
+            self.seen.lock().expect("seen").push(p.clone());
+            *self.policy.lock().expect("policy") = p;
+        }
+
+        fn policy(&self) -> Option<ThinkPolicy> {
+            Some(self.policy.lock().expect("policy").clone())
+        }
+
+        fn set_token_sink(&self, sink: Option<TokenSink>) {
+            *self.sink.lock().expect("sink") = sink;
+        }
+    }
+
+    let mut answer = turn_text(SYNTH_ANSWER);
+    answer.reasoning = "private scratch that must not reach the console".into();
+    let scripted = StreamingPolicyScript {
+        turns: Mutex::new(VecDeque::from([
+            turn_tool("glob", json!({"glob_pattern": "**/*.rs"})),
+            turn_tool("grep", json!({"pattern": "fn ping"})),
+            turn_tool("read", json!({"path": "a.rs"})),
+            turn_tool("glob", json!({"glob_pattern": "**/*.rs"})),
+            turn_tool("grep", json!({"pattern": "fn ping"})),
+            turn_tool("read", json!({"path": "a.rs"})),
+            answer,
+        ])),
+        sink: Mutex::new(None),
+        policy: Mutex::new(ThinkPolicy::agent_default()),
+        seen: seen.clone(),
+    };
+    let mut o = opts(&dir);
+    o.max_steps = 12;
+    o.peripheral = false;
+    let mut agent = Agent::new(scripted, o).unwrap();
+    agent.set_emit(crate::sidecar::EventSink { tx });
+    let out = agent.run("look around then answer").await.unwrap();
+    assert_eq!(out.text, SYNTH_ANSWER);
+
+    let policies = seen.lock().expect("seen");
+    assert!(
+        policies.iter().any(|p| {
+            p.enabled
+                && p.effort == Some(crate::policy::Effort::Low)
+                && p.max_think_tokens == SYNTHESIS_THINK_CAP
+                && p.max_tokens == SYNTHESIS_OUTPUT_CAP
+        }),
+        "missing synthesis policy: {policies:?}"
+    );
+    drop(policies);
+    let mut painted_reasoning = String::new();
+    let mut painted_content = String::new();
+    while let Ok(event) = rx.try_recv() {
+        if let SessionEvent::Delta(delta) = event {
+            if delta.channel == crate::session::DeltaChannel::Reasoning {
+                painted_reasoning.push_str(&delta.text);
+            } else {
+                painted_content.push_str(&delta.text);
+            }
+        }
+    }
+    assert!(
+        !painted_reasoning.contains("private scratch"),
+        "synthesis reasoning leaked: {painted_reasoning}"
+    );
+    assert!(painted_content.contains(SYNTH_ANSWER), "{painted_content}");
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+#[tokio::test]
+async fn synthesis_watchdog_retries_with_thinking_off_not_wider() {
+    let dir = std::env::temp_dir().join(format!(
+        "hyper-synth-watchdog-{}",
+        uuid::Uuid::new_v4().simple()
+    ));
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(dir.join("a.rs"), "fn ping() {}\n").unwrap();
+    let seen = Arc::new(Mutex::new(Vec::new()));
+    let watch = PolicyWatch {
+        inner: Scripted {
+            turns: Mutex::new(VecDeque::from([
+                turn_tool("glob", json!({"glob_pattern": "**/*.rs"})),
+                turn_tool("grep", json!({"pattern": "fn ping"})),
+                turn_tool("read", json!({"path": "a.rs"})),
+                turn_tool("glob", json!({"glob_pattern": "**/*.rs"})),
+                turn_tool("grep", json!({"pattern": "fn ping"})),
+                turn_tool("read", json!({"path": "a.rs"})),
+                ModelTurn::watchdog(),
+                turn_text(SYNTH_ANSWER),
+            ])),
+            meter: false,
+        },
+        policy: Mutex::new(ThinkPolicy::agent_default()),
+        seen: seen.clone(),
+    };
+    let mut o = opts(&dir);
+    o.max_steps = 14;
+    o.peripheral = false;
+    let mut agent = Agent::new(watch, o).unwrap();
+    let out = agent.run("look around then answer").await.unwrap();
+    assert_eq!(out.text, SYNTH_ANSWER);
+    let policies = seen.lock().expect("seen");
+    assert!(
+        policies
+            .iter()
+            .any(|p| !p.enabled && p.max_tokens == SYNTHESIS_ANSWER_RESERVE),
+        "second synthesis attempt must disable thinking: {policies:?}"
+    );
+    assert!(
+        !policies
+            .iter()
+            .any(|p| p.max_think_tokens == NO_TOOL_THINK_FLOOR),
+        "synthesis must not widen to the generic no-tool floor: {policies:?}"
+    );
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+#[tokio::test]
+async fn synthesis_think_only_retries_tight_not_wider() {
+    let dir = std::env::temp_dir().join(format!(
+        "hyper-synth-empty-{}",
+        uuid::Uuid::new_v4().simple()
+    ));
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(dir.join("a.rs"), "fn ping() {}\n").unwrap();
+    let seen = Arc::new(Mutex::new(Vec::new()));
+    let watch = PolicyWatch {
+        inner: Scripted {
+            turns: Mutex::new(VecDeque::from([
+                turn_tool("glob", json!({"glob_pattern": "**/*.rs"})),
+                turn_tool("grep", json!({"pattern": "fn ping"})),
+                turn_tool("read", json!({"path": "a.rs"})),
+                turn_tool("glob", json!({"glob_pattern": "**/*.rs"})),
+                turn_tool("grep", json!({"pattern": "fn ping"})),
+                turn_tool("read", json!({"path": "a.rs"})),
+                turn_think(
+                    "The user wants me to check ComputerUse. Let me look at dispatch.rs next.",
+                ),
+                turn_text(SYNTH_ANSWER),
+            ])),
+            meter: false,
+        },
+        policy: Mutex::new(ThinkPolicy::agent_default()),
+        seen: seen.clone(),
+    };
+    let mut o = opts(&dir);
+    o.max_steps = 14;
+    o.peripheral = false;
+    let mut agent = Agent::new(watch, o).unwrap();
+    let out = agent.run("look around then answer").await.unwrap();
+    assert_eq!(out.text, SYNTH_ANSWER);
+    assert_eq!(
+        out.stop_reason.as_deref(),
+        Some(STOP_NO_PROGRESS_SYNTHESIZED),
+        "{:?}",
+        out.stop_reason
+    );
+    let policies = seen.lock().expect("seen");
+    assert!(
+        policies
+            .iter()
+            .any(|p| !p.enabled && p.max_tokens == SYNTHESIS_ANSWER_RESERVE),
+        "empty wrap must retry with a tight cap, not 8k: {policies:?}"
+    );
+    assert!(
+        !policies
+            .iter()
+            .any(|p| p.max_think_tokens == NO_TOOL_THINK_FLOOR),
+        "synthesis must not widen to the generic no-tool floor: {policies:?}"
+    );
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+#[tokio::test]
+async fn synthesis_keeps_output_cap_when_user_forbade_tools() {
+    let dir = std::env::temp_dir().join(format!(
+        "hyper-synth-no-widen-{}",
+        uuid::Uuid::new_v4().simple()
+    ));
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(dir.join("a.rs"), "fn ping() {}\n").unwrap();
+    let live = Arc::new(Mutex::new(Vec::new()));
+
+    struct LivePolicy {
+        inner: Scripted,
+        policy: Mutex<ThinkPolicy>,
+        live: Arc<Mutex<Vec<ThinkPolicy>>>,
+    }
+    impl Completer for LivePolicy {
+        async fn complete(
+            &self,
+            messages: &[ChatMessage],
+            tools: Option<&[Value]>,
+        ) -> Result<ModelTurn> {
+            self.live
+                .lock()
+                .expect("live")
+                .push(self.policy.lock().expect("policy").clone());
+            self.inner.complete(messages, tools).await
+        }
+        fn set_policy(&self, p: ThinkPolicy) {
+            *self.policy.lock().expect("policy") = p;
+        }
+        fn policy(&self) -> Option<ThinkPolicy> {
+            Some(self.policy.lock().expect("policy").clone())
+        }
+    }
+
+    let scripted = LivePolicy {
+        inner: Scripted {
+            turns: Mutex::new(VecDeque::from([
+                turn_tool("glob", json!({"glob_pattern": "**/*.rs"})),
+                turn_tool("grep", json!({"pattern": "fn ping"})),
+                turn_tool("read", json!({"path": "a.rs"})),
+                turn_tool("glob", json!({"glob_pattern": "**/*.rs"})),
+                turn_tool("grep", json!({"pattern": "fn ping"})),
+                turn_tool("read", json!({"path": "a.rs"})),
+                turn_text(SYNTH_ANSWER),
+            ])),
+            meter: false,
+        },
+        policy: Mutex::new(ThinkPolicy::agent_default()),
+        live: live.clone(),
+    };
+    let mut o = opts(&dir);
+    o.max_steps = 12;
+    o.peripheral = false;
+    let mut agent = Agent::new(scripted, o).unwrap();
+    let out = agent
+        .run("不要调用工具。look around then answer")
+        .await
+        .unwrap();
+    assert_eq!(out.text, SYNTH_ANSWER);
+    let hops = live.lock().expect("live");
+    let wrap = hops.last().expect("synthesis complete");
+    assert_eq!(
+        wrap.max_think_tokens, SYNTHESIS_THINK_CAP,
+        "wrap hop must not inherit the 8k no-tool widen: {hops:?}"
+    );
+    assert_eq!(
+        wrap.max_tokens, SYNTHESIS_OUTPUT_CAP,
+        "Grok wrap must send max_output_tokens: {wrap:?}"
+    );
+    assert_eq!(wrap.effort, Some(crate::policy::Effort::Low), "{wrap:?}");
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+#[tokio::test]
 async fn natural_text_final_is_still_end_turn() {
     let dir =
         std::env::temp_dir().join(format!("hyper-end-turn-{}", uuid::Uuid::new_v4().simple()));
@@ -6931,8 +7471,10 @@ async fn natural_text_final_is_still_end_turn() {
 
 #[tokio::test]
 async fn write_between_reads_is_not_low_progress() {
-    let dir =
-        std::env::temp_dir().join(format!("hyper-write-prog-{}", uuid::Uuid::new_v4().simple()));
+    let dir = std::env::temp_dir().join(format!(
+        "hyper-write-prog-{}",
+        uuid::Uuid::new_v4().simple()
+    ));
     std::fs::create_dir_all(&dir).unwrap();
     std::fs::write(dir.join("a.rs"), "fn ping() {}\n").unwrap();
     let scripted = Scripted {
@@ -6958,6 +7500,92 @@ async fn write_between_reads_is_not_low_progress() {
 }
 
 #[tokio::test]
+async fn inspect_tour_of_new_files_eventually_synthesizes() {
+    let dir = std::env::temp_dir().join(format!(
+        "hyper-inspect-tour-{}",
+        uuid::Uuid::new_v4().simple()
+    ));
+    std::fs::create_dir_all(&dir).unwrap();
+    let n = INSPECT_STREAK as usize;
+    for i in 0..n {
+        std::fs::write(
+            dir.join(format!("f{i}.rs")),
+            format!("fn tour_{i}() {{}}\n"),
+        )
+        .unwrap();
+    }
+    let mut hops: Vec<_> = (0..n)
+        .map(|i| turn_tool("read", json!({"path": format!("f{i}.rs")})))
+        .collect();
+    hops.push(turn_text(SYNTH_ANSWER));
+    let none_at = Arc::new(Mutex::new(Vec::new()));
+    let watch = ToolsWatch {
+        inner: Scripted {
+            turns: Mutex::new(VecDeque::from(hops)),
+            meter: false,
+        },
+        none_at: none_at.clone(),
+    };
+    let mut o = opts(&dir);
+    o.max_steps = INSPECT_STREAK + 4;
+    o.peripheral = false;
+    let mut agent = Agent::new(watch, o).unwrap();
+    let out = agent.run("audit these files").await.unwrap();
+    assert_eq!(out.text, SYNTH_ANSWER);
+    assert_eq!(
+        out.stop_reason.as_deref(),
+        Some(STOP_NO_PROGRESS_SYNTHESIZED),
+        "{:?}",
+        out.stop_reason
+    );
+    let none = none_at.lock().expect("none").clone();
+    assert!(
+        none.iter().any(|t| *t),
+        "inspect budget must strip tools: {none:?}"
+    );
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+#[tokio::test]
+async fn nine_inspect_hops_still_allow_a_write() {
+    let dir = std::env::temp_dir().join(format!(
+        "hyper-inspect-write-{}",
+        uuid::Uuid::new_v4().simple()
+    ));
+    std::fs::create_dir_all(&dir).unwrap();
+    let n = (INSPECT_STREAK - 1) as usize;
+    for i in 0..n {
+        std::fs::write(
+            dir.join(format!("f{i}.rs")),
+            format!("fn keep_{i}() {{}}\n"),
+        )
+        .unwrap();
+    }
+    let mut hops: Vec<_> = (0..n)
+        .map(|i| turn_tool("read", json!({"path": format!("f{i}.rs")})))
+        .collect();
+    hops.push(turn_tool(
+        "write",
+        json!({"path": "f0.rs", "contents": "fn keep_0() { 1 }\n"}),
+    ));
+    hops.push(turn_text(SYNTH_ANSWER));
+    let scripted = Scripted {
+        turns: Mutex::new(VecDeque::from(hops)),
+        meter: false,
+    };
+    let mut o = opts(&dir);
+    o.max_steps = INSPECT_STREAK + 4;
+    o.peripheral = false;
+    let mut agent = Agent::new(scripted, o).unwrap();
+    let out = agent.run("read then edit").await.unwrap();
+    assert_eq!(out.text, SYNTH_ANSWER);
+    assert_eq!(out.stop_reason, None, "{:?}", out.stop_reason);
+    let written = std::fs::read_to_string(dir.join("f0.rs")).unwrap();
+    assert!(written.contains("{ 1 }"), "{written}");
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+#[tokio::test]
 async fn synthesis_empty_records_no_progress_empty() {
     let dir = std::env::temp_dir().join(format!(
         "hyper-noprog-empty-{}",
@@ -6975,6 +7603,7 @@ async fn synthesis_empty_records_no_progress_empty() {
             turn_tool("grep", json!({"pattern": "fn ping"})),
             turn_tool("read", json!({"path": "a.rs"})),
             turn_text(""),
+            turn_text(""),
         ])),
         meter: false,
     };
@@ -6989,6 +7618,7 @@ async fn synthesis_empty_records_no_progress_empty() {
         "{:?}",
         out.stop_reason
     );
+    assert_eq!(out.text, EMPTY_STOP_FALLBACK);
     let _ = std::fs::remove_dir_all(dir);
 }
 

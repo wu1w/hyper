@@ -501,12 +501,17 @@ pub struct Agent<C> {
     /// Distinct Search queries this turn. Near-duplicates do not consume
     /// `search_calls`, so a second topic still gets a slot.
     search_queries: Mutex<Vec<String>>,
+    /// Grep patterns this user turn. Paraphrases fold; a high storm cap
+    /// still applies to distinct directory greps.
+    grep_queries: Mutex<Vec<String>>,
     /// Grep calls this user turn. Caps rg storms without changing `drive()`.
     grep_calls: Arc<AtomicU32>,
     /// Full-file Read paths this user turn. Same-path re-reads fold; offset paging stays.
     read_full: Mutex<HashSet<String>>,
     /// Physics cap (steps / wall / context / tool budget) already got a wrap-up hop.
     physics_nudged: bool,
+    /// Empty toolless hop already got one wrap-up. Second blank → fallback text.
+    channel_nudged: bool,
     /// Next model hop has tools=None so the model must answer from evidence.
     force_synthesis: bool,
     /// One leaked-tool retry already used on the synthesis hop.

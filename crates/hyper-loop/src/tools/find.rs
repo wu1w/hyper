@@ -54,6 +54,14 @@ pub(crate) fn is_unfiltered_tree_glob(pattern: &str) -> bool {
     matches!(p.as_str(), "*" | "*.*" | "**" | "**/*" | "**/*.*")
 }
 
+/// Footer on a workspace-root unfiltered glob. The listing above is top-level
+/// only; a recursive dump is not useful.
+pub(crate) const GLOB_TREE_MSG: &str = "\
+Top-level sample only (vendor / release / out skipped). Grep a symbol, or \
+Glob with an extension / inside a subdirectory — a full recursive **/* dump \
+is not useful.";
+
+const SHALLOW_SAMPLE: usize = 40;
 const MAX_FILE_BYTES: u64 = 1_048_576;
 /// Fallback Glob/Grep walk cap. Windows home/Documents as workspace used to
 /// freeze the hop when `rg` was missing from PATH.
@@ -93,6 +101,17 @@ pub fn glob_files(ws: &Workspace, call: &ToolCall, limits: ToolLimits) -> ToolRe
             ),
             ToolState::Error,
         );
+    }
+    if is_unfiltered_tree_glob(&pattern) && listing_is_ws_root(ws, &root) {
+        let hits = shallow_listing(&root, ws.root(), SHALLOW_SAMPLE);
+        let mut text = if hits.is_empty() {
+            format!("No files matching `{pattern}`.")
+        } else {
+            hits.join("\n")
+        };
+        text.push_str("\n\n");
+        text.push_str(GLOB_TREE_MSG);
+        return folded_response(&call.id, text, ToolState::Success, limits, None);
     }
     let matcher = match GlobMatcher::new(&pattern) {
         Ok(m) => m,
@@ -699,6 +718,50 @@ fn skip_walk_dir(name: &str, parent_rel: &str) -> bool {
     under_hyper && HYPER_SKIP_DIR.contains(&name)
 }
 
+fn listing_is_ws_root(ws: &Workspace, root: &Path) -> bool {
+    if root == ws.root() {
+        return true;
+    }
+    match (root.canonicalize(), ws.root().canonicalize()) {
+        (Ok(a), Ok(b)) => a == b,
+        _ => false,
+    }
+}
+
+/// Immediate children of `dir`, skipping packed/vendor names. Dirs keep a
+/// trailing slash so the sample reads as a tree, not a file list.
+pub(crate) fn shallow_listing(dir: &Path, ws_root: &Path, cap: usize) -> Vec<String> {
+    let Ok(entries) = fs::read_dir(dir) else {
+        return Vec::new();
+    };
+    let parent_rel = dir
+        .strip_prefix(ws_root)
+        .unwrap_or(dir)
+        .to_string_lossy()
+        .replace('\\', "/");
+    let mut hits: Vec<(bool, String)> = Vec::new();
+    for entry in entries.flatten() {
+        let name_s = entry.file_name().to_string_lossy().into_owned();
+        if skip_walk_dir(&name_s, &parent_rel) {
+            continue;
+        }
+        let path = entry.path();
+        let rel = path
+            .strip_prefix(ws_root)
+            .unwrap_or(&path)
+            .to_string_lossy()
+            .replace('\\', "/");
+        let is_dir = entry.file_type().map(|t| t.is_dir()).unwrap_or(false);
+        if is_dir {
+            hits.push((true, format!("{rel}/")));
+        } else {
+            hits.push((false, rel));
+        }
+    }
+    hits.sort_by(|a, b| a.1.cmp(&b.1));
+    hits.into_iter().map(|(_, s)| s).take(cap).collect()
+}
+
 fn walk_files(dir: &Path, root: &Path, visit: &mut dyn FnMut(&str, &Path) -> bool) -> WalkEnd {
     let started = Instant::now();
     let mut stack = vec![dir.to_path_buf()];
@@ -957,6 +1020,25 @@ mod tests {
             "electron release must not fill the glob cap: {t}"
         );
         assert!(!t.contains("/out/"), "tsc out must not fill glob: {t}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn glob_root_star_returns_shallow_sample() {
+        let (ws, dir) = scratch();
+        std::fs::create_dir_all(dir.join("crates")).unwrap();
+        std::fs::write(dir.join("crates/lib.rs"), "fn x() {}\n").unwrap();
+        std::fs::write(dir.join("README.md"), "# h\n").unwrap();
+        let t = glob_files(
+            &ws,
+            &call(json!({"glob_pattern": "**/*"})),
+            ToolLimits::default(),
+        )
+        .joined_text();
+        assert!(t.contains("crates/"), "{t}");
+        assert!(t.contains("README.md"), "{t}");
+        assert!(t.contains(GLOB_TREE_MSG), "{t}");
+        assert!(!t.contains("crates/lib.rs"), "must not recurse: {t}");
         let _ = std::fs::remove_dir_all(&dir);
     }
 

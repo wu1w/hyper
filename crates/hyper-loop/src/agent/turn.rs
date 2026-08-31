@@ -5,10 +5,11 @@ use serde_json::Value;
 use super::dispatch::{
     normalize_tool_calls, observed_from_messages, openai_stored, openai_tool_calls,
 };
-use super::{Agent, AgentOutcome, Completer, ModelTurn};
+use super::{Agent, AgentOutcome, Completer, ModelTurn, TokenSink};
 use crate::channel::take_steer;
 use crate::error::Result;
 use crate::paw_loop::{fs_tool_path, GateCtx, GateDecision, ToolFingerprint};
+use crate::policy::ThinkPolicy;
 use crate::session::{PolicyReason, RunPhase, SessionEvent, StepPhase};
 use crate::sticky;
 use crate::template::{is_hidden_user_text, wrap_tool_response, ChatMessage};
@@ -55,6 +56,7 @@ impl<C: Completer> Agent<C> {
         // inherit iteration/timeout/doom from the previous prompt.
         self.handler.reset_turn(&self.session_id);
         self.physics_nudged = false;
+        self.channel_nudged = false;
         self.force_synthesis = false;
         self.synthesis_recovered = false;
         self.progress.reset();
@@ -66,6 +68,7 @@ impl<C: Completer> Agent<C> {
         crate::lock_unpoison(&self.search_queries).clear();
         self.grep_calls
             .store(0, std::sync::atomic::Ordering::Relaxed);
+        crate::lock_unpoison(&self.grep_queries).clear();
         crate::lock_unpoison(&self.read_full).clear();
         self.channel_files.clear();
         self.observed_paths = observed_from_messages(&self.messages, &self.workspace);
@@ -114,8 +117,7 @@ impl<C: Completer> Agent<C> {
             first_hop = false;
 
             let tools_owned = self.tools.clone();
-            let tools = if self.force_synthesis || self.physics_nudged || tools_owned.is_empty()
-            {
+            let tools = if self.force_synthesis || self.physics_nudged || tools_owned.is_empty() {
                 None
             } else {
                 Some(tools_owned.as_slice())
@@ -123,8 +125,19 @@ impl<C: Completer> Agent<C> {
 
             self.current_step = steps.saturating_add(1);
             self.emit_step(StepPhase::Started, None, None);
+            let synthesis_policy = if self.force_synthesis {
+                self.arm_synthesis_completion()
+            } else {
+                None
+            };
             self.arm_speculate();
             let completed = self.complete_or_abort(tools).await;
+            if let Some(prev) = synthesis_policy {
+                self.completer.set_policy(prev);
+            }
+            if self.force_synthesis {
+                self.arm_sink();
+            }
             self.completer.set_speculate(None);
             let completed = match completed {
                 Ok(turn) => turn,
@@ -147,6 +160,20 @@ impl<C: Completer> Agent<C> {
             );
             prompt_tokens += turn.prompt_tokens;
             completion_tokens += turn.completion_tokens;
+
+            if self.force_synthesis && turn.watchdog_hit {
+                self.drop_speculate();
+                if self.retry_synthesis_once("synthesis think cap") {
+                    continue;
+                }
+                return self.finish(
+                    self.last_spoken
+                        .clone()
+                        .unwrap_or_else(|| EMPTY_STOP_FALLBACK.to_string()),
+                    Some(super::progress::STOP_NO_PROGRESS_EMPTY.into()),
+                    steps,
+                );
+            }
 
             if turn.watchdog_hit {
                 // A cap hit is evidence of a runaway trajectory, not evidence
@@ -229,6 +256,23 @@ impl<C: Completer> Agent<C> {
                 continue;
             }
 
+            if turn.tool_calls.is_empty() {
+                if let Some(body) = Self::promote_reasoning_reply(&turn) {
+                    turn.content = body;
+                }
+            }
+            if !self.force_synthesis && self.needs_channel_rescue(&turn) {
+                if !self.channel_nudged {
+                    self.channel_nudged = true;
+                    self.note("[channel] empty visible reply; one wrap-up");
+                    self.push_hidden_user(EMPTY_CHANNEL_NOTE);
+                    self.drop_speculate();
+                    continue;
+                }
+                self.mark_clean();
+                return self.finish(String::new(), None, steps);
+            }
+
             if self.force_synthesis {
                 let leaked_json = lift_leaked_tool_json(&turn.content);
                 if leaked_json.is_some() {
@@ -237,11 +281,23 @@ impl<C: Completer> Agent<C> {
                 let leaked = !turn.tool_calls.is_empty() || leaked_json.is_some();
                 turn.tool_calls.clear();
                 turn.raw_tool_calls = None;
-                if leaked && !self.synthesis_recovered {
-                    self.synthesis_recovered = true;
+                if leaked {
                     self.push_assistant(&turn);
-                    self.push_hidden_user(super::progress::FORCED_SYNTHESIS_NOTE);
+                    if self.retry_synthesis_once("synthesis leaked tools") {
+                        continue;
+                    }
                     self.drop_speculate();
+                    return self.finish(
+                        self.last_spoken.clone().unwrap_or_default(),
+                        Some(super::progress::STOP_NO_PROGRESS_EMPTY.into()),
+                        steps,
+                    );
+                }
+                if !crate::stutter::is_substantial_reply(&turn.content)
+                    && self.retry_synthesis_once("synthesis empty wrap")
+                {
+                    // Grok Responses clips on max_output_tokens without
+                    // watchdog_hit. Do not commit scratch think as an answer.
                     continue;
                 }
                 self.push_assistant(&turn);
@@ -540,6 +596,43 @@ impl<C: Completer> Agent<C> {
         self.completer.set_speculate(Some(slot));
     }
 
+    /// A convergence hop is not another research hop. Stream only answer
+    /// tokens. Grok Responses honors `max_tokens` as `max_output_tokens`
+    /// (reasoning + answer); llama.cpp also cuts local think at 768. Recovery
+    /// tightens the wire cap instead of widening to the 8k no-tool floor.
+    /// Grok still forwards `effort=low` when thinking is off.
+    fn arm_synthesis_completion(&self) -> Option<ThinkPolicy> {
+        self.completer
+            .set_token_sink(self.live_sink().map(TokenSink::content_only));
+        let prev = self.completer.policy()?;
+        let mut synthesis = if self.synthesis_recovered {
+            ThinkPolicy::off()
+        } else {
+            prev.clone()
+        };
+        if !self.synthesis_recovered {
+            synthesis.enabled = true;
+            synthesis.effort = Some(crate::policy::Effort::Low);
+            synthesis.max_think_tokens = SYNTHESIS_THINK_CAP;
+            synthesis.max_tokens = SYNTHESIS_OUTPUT_CAP;
+        } else {
+            synthesis.max_tokens = SYNTHESIS_ANSWER_RESERVE;
+        }
+        self.completer.set_policy(synthesis);
+        Some(prev)
+    }
+
+    fn retry_synthesis_once(&mut self, why: &str) -> bool {
+        if self.synthesis_recovered {
+            return false;
+        }
+        self.synthesis_recovered = true;
+        self.note(&format!("[trajectory] {why}; one tight retry"));
+        self.push_hidden_user(super::progress::FORCED_SYNTHESIS_NOTE);
+        self.drop_speculate();
+        true
+    }
+
     fn drop_speculate(&mut self) {
         self.completer.set_speculate(None);
         if let Some(slot) = self.speculate.take() {
@@ -562,6 +655,42 @@ impl<C: Completer> Agent<C> {
         }
         self.push_hidden_user(PHYSICS_WRAP_NOTE);
         true
+    }
+
+    /// Empty visible hop: leftover think, or a naked empty stop with nothing
+    /// already spoken. Do not dump unfinished CoT; do not deliver `""`.
+    fn needs_channel_rescue(&self, turn: &ModelTurn) -> bool {
+        if !turn.tool_calls.is_empty() || !turn.content.trim().is_empty() {
+            return false;
+        }
+        if !turn.reasoning.trim().is_empty() {
+            return true;
+        }
+        self.last_spoken
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .is_none()
+    }
+
+    /// Lift a finished answer that landed only in `reasoning`. Scratch plans
+    /// and long CoT stay in think and get a wrap-up hop. Cursor keeps thinking
+    /// in the think panel; only a short finished reply is promoted.
+    fn promote_reasoning_reply(turn: &ModelTurn) -> Option<String> {
+        if !turn.tool_calls.is_empty() || !turn.content.trim().is_empty() {
+            return None;
+        }
+        let r = turn.reasoning.trim();
+        if crate::stutter::is_scratch_think(r) {
+            return None;
+        }
+        if !crate::stutter::is_substantial_reply(r) {
+            return None;
+        }
+        if r.chars().count() > PROMOTE_REASONING_MAX {
+            return None;
+        }
+        Some(r.to_string())
     }
 
     pub(crate) fn last_real_user(&self) -> &str {
@@ -688,9 +817,7 @@ impl<C: Completer> Agent<C> {
         if self.print {
             self.stdio.close_think();
         }
-        let reason = stop_reason
-            .clone()
-            .unwrap_or_else(|| "end_turn".into());
+        let reason = stop_reason.clone().unwrap_or_else(|| "end_turn".into());
         self.log_event(SessionEvent::stop(reason));
         let aborted = stop_reason.as_deref() == Some("aborted");
         let run_phase = if aborted {
@@ -704,12 +831,12 @@ impl<C: Completer> Agent<C> {
         } else {
             self.last_spoken.clone().unwrap_or_default()
         };
-        if !aborted
-            && text.trim().is_empty()
-            && !super::interactive_channel(&self.channel)
-            && !self.channel.is_empty()
-        {
-            text = im_no_reply_text(stop_reason.as_deref());
+        if !aborted && text.trim().is_empty() {
+            if !super::interactive_channel(&self.channel) && !self.channel.is_empty() {
+                text = im_no_reply_text(stop_reason.as_deref());
+            } else {
+                text = EMPTY_STOP_FALLBACK.to_string();
+            }
         }
         if !aborted {
             self.maybe_write_chat_recap(&text);
@@ -789,6 +916,13 @@ pub(crate) const NO_TOOL_THINK_FLOOR: u32 = 8192;
 
 /// Generation room reserved past the think floor for the visible answer.
 pub(crate) const NO_TOOL_ANSWER_RESERVE: u32 = 4096;
+/// Forced convergence is deliberately much smaller than a user-requested
+/// no-tool deep-thinking turn. It should summarize evidence, not reopen work.
+pub(crate) const SYNTHESIS_THINK_CAP: u32 = 768;
+pub(crate) const SYNTHESIS_ANSWER_RESERVE: u32 = 2048;
+/// Wire cap for the wrap hop (`max_output_tokens` on Grok Responses includes
+/// reasoning). Local llama.cpp watchdog still uses [`SYNTHESIS_THINK_CAP`].
+pub(crate) const SYNTHESIS_OUTPUT_CAP: u32 = SYNTHESIS_THINK_CAP + SYNTHESIS_ANSWER_RESERVE;
 
 #[cfg(test)]
 pub(crate) const THINK_DIVERGENCE_NOTE: &str = "[trajectory] This turn's thinking hit the length budget and may be diverging. \
@@ -797,6 +931,21 @@ Compress known facts and open questions first; answer or act if the evidence is 
 pub(crate) const PHYSICS_WRAP_NOTE: &str =
     "[trajectory] No user-visible reply yet. Summarize what you found and accomplished; \
 do not call any more tools.";
+
+/// One wrap-up hop after a toolless hop with empty visible content.
+/// Thinking is not the answer (Cursor hop geometry).
+pub(crate) const EMPTY_CHANNEL_NOTE: &str = "\
+[trajectory] The last hop had no user-visible reply. \
+Write the full conclusion in the normal reply — thinking is not shown as the answer. \
+If the task is unfinished, call a tool. Do not submit another empty reply.";
+
+/// Console fallback when a wrap-up hop is still blank. IM uses `im_no_reply_text`.
+pub(crate) const EMPTY_STOP_FALLBACK: &str =
+    "没有可见回复：模型这一跳交了空正文。直接发「继续」我再收一次。";
+
+/// Upper bound for promoting think-channel text into the visible reply.
+/// Longer blobs are unfinished CoT, not an answer.
+const PROMOTE_REASONING_MAX: usize = 800;
 
 /// Hermes turn-completion explainer: IM never returns a blank box.
 pub(crate) fn im_no_reply_text(reason: Option<&str>) -> String {

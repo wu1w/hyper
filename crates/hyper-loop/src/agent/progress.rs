@@ -17,13 +17,18 @@ use super::dispatch::canon_ws_path;
 
 pub const HOP_HISTORY: usize = 8;
 pub const LOW_STREAK: u32 = 3;
+/// Consecutive inspect-only hops (Read/Grep/Glob/…) before forcing a
+/// synthesis hop. Writes reset this. High enough that a real edit can still
+/// read a handful of files first; low enough that an audit cannot wander
+/// through the tree until the context fills.
+pub const INSPECT_STREAK: u32 = 10;
 pub const NOVELTY_FLOOR: f32 = 0.15;
 
 pub const STOP_NO_PROGRESS_SYNTHESIZED: &str = "no_progress_synthesized";
 pub const STOP_NO_PROGRESS_EMPTY: &str = "no_progress_empty";
 
 pub const FORCED_SYNTHESIS_NOTE: &str = "\
-[trajectory] Further inspection is repeating existing evidence. \
+[trajectory] Further inspection is not adding enough new evidence. \
 Do not call tools. Answer the user now using the evidence already collected. \
 State remaining uncertainty explicitly.";
 
@@ -71,6 +76,7 @@ pub struct ProgressTracker {
     hops: VecDeque<HopSignature>,
     last_fps: BTreeSet<String>,
     low_streak: u32,
+    inspect_streak: u32,
     hop_index: u32,
     last_test_fail: Option<bool>,
     last_diag_hash: Option<String>,
@@ -131,6 +137,12 @@ impl ProgressTracker {
             // Capture before count_evidence / remember_hash, or the first
             // dump of a blob is folded away as "already observed".
             let already = self.seen_hashes.contains(&blob_hash);
+            if is_gate_or_nudge(&body) {
+                delta.total_results += 1;
+                delta.repeated_results += 1;
+                self.remember_hash(&blob_hash);
+                continue;
+            }
             let listing = matches!(name, "glob" | "grep" | "search");
             if listing {
                 self.note_listing(&canon, &mut delta, response);
@@ -185,7 +197,13 @@ impl ProgressTracker {
         } else if !identical {
             self.low_streak = 0;
         }
-        if self.low_streak >= LOW_STREAK {
+        let inspect = hop_is_inspect(calls);
+        if inspect && !identical {
+            self.inspect_streak = self.inspect_streak.saturating_add(1);
+        } else if !inspect {
+            self.inspect_streak = 0;
+        }
+        if self.low_streak >= LOW_STREAK || self.inspect_streak >= INSPECT_STREAK {
             self.synthesize = true;
         }
         self.hops.push_back(sig);
@@ -224,7 +242,12 @@ impl ProgressTracker {
         true
     }
 
-    fn note_listing(&mut self, canon: &str, delta: &mut ProgressDelta, response: &mut ToolResponse) {
+    fn note_listing(
+        &mut self,
+        canon: &str,
+        delta: &mut ProgressDelta,
+        response: &mut ToolResponse,
+    ) {
         let mut new_matches = 0usize;
         let mut old_matches = 0usize;
         let mut ids: Vec<String> = Vec::new();
@@ -250,8 +273,11 @@ impl ProgressTracker {
             }
         }
         if old_matches > 0 {
-            let extra = format!("\nnew_matches: {new_matches}\npreviously_seen_matches: {old_matches}");
-            response.content.push(crate::tool_calls::TextBlock { text: extra });
+            let extra =
+                format!("\nnew_matches: {new_matches}\npreviously_seen_matches: {old_matches}");
+            response
+                .content
+                .push(crate::tool_calls::TextBlock { text: extra });
         }
     }
 }
@@ -272,6 +298,27 @@ fn is_gate_or_nudge(body: &str) -> bool {
         || body.contains("Search already located")
         || body.contains("Do not Shell cat")
         || body.contains("Do not call Search")
+        || body.contains("Already Grep'd")
+        || body.contains("similar pattern this turn")
+}
+
+fn hop_is_inspect(calls: &[ToolCall]) -> bool {
+    !calls.is_empty()
+        && calls.iter().all(|c| {
+            !matches!(
+                dispatch_name(&c.name),
+                "write"
+                    | "edit"
+                    | "delete"
+                    | "editnotebook"
+                    | "generateimage"
+                    | "ask"
+                    | "switchmode"
+                    | "task"
+                    | "computeruse"
+                    | "calldynamictool"
+            )
+        })
 }
 
 fn already_observed_text(hop: u32) -> String {
@@ -305,7 +352,8 @@ fn tool_key(ws: &Workspace, call: &ToolCall) -> String {
             let pat = crate::tools::arg_str(&call.arguments, "glob_pattern")
                 .or_else(|| crate::tools::arg_str(&call.arguments, "pattern"))
                 .unwrap_or_default();
-            let dir = crate::tools::arg_str(&call.arguments, "target_directory").unwrap_or_default();
+            let dir =
+                crate::tools::arg_str(&call.arguments, "target_directory").unwrap_or_default();
             format!("glob:{dir}:{pat}")
         }
         "grep" => {
