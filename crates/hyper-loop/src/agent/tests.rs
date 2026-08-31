@@ -1,5 +1,5 @@
 use std::collections::VecDeque;
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 
 use super::dispatch::{
     bash_coordinator_timeout_secs, canon_ws_path, fold_search_dump, glob_covered_by_search_paths,
@@ -14,6 +14,9 @@ use super::dispatch::{
 use super::notes::{
     forbids_glob, forbids_grep, forbids_tools, wants_auto_locate, wants_numeric_check,
     wants_web_check,
+};
+use super::progress::{
+    FORCED_SYNTHESIS_NOTE, STOP_NO_PROGRESS_EMPTY, STOP_NO_PROGRESS_SYNTHESIZED,
 };
 use super::turn::{
     NO_TOOL_THINK_FLOOR, PARSE_REPAIR_NOTE, PHYSICS_WRAP_NOTE, THINK_DIVERGENCE_NOTE,
@@ -59,6 +62,22 @@ impl Completer for Scripted {
                 preserve_thinking: None,
             },
         ))
+    }
+}
+
+struct ToolsWatch {
+    inner: Scripted,
+    none_at: Arc<Mutex<Vec<bool>>>,
+}
+
+impl Completer for ToolsWatch {
+    async fn complete(
+        &self,
+        messages: &[ChatMessage],
+        tools: Option<&[Value]>,
+    ) -> Result<ModelTurn> {
+        self.none_at.lock().expect("none").push(tools.is_none());
+        self.inner.complete(messages, tools).await
     }
 }
 
@@ -1917,6 +1936,59 @@ async fn grep_not_capped_when_search_is_off() {
     assert!(
         bodies[4].contains("epsilon_unique_symbol") || bodies[4].contains("src/lib.rs"),
         "fifth Grep must run: {}",
+        bodies[4]
+    );
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+#[tokio::test]
+async fn grep_file_scoped_not_capped_when_search_is_on() {
+    let dir = std::env::temp_dir().join(format!(
+        "hyper-grep-filescoped-{}",
+        uuid::Uuid::new_v4().simple()
+    ));
+    std::fs::create_dir_all(dir.join("src")).unwrap();
+    std::fs::write(
+        dir.join("src/lib.rs"),
+        "fn alpha() {}\nfn beta() {}\nfn gamma() {}\nfn delta() {}\nfn epsilon_unique_symbol() {}\n",
+    )
+    .unwrap();
+    let scripted = Scripted {
+        turns: Mutex::new(VecDeque::from([
+            turn_tools(vec![
+                ("g1", "grep", json!({"pattern": "alpha"})),
+                ("g2", "grep", json!({"pattern": "beta"})),
+                ("g3", "grep", json!({"pattern": "gamma"})),
+                ("g4", "grep", json!({"pattern": "delta"})),
+                (
+                    "g5",
+                    "grep",
+                    json!({"pattern": "epsilon_unique_symbol", "path": "src/lib.rs"}),
+                ),
+            ]),
+            turn_text("ok"),
+        ])),
+        meter: false,
+    };
+    let mut o = opts_search(&dir);
+    o.max_steps = 8;
+    let mut agent = Agent::new(scripted, o).unwrap();
+    let out = agent.run("find those helpers").await.unwrap();
+    assert_eq!(out.text, "ok");
+    let bodies: Vec<String> = agent
+        .messages
+        .iter()
+        .filter(|m| m.role == "tool")
+        .map(|m| m.content.clone().unwrap_or_default())
+        .collect();
+    assert_eq!(bodies.len(), 5, "{bodies:?}");
+    assert!(
+        bodies.iter().all(|t| !t.contains(GREP_TURN_CAP_MSG)),
+        "file-scoped Grep must not consume the turn cap: {bodies:?}"
+    );
+    assert!(
+        bodies[4].contains("epsilon_unique_symbol") || bodies[4].contains("src/lib.rs"),
+        "fifth file Grep must run: {}",
         bodies[4]
     );
     let _ = std::fs::remove_dir_all(dir);
@@ -6759,6 +6831,220 @@ async fn history_card_injected_from_sibling_session() {
         !hidden[0].contains("[history] applied"),
         "live card must reach the model: {:?}",
         hidden[0]
+    );
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+const SYNTH_ANSWER: &str = "The inspection loop stopped adding evidence. \
+Glob listed the rust files, Grep found ping, and Read already returned a.rs. \
+Remaining uncertainty: exhaustive coverage of every sibling was not requested.";
+
+#[tokio::test]
+async fn no_progress_permuted_hops_force_synthesis() {
+    let dir = std::env::temp_dir().join(format!(
+        "hyper-noprog-synth-{}",
+        uuid::Uuid::new_v4().simple()
+    ));
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(dir.join("a.rs"), "fn ping() {}\n").unwrap();
+    std::fs::write(dir.join("b.rs"), "fn pong() {}\n").unwrap();
+    let none_at = Arc::new(Mutex::new(Vec::new()));
+    let watch = ToolsWatch {
+        inner: Scripted {
+            turns: Mutex::new(VecDeque::from([
+                turn_tool("glob", json!({"glob_pattern": "**/*.rs"})),
+                turn_tool("grep", json!({"pattern": "fn ping"})),
+                turn_tool("read", json!({"path": "a.rs"})),
+                turn_tool("glob", json!({"glob_pattern": "**/*.rs"})),
+                turn_tool("grep", json!({"pattern": "fn ping"})),
+                turn_tool("read", json!({"path": "a.rs"})),
+                turn_text(SYNTH_ANSWER),
+            ])),
+            meter: false,
+        },
+        none_at: none_at.clone(),
+    };
+    let mut o = opts(&dir);
+    o.max_steps = 12;
+    o.peripheral = false;
+    let mut agent = Agent::new(watch, o).unwrap();
+    let out = agent.run("look around then answer").await.unwrap();
+    assert_eq!(out.text, SYNTH_ANSWER);
+    assert_eq!(
+        out.stop_reason.as_deref(),
+        Some(STOP_NO_PROGRESS_SYNTHESIZED),
+        "{:?}",
+        out.stop_reason
+    );
+    let none = none_at.lock().expect("none").clone();
+    assert!(
+        none.last().copied() == Some(true),
+        "synthesis hop must omit tools: {none:?}"
+    );
+    let hidden: Vec<_> = agent
+        .messages
+        .iter()
+        .filter(|m| m.role == "user")
+        .filter_map(|m| m.content.as_deref())
+        .filter(|c| crate::template::is_hidden_user_text(c))
+        .collect();
+    assert!(
+        hidden.iter().any(|c| c.contains(FORCED_SYNTHESIS_NOTE)),
+        "forced synthesis note missing: {hidden:?}"
+    );
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+#[tokio::test]
+async fn natural_text_final_is_still_end_turn() {
+    let dir =
+        std::env::temp_dir().join(format!("hyper-end-turn-{}", uuid::Uuid::new_v4().simple()));
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(dir.join("a.rs"), "fn ping() {}\n").unwrap();
+    let scripted = Scripted {
+        turns: Mutex::new(VecDeque::from([
+            turn_tool("read", json!({"path": "a.rs"})),
+            turn_text(SYNTH_ANSWER),
+        ])),
+        meter: false,
+    };
+    let mut o = opts(&dir);
+    o.max_steps = 6;
+    o.peripheral = false;
+    let mut agent = Agent::new(scripted, o).unwrap();
+    let out = agent.run("read a.rs and answer").await.unwrap();
+    assert_eq!(out.text, SYNTH_ANSWER);
+    assert_eq!(out.stop_reason, None, "{:?}", out.stop_reason);
+    let hidden: Vec<_> = agent
+        .messages
+        .iter()
+        .filter(|m| m.role == "user")
+        .filter_map(|m| m.content.as_deref())
+        .filter(|c| crate::template::is_hidden_user_text(c))
+        .collect();
+    assert!(
+        hidden.iter().all(|c| !c.contains(FORCED_SYNTHESIS_NOTE)),
+        "natural final must not inject synthesis: {hidden:?}"
+    );
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+#[tokio::test]
+async fn write_between_reads_is_not_low_progress() {
+    let dir =
+        std::env::temp_dir().join(format!("hyper-write-prog-{}", uuid::Uuid::new_v4().simple()));
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(dir.join("a.rs"), "fn ping() {}\n").unwrap();
+    let scripted = Scripted {
+        turns: Mutex::new(VecDeque::from([
+            turn_tool("read", json!({"path": "a.rs"})),
+            turn_tool(
+                "write",
+                json!({"path": "a.rs", "contents": "fn ping() { 1 }\n"}),
+            ),
+            turn_tool("read", json!({"path": "a.rs"})),
+            turn_text(SYNTH_ANSWER),
+        ])),
+        meter: false,
+    };
+    let mut o = opts(&dir);
+    o.max_steps = 8;
+    o.peripheral = false;
+    let mut agent = Agent::new(scripted, o).unwrap();
+    let out = agent.run("edit a.rs").await.unwrap();
+    assert_eq!(out.text, SYNTH_ANSWER);
+    assert_eq!(out.stop_reason, None, "{:?}", out.stop_reason);
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+#[tokio::test]
+async fn synthesis_empty_records_no_progress_empty() {
+    let dir = std::env::temp_dir().join(format!(
+        "hyper-noprog-empty-{}",
+        uuid::Uuid::new_v4().simple()
+    ));
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(dir.join("a.rs"), "fn ping() {}\n").unwrap();
+    std::fs::write(dir.join("b.rs"), "fn pong() {}\n").unwrap();
+    let scripted = Scripted {
+        turns: Mutex::new(VecDeque::from([
+            turn_tool("glob", json!({"glob_pattern": "**/*.rs"})),
+            turn_tool("grep", json!({"pattern": "fn ping"})),
+            turn_tool("read", json!({"path": "a.rs"})),
+            turn_tool("glob", json!({"glob_pattern": "**/*.rs"})),
+            turn_tool("grep", json!({"pattern": "fn ping"})),
+            turn_tool("read", json!({"path": "a.rs"})),
+            turn_text(""),
+        ])),
+        meter: false,
+    };
+    let mut o = opts(&dir);
+    o.max_steps = 12;
+    o.peripheral = false;
+    let mut agent = Agent::new(scripted, o).unwrap();
+    let out = agent.run("look around then answer").await.unwrap();
+    assert_eq!(
+        out.stop_reason.as_deref(),
+        Some(STOP_NO_PROGRESS_EMPTY),
+        "{:?}",
+        out.stop_reason
+    );
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+#[tokio::test]
+async fn synthesis_leaked_tools_recover_once() {
+    let dir = std::env::temp_dir().join(format!(
+        "hyper-noprog-leak-{}",
+        uuid::Uuid::new_v4().simple()
+    ));
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(dir.join("a.rs"), "fn ping() {}\n").unwrap();
+    std::fs::write(dir.join("b.rs"), "fn pong() {}\n").unwrap();
+    let none_at = Arc::new(Mutex::new(Vec::new()));
+    let watch = ToolsWatch {
+        inner: Scripted {
+            turns: Mutex::new(VecDeque::from([
+                turn_tool("glob", json!({"glob_pattern": "**/*.rs"})),
+                turn_tool("grep", json!({"pattern": "fn ping"})),
+                turn_tool("read", json!({"path": "a.rs"})),
+                turn_tool("glob", json!({"glob_pattern": "**/*.rs"})),
+                turn_tool("grep", json!({"pattern": "fn ping"})),
+                turn_tool("read", json!({"path": "a.rs"})),
+                turn_tool("read", json!({"path": "b.rs"})),
+                turn_text(SYNTH_ANSWER),
+            ])),
+            meter: false,
+        },
+        none_at: none_at.clone(),
+    };
+    let mut o = opts(&dir);
+    o.max_steps = 14;
+    o.peripheral = false;
+    let mut agent = Agent::new(watch, o).unwrap();
+    let out = agent.run("look around then answer").await.unwrap();
+    assert_eq!(out.text, SYNTH_ANSWER);
+    assert_eq!(
+        out.stop_reason.as_deref(),
+        Some(STOP_NO_PROGRESS_SYNTHESIZED),
+        "{:?}",
+        out.stop_reason
+    );
+    let none = none_at.lock().expect("none").clone();
+    let none_hops = none.iter().filter(|n| **n).count();
+    assert!(
+        none_hops >= 2,
+        "leak recovery must keep tools off: {none:?}"
+    );
+    let bodies: Vec<String> = agent
+        .messages
+        .iter()
+        .filter(|m| m.role == "tool")
+        .map(|m| m.content.clone().unwrap_or_default())
+        .collect();
+    assert!(
+        bodies.iter().all(|t| !t.contains("fn pong")),
+        "leaked Read on synthesis hop must not execute: {bodies:?}"
     );
     let _ = std::fs::remove_dir_all(dir);
 }

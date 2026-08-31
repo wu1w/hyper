@@ -4,8 +4,9 @@
 
 ## Unreleased
 
-- Glob / Shell 只拦工作区根上的无过滤 `**/*`，`**/*.rs` 这类带扩展名的会真扫（仍跳过 vendor，满 200 条截断）
-- Grep 回合上限只在 Search 挂上时生效；默认冻结 17 里 Grep 是定位工具，不再第 5 次起全是 cap
+- Glob / Shell 只拦工作区根上的无过滤 `**/*`，`**/*.rs` 这类带扩展名的会真扫（仍跳过 vendor / 嵌套 `release` / `out` / `unpacked`，满 200 条截断）；`target_directory` 指到文件时直接报错，不再假装「没有匹配」
+- Grep 默认不扫 electron `release`、tsc `out` 等打包目录（含嵌套路径；显式 `path` 进该目录仍可搜）；回合上限只在 Search 挂上时对目录级 Grep 生效，单文件 Grep 不占名额；cap 文案不再提未挂载的 Search
+- 连续几个 hop 不再产生新路径 / 新证据时，下一跳收起工具，让模型基于已有证据作答（`no_progress_synthesized`），而不是空正文结束
 - `view` 未挂进 tools[] 时幻觉调用返回 unknown；Read 图片/音视频会直接加载，不再指向未挂载的 view
 - ReadLints：cargo/tsc 超时或没跑 checker 不再报「没有编译/检查错误」；tsc 从文件向上找最近的 tsconfig.json（例如 `web/console`）
 - Write schema 要求 `contents`；EditNotebook schema 要求 `target_notebook`

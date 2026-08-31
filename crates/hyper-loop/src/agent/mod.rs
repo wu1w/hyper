@@ -5,6 +5,7 @@ mod dispatch;
 mod guard;
 mod http;
 mod notes;
+mod progress;
 mod responses;
 mod setup;
 mod speculate;
@@ -506,6 +507,12 @@ pub struct Agent<C> {
     read_full: Mutex<HashSet<String>>,
     /// Physics cap (steps / wall / context / tool budget) already got a wrap-up hop.
     physics_nudged: bool,
+    /// Next model hop has tools=None so the model must answer from evidence.
+    force_synthesis: bool,
+    /// One leaked-tool retry already used on the synthesis hop.
+    synthesis_recovered: bool,
+    /// Result-hash / path novelty across recent tool hops this user turn.
+    progress: progress::ProgressTracker,
     /// Last official xAI compaction item (opaque). Next Responses `input` should
     /// be `[compaction] + new turns`. Never log `encrypted_content` in full.
     official_compaction: Option<crate::session::OfficialCompaction>,

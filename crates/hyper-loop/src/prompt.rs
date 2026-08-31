@@ -21,10 +21,12 @@ If they already gave the path, Write it; do not Glob to confirm. Do not \
 expand scope or add extras they did not ask for.
 
 Lead with the answer, then supporting detail. Define project terms on first \
-use. Complete sentences. Backticks for files, functions, and commands. Bold \
+use. Backticks for files, functions, and commands. Bold \
 only the few words that matter. Match the user's language. Tool hops keep \
 visible text empty; the hop without tools is the answer and must stand \
-alone. Do not restate.
+alone. Do not restate. Use tools only for missing evidence. For audits, \
+inspect a representative sample. Do not repeat a search or read already \
+present.
 
 When citing code, use ```startLine:endLine:filepath with the snippet inside. \
 That is the only citation format.
@@ -182,6 +184,14 @@ pub fn is_stale_prefer_search_builtin(text: &str) -> bool {
         && text.contains("do not Glob to confirm")
 }
 
+/// Previous builtin that never told Grok when tools were enough.
+pub fn is_stale_sample_builtin(text: &str) -> bool {
+    text.contains("You are grok-hyper, an agent in this workspace")
+        && text.contains("do not Glob to confirm")
+        && text.contains("Prefer Grep, Glob, and Read")
+        && !text.contains("representative sample")
+}
+
 pub fn is_stale_builtin(text: &str) -> bool {
     is_stale_office_builtin(text)
         || is_stale_coding_builtin(text)
@@ -195,6 +205,7 @@ pub fn is_stale_builtin(text: &str) -> bool {
         || is_stale_search_once_builtin(text)
         || is_stale_search_span_builtin(text)
         || is_stale_prefer_search_builtin(text)
+        || is_stale_sample_builtin(text)
 }
 
 /// Rewrite home AGENT.md when it is still a previous builtin snapshot.
@@ -249,6 +260,8 @@ mod tests {
         assert!(DEFAULT_AGENT_MD.contains("Tool hops keep visible text empty"));
         assert!(DEFAULT_AGENT_MD.contains("must stand alone"));
         assert!(DEFAULT_AGENT_MD.contains("Do not restate"));
+        assert!(DEFAULT_AGENT_MD.contains("representative sample"));
+        assert!(DEFAULT_AGENT_MD.contains("missing evidence"));
         assert!(!DEFAULT_AGENT_MD.contains("AskQuestion"));
         assert!(!DEFAULT_AGENT_MD.contains("TodoWrite"));
         assert!(!DEFAULT_AGENT_MD.contains("工作区助手"));
@@ -380,6 +393,11 @@ mod tests {
         ));
         assert!(!is_stale_prefer_search_builtin(DEFAULT_AGENT_MD));
         assert!(!DEFAULT_AGENT_MD.contains("Prefer Search"));
+        assert!(is_stale_sample_builtin(
+            "You are grok-hyper, an agent in this workspace. If they already gave the path, Write it; do not Glob to confirm. Prefer Grep, Glob, and Read over Shell cat."
+        ));
+        assert!(!is_stale_sample_builtin(DEFAULT_AGENT_MD));
+        assert!(DEFAULT_AGENT_MD.contains("representative sample"));
         assert!(!is_stale_builtin(DEFAULT_AGENT_MD));
     }
 

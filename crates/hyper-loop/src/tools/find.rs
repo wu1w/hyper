@@ -19,6 +19,9 @@ pub(crate) const SKIP_DIR: &[&str] = &[
     "node_modules",
     "dist",
     "build",
+    "release",
+    "out",
+    "unpacked",
     "third_party",
     "__pycache__",
     ".venv",
@@ -78,6 +81,19 @@ pub fn glob_files(ws: &Workspace, call: &ToolCall, limits: ToolLimits) -> ToolRe
         Ok(p) => p,
         Err(e) => return ToolResponse::text(&call.id, e, ToolState::Error),
     };
+    if root.is_file() {
+        let shown = root
+            .strip_prefix(ws.root())
+            .map(|p| p.to_string_lossy().replace('\\', "/"))
+            .unwrap_or_else(|_| root.display().to_string());
+        return ToolResponse::text(
+            &call.id,
+            format!(
+                "Error: `target_directory` is a file ({shown}). Glob walks a directory. Read that path, or Glob its parent."
+            ),
+            ToolState::Error,
+        );
+    }
     let matcher = match GlobMatcher::new(&pattern) {
         Ok(m) => m,
         Err(e) => {
@@ -236,10 +252,7 @@ fn grep_ripgrep(ws: &Workspace, root: &Path, pattern: &str, args: &Value) -> Opt
         cmd.arg("--no-ignore-vcs");
         cmd.arg("--no-ignore-parent");
     }
-    if !path_under_dir(ws, root, "third_party") {
-        cmd.arg("--glob");
-        cmd.arg("!third_party/**");
-    }
+    apply_rg_skip_globs(&mut cmd, ws, root);
     match grep_output_mode(args) {
         "files_with_matches" => {
             cmd.arg("-l");
@@ -654,19 +667,28 @@ fn rg_search_path() -> OsString {
     std::env::join_paths(parts).unwrap_or_else(|_| std::env::var_os("PATH").unwrap_or_default())
 }
 
+fn apply_rg_skip_globs(cmd: &mut Command, ws: &Workspace, root: &Path) {
+    for dir in SKIP_DIR {
+        if path_under_dir(ws, root, dir) {
+            continue;
+        }
+        // `!release/**` only matches a root-level dir. Nested electron
+        // bundles live at `web/desktop/release/` and need `**/`.
+        cmd.arg("--glob");
+        cmd.arg(format!("!**/{dir}/**"));
+    }
+}
+
 fn path_under_hyper_overlay(ws: &Workspace, root: &Path) -> bool {
     path_under_dir(ws, root, ".grok-hyper")
 }
 
 fn path_under_dir(ws: &Workspace, root: &Path, name: &str) -> bool {
-    let Ok(rel) = root.strip_prefix(ws.root()) else {
-        return root
-            .file_name()
-            .and_then(|n| n.to_str())
-            .is_some_and(|n| n == name);
+    let rel = match root.strip_prefix(ws.root()) {
+        Ok(r) => r.to_path_buf(),
+        Err(_) => root.to_path_buf(),
     };
-    let s = rel.to_string_lossy().replace('\\', "/");
-    s == name || s.starts_with(&format!("{name}/"))
+    rel.components().any(|c| c.as_os_str() == name)
 }
 
 fn skip_walk_dir(name: &str, parent_rel: &str) -> bool {
@@ -907,6 +929,102 @@ mod tests {
             !t.contains("third_party"),
             "rg must not dump vendored clones: {t}"
         );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn glob_skips_electron_release_and_out() {
+        let (ws, dir) = scratch();
+        std::fs::create_dir_all(dir.join("crates")).unwrap();
+        std::fs::create_dir_all(dir.join("web/desktop/release/mac")).unwrap();
+        std::fs::create_dir_all(dir.join("plugins/vscode-hyper/out")).unwrap();
+        std::fs::write(dir.join("crates/lib.rs"), "fn x() {}\n").unwrap();
+        std::fs::write(
+            dir.join("web/desktop/release/mac/bundle.js"),
+            "function tools() {}\n",
+        )
+        .unwrap();
+        std::fs::write(dir.join("plugins/vscode-hyper/out/ext.js"), "export {}\n").unwrap();
+        let t = glob_files(
+            &ws,
+            &call(json!({"glob_pattern": "**/*.{rs,js}"})),
+            ToolLimits::default(),
+        )
+        .joined_text();
+        assert!(t.contains("crates/lib.rs"), "{t}");
+        assert!(
+            !t.contains("release"),
+            "electron release must not fill the glob cap: {t}"
+        );
+        assert!(!t.contains("/out/"), "tsc out must not fill glob: {t}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn grep_skips_electron_release() {
+        let (ws, dir) = scratch();
+        std::fs::create_dir_all(dir.join("crates")).unwrap();
+        std::fs::create_dir_all(dir.join("web/desktop/release")).unwrap();
+        std::fs::write(dir.join("crates/lib.rs"), "fn release_mark_omega() {}\n").unwrap();
+        std::fs::write(
+            dir.join("web/desktop/release/bundle.js"),
+            "function release_mark_omega() {}\n",
+        )
+        .unwrap();
+        let t = grep_files(
+            &ws,
+            &ToolCall {
+                id: "t1".into(),
+                name: "Grep".into(),
+                arguments: json!({"pattern": "release_mark_omega"}),
+            },
+            ToolLimits::default(),
+            None,
+        )
+        .joined_text();
+        assert!(t.contains("crates/lib.rs"), "{t}");
+        assert!(
+            !t.contains("bundle.js") && !t.contains("web/desktop/release"),
+            "rg must not dump electron release: {t}"
+        );
+        let explicit = grep_files(
+            &ws,
+            &ToolCall {
+                id: "t2".into(),
+                name: "Grep".into(),
+                arguments: json!({
+                    "pattern": "release_mark_omega",
+                    "path": "web/desktop/release",
+                }),
+            },
+            ToolLimits::default(),
+            None,
+        )
+        .joined_text();
+        assert!(
+            explicit.contains("bundle.js"),
+            "explicit path into release must still search: {explicit}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn glob_file_target_directory_errors() {
+        let (ws, dir) = scratch();
+        std::fs::create_dir_all(dir.join("src")).unwrap();
+        std::fs::write(dir.join("src/lib.rs"), "fn x() {}\n").unwrap();
+        let t = glob_files(
+            &ws,
+            &call(json!({
+                "glob_pattern": "**/*.rs",
+                "target_directory": "src/lib.rs",
+            })),
+            ToolLimits::default(),
+        )
+        .joined_text();
+        assert!(t.contains("is a file"), "{t}");
+        assert!(t.contains("src/lib.rs"), "{t}");
+        assert!(!t.starts_with("No files matching"), "{t}");
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

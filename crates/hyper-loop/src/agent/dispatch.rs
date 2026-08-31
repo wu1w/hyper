@@ -41,7 +41,7 @@ pub(crate) fn claim_search_slot(calls: &std::sync::atomic::AtomicU32) -> bool {
 
 pub(crate) const GREP_TURN_CAP: u32 = 4;
 pub(crate) const GREP_TURN_CAP_MSG: &str =
-    "Grep budget for this turn is used. Search or Read instead of more Grep.";
+    "Grep budget for this turn is used. Read the files already located instead of more Grep.";
 pub(crate) const GREP_FORBIDDEN_MSG: &str = "The user forbade Grep this turn. Read instead.";
 const STEER_SKIPPED_MSG: &str =
     "Skipped before launch because the user sent a steering update. Continue from the steering instruction after the paired tool results.";
@@ -408,7 +408,7 @@ impl<C: Completer> Agent<C> {
         }
     }
 
-    pub(crate) async fn execute_tools(&mut self, calls: Vec<ToolCall>) {
+    pub(crate) async fn execute_tools(&mut self, calls: Vec<ToolCall>) -> bool {
         if self.code_index.is_none() && calls.iter().any(needs_search_index) {
             self.start_code_index();
             self.settle_code_index().await;
@@ -511,14 +511,22 @@ impl<C: Completer> Agent<C> {
         } else {
             verify::run_diagnostics_async(self.workspace.root(), &edited, &self.cancel).await
         };
-        if let Some(diag) = diag {
+        if let Some(diag) = diag.as_ref() {
             if let Some(id) = last_edit_id.as_deref() {
                 if let Some(i) = calls.iter().position(|c| c.id == id) {
-                    responses[i].content.push(TextBlock { text: diag });
+                    responses[i].content.push(TextBlock { text: diag.clone() });
                 }
             }
             self.note("[diagnostics]");
         }
+        self.progress.fold_and_observe(
+            &self.workspace,
+            &calls,
+            &mut responses,
+            test_red,
+            saw_test_output,
+            diag.as_deref(),
+        );
         for (call, response) in calls.iter().zip(responses) {
             let state = response.state.clone();
             let summary = response.joined_text();
@@ -556,6 +564,7 @@ impl<C: Completer> Agent<C> {
         if thrash && self.effort.note_thrash() {
             self.sync_effort(PolicyReason::Upgrade);
         }
+        self.progress.should_synthesize()
     }
 
     pub(crate) fn apply_guard_note(&mut self, note: guard::GuardNote) {
@@ -834,10 +843,23 @@ impl<C: Completer> Agent<C> {
                 return Some(grep_after_search_reply(&self.messages));
             }
         }
-        if has_tool(&self.tools, "Search") && !claim_grep_slot(&self.grep_calls) {
+        if has_tool(&self.tools, "Search")
+            && !self.grep_is_file_scoped(call)
+            && !claim_grep_slot(&self.grep_calls)
+        {
             return Some(search_nudge_reply(GREP_TURN_CAP_MSG, &self.messages));
         }
         None
+    }
+
+    fn grep_is_file_scoped(&self, call: &ToolCall) -> bool {
+        let Some(raw) = crate::tools::arg_path(&call.arguments) else {
+            return false;
+        };
+        self.workspace
+            .resolve(&raw)
+            .map(|p| p.is_file())
+            .unwrap_or(false)
     }
 
     fn read_gate(&self, call: &ToolCall) -> Option<String> {

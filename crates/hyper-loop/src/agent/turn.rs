@@ -55,6 +55,9 @@ impl<C: Completer> Agent<C> {
         // inherit iteration/timeout/doom from the previous prompt.
         self.handler.reset_turn(&self.session_id);
         self.physics_nudged = false;
+        self.force_synthesis = false;
+        self.synthesis_recovered = false;
+        self.progress.reset();
         self.last_spoken = None;
         self.tool_evidence.clear();
         self.read_paths.clear();
@@ -111,7 +114,8 @@ impl<C: Completer> Agent<C> {
             first_hop = false;
 
             let tools_owned = self.tools.clone();
-            let tools = if self.physics_nudged || tools_owned.is_empty() {
+            let tools = if self.force_synthesis || self.physics_nudged || tools_owned.is_empty()
+            {
                 None
             } else {
                 Some(tools_owned.as_slice())
@@ -195,7 +199,7 @@ impl<C: Completer> Agent<C> {
                 }
             }
 
-            if turn.tool_calls.is_empty() {
+            if turn.tool_calls.is_empty() && !self.force_synthesis {
                 if let Some(calls) = lift_leaked_tool_json(&turn.content) {
                     turn.tool_calls = calls;
                     turn.content.clear();
@@ -225,6 +229,38 @@ impl<C: Completer> Agent<C> {
                 continue;
             }
 
+            if self.force_synthesis {
+                let leaked_json = lift_leaked_tool_json(&turn.content);
+                if leaked_json.is_some() {
+                    turn.content.clear();
+                }
+                let leaked = !turn.tool_calls.is_empty() || leaked_json.is_some();
+                turn.tool_calls.clear();
+                turn.raw_tool_calls = None;
+                if leaked && !self.synthesis_recovered {
+                    self.synthesis_recovered = true;
+                    self.push_assistant(&turn);
+                    self.push_hidden_user(super::progress::FORCED_SYNTHESIS_NOTE);
+                    self.drop_speculate();
+                    continue;
+                }
+                self.push_assistant(&turn);
+                self.drop_speculate();
+                if crate::stutter::is_substantial_reply(&turn.content) {
+                    self.last_spoken = Some(turn.content.clone());
+                    return self.finish(
+                        turn.content,
+                        Some(super::progress::STOP_NO_PROGRESS_SYNTHESIZED.into()),
+                        steps,
+                    );
+                }
+                return self.finish(
+                    self.last_spoken.clone().unwrap_or_default(),
+                    Some(super::progress::STOP_NO_PROGRESS_EMPTY.into()),
+                    steps,
+                );
+            }
+
             self.emit_tools_scheduled(&turn.tool_calls);
             self.push_assistant(&turn);
             if turn.tool_calls.is_empty() && crate::stutter::is_substantial_reply(&turn.content) {
@@ -245,7 +281,11 @@ impl<C: Completer> Agent<C> {
                 }
                 let calls = std::mem::take(&mut turn.tool_calls);
                 self.settle_code_index().await;
-                self.execute_tools(calls).await;
+                let should_synth = self.execute_tools(calls).await;
+                if should_synth && !self.force_synthesis {
+                    self.force_synthesis = true;
+                    self.push_hidden_user(super::progress::FORCED_SYNTHESIS_NOTE);
+                }
                 self.drop_speculate();
                 self.flush_steer();
                 if self.cancel.is_cancelled() {
@@ -648,7 +688,9 @@ impl<C: Completer> Agent<C> {
         if self.print {
             self.stdio.close_think();
         }
-        let reason = stop_reason.clone().unwrap_or_else(|| "stop".into());
+        let reason = stop_reason
+            .clone()
+            .unwrap_or_else(|| "end_turn".into());
         self.log_event(SessionEvent::stop(reason));
         let aborted = stop_reason.as_deref() == Some("aborted");
         let run_phase = if aborted {
