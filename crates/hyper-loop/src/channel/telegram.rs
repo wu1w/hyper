@@ -134,10 +134,10 @@ pub async fn send(
         if matches!(part, ContentPart::Text { .. }) {
             continue;
         }
-        if let Err(e) = send_media(&client, &token, &chat_id, part).await {
+        if let Err(e) = send_media(&client, &token, env, &chat_id, part).await {
             eprintln!("hyper telegram media: {e}");
             let fallback = part.fallback_line().unwrap_or_else(|| "[文件]".into());
-            let _ = send_message(&client, &token, &chat_id, &fallback).await;
+            let _ = send_message(&client, &token, env, &chat_id, &fallback).await;
         }
     }
     Ok(())
@@ -148,9 +148,9 @@ pub(crate) async fn send_choices(
     env: &NativePayload,
     text: &str,
     buttons: &[(String, String)],
-) -> Result<()> {
+) -> Result<Option<String>> {
     let Some(ep) = ep else {
-        return Ok(());
+        return Ok(None);
     };
     let Some(token) = token(ep) else {
         return Err(Error::msg("telegram send: missing bot token"));
@@ -160,9 +160,45 @@ pub(crate) async fn send_choices(
         return Err(Error::msg("telegram send: missing chat_id"));
     }
     let client = crate::llm_http::env_aware_client(30, API)?;
-    send_message_markup(&client, &token, &chat_id, text, buttons)
-        .await
-        .map(|_| ())
+    let id = send_message_markup(&client, &token, env, &chat_id, text, buttons).await?;
+    Ok(id.map(|n| n.to_string()))
+}
+
+pub(crate) async fn settle_choices(
+    ep: Option<&ChannelEndpoint>,
+    env: &NativePayload,
+    message_id: &str,
+    summary: &str,
+) -> Result<()> {
+    let Some(ep) = ep else {
+        return Ok(());
+    };
+    let Some(token) = token(ep) else {
+        return Ok(());
+    };
+    let chat_id = env.chat_id();
+    let Ok(mid) = message_id.parse::<i64>() else {
+        return Ok(());
+    };
+    if chat_id.is_empty() {
+        return Ok(());
+    }
+    let Ok(client) = crate::llm_http::env_aware_client(15, API) else {
+        return Ok(());
+    };
+    let url = edit_message_url(&token);
+    let body = json!({
+        "chat_id": chat_id,
+        "message_id": mid,
+        "text": clip(summary, 3900),
+        "reply_markup": { "inline_keyboard": [] },
+    });
+    let resp = client.post(&url).json(&body).send().await?;
+    if !resp.status().is_success() {
+        let t = resp.text().await.unwrap_or_default();
+        return Err(Error::msg(format!("telegram settle choice: {t}")));
+    }
+    Ok(())
 }
 
 async fn answer_callback_query(
@@ -238,7 +274,7 @@ async fn promote_or_send(
     // Long answers split into ordered bubbles instead of being clipped.
     take_bubble(&env.progress_bubble_key());
     for chunk in super::chunk::chunk_text(text, TG_TEXT_BUBBLE) {
-        send_message(client, token, chat_id, &chunk).await?;
+        send_message(client, token, env, chat_id, &chunk).await?;
     }
     Ok(())
 }
@@ -259,7 +295,7 @@ async fn upsert_progress(
             return Ok(());
         }
     }
-    if let Some(mid) = send_message(client, token, chat_id, text).await? {
+    if let Some(mid) = send_message(client, token, env, chat_id, text).await? {
         store_bubble(&key, mid);
     }
     Ok(())
@@ -327,14 +363,18 @@ async fn edit_message(
 async fn send_message(
     client: &reqwest::Client,
     token: &str,
+    env: &NativePayload,
     chat_id: &str,
     text: &str,
 ) -> Result<Option<i64>> {
     let url = format!("{API}/bot{token}/sendMessage");
-    let body = json!({
-        "chat_id": chat_id,
-        "text": clip(text, 3900),
-    });
+    let body = with_thread(
+        json!({
+            "chat_id": chat_id,
+            "text": clip(text, 3900),
+        }),
+        env,
+    );
     let resp = client.post(&url).json(&body).send().await?;
     let status = resp.status();
     let t = resp.text().await.unwrap_or_default();
@@ -361,6 +401,7 @@ async fn send_message(
 async fn send_message_markup(
     client: &reqwest::Client,
     token: &str,
+    env: &NativePayload,
     chat_id: &str,
     text: &str,
     buttons: &[(String, String)],
@@ -375,11 +416,14 @@ async fn send_message_markup(
             })]
         })
         .collect();
-    let body = json!({
-        "chat_id": chat_id,
-        "text": clip(text, 3900),
-        "reply_markup": { "inline_keyboard": keyboard },
-    });
+    let body = with_thread(
+        json!({
+            "chat_id": chat_id,
+            "text": clip(text, 3900),
+            "reply_markup": { "inline_keyboard": keyboard },
+        }),
+        env,
+    );
     let resp = client.post(&url).json(&body).send().await?;
     let status = resp.status();
     let t = resp.text().await.unwrap_or_default();
@@ -400,6 +444,7 @@ fn clip_callback(id: &str) -> String {
 async fn send_media(
     client: &reqwest::Client,
     token: &str,
+    env: &NativePayload,
     chat_id: &str,
     part: &ContentPart,
 ) -> Result<()> {
@@ -412,9 +457,12 @@ async fn send_media(
     };
     let url = format!("{API}/bot{token}/{method}");
     let file = super::xfer::bytes_part(&blob);
-    let form = reqwest::multipart::Form::new()
+    let mut form = reqwest::multipart::Form::new()
         .text("chat_id", chat_id.to_string())
         .part(field, file);
+    if let Some(tid) = telegram_thread_id(env) {
+        form = form.text("message_thread_id", tid.to_string());
+    }
     let resp = client.post(&url).multipart(form).send().await?;
     if !resp.status().is_success() {
         return Err(Error::msg(format!(
@@ -514,6 +562,7 @@ async fn native_from_message(
         "is_reply_to_bot".into(),
         json!(msg["reply_to_message"]["from"]["is_bot"].as_bool() == Some(true)),
     );
+    stamp_telegram_thread(&mut env, msg);
     Ok(Some(env))
 }
 
@@ -561,6 +610,7 @@ fn native_from_callback(ep: &ChannelEndpoint, cq: &Value) -> Option<NativePayloa
         env.meta.insert("callback_query_id".into(), json!(id));
     }
     env.mark_choice_click();
+    stamp_telegram_thread(&mut env, msg);
     Some(env)
 }
 
@@ -605,6 +655,25 @@ fn inbound_message_id(msg: &Value) -> Option<String> {
         Some(Value::String(s)) if !s.is_empty() => Some(s.clone()),
         _ => None,
     }
+}
+
+fn stamp_telegram_thread(env: &mut NativePayload, msg: &Value) {
+    match msg.get("message_thread_id") {
+        Some(Value::Number(n)) => env.stamp_thread(n.to_string()),
+        Some(Value::String(s)) => env.stamp_thread(s),
+        _ => {}
+    }
+}
+
+fn telegram_thread_id(env: &NativePayload) -> Option<i64> {
+    env.thread_id()?.parse().ok()
+}
+
+fn with_thread(mut body: Value, env: &NativePayload) -> Value {
+    if let Some(tid) = telegram_thread_id(env) {
+        body["message_thread_id"] = json!(tid);
+    }
+    body
 }
 
 fn is_mentioned(text: &str, bot_username: &str) -> bool {
@@ -780,5 +849,18 @@ mod tests {
         assert_eq!(env.meta["is_mentioned"], json!(true));
         assert_eq!(env.meta["chat_id"], json!("42"));
         assert_eq!(clip_callback(&"a".repeat(80)).chars().count(), 64);
+        let topic = json!({
+            "id": "cb2",
+            "from": {"id": 7, "first_name": "A"},
+            "message": {
+                "message_id": 3,
+                "message_thread_id": 99,
+                "chat": {"id": -100, "type": "supergroup"}
+            },
+            "data": "1"
+        });
+        let env = native_from_callback(&ep, &topic).unwrap();
+        assert_eq!(env.thread_id().as_deref(), Some("99"));
+        assert!(env.is_group());
     }
 }

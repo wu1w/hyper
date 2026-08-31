@@ -165,6 +165,30 @@ pub fn set_title(dir: impl AsRef<Path>, id: &str, title: &str) -> Result<()> {
     Ok(())
 }
 
+/// Write a title even if the jsonl does not exist yet (`/new Title` binds
+/// the route before the first agent turn).
+pub fn seed_title(dir: impl AsRef<Path>, id: &str, title: &str) -> Result<()> {
+    let dir = dir.as_ref();
+    let title = title.trim();
+    if id.trim().is_empty() || title.is_empty() {
+        return Err(Error::msg("missing session id or title"));
+    }
+    fs::create_dir_all(dir)?;
+    let mut meta = read_meta(dir, id);
+    meta.title = title.to_string();
+    let path = meta_path(dir, id);
+    fs::write(
+        &path,
+        serde_json::to_string_pretty(&meta).map_err(Error::msg)?,
+    )?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = fs::set_permissions(&path, fs::Permissions::from_mode(0o600));
+    }
+    Ok(())
+}
+
 pub fn delete(dir: impl AsRef<Path>, id: &str) -> Result<()> {
     let dir = dir.as_ref();
     let jsonl = dir.join(format!("{id}.jsonl"));
@@ -422,6 +446,29 @@ mod tests {
         assert_eq!(resolve(&dir, "cache").unwrap().unwrap().id, id);
         delete(&dir, &id).unwrap();
         assert!(list(&dir).unwrap().is_empty());
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn seed_title_before_jsonl() {
+        let dir = tmp();
+        let id = new_session_id();
+        seed_title(&dir, &id, "nightly review").unwrap();
+        assert!(set_title(&dir, &id, "nope").is_err());
+        SessionLog::create_in(
+            &dir,
+            SessionStart::new(
+                &id,
+                "/ws",
+                SessionMode::Agent,
+                "sys",
+                "h",
+                SessionMode::Agent.default_policy(),
+            ),
+        )
+        .unwrap();
+        let listed = list(&dir).unwrap();
+        assert_eq!(listed[0].title, "nightly review");
         let _ = fs::remove_dir_all(dir);
     }
 

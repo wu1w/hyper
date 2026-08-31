@@ -64,6 +64,9 @@ pub enum SlashCmd {
     Busy {
         policy: Option<BusyPolicy>,
     },
+    Background {
+        prompt: Option<String>,
+    },
     Undo,
     Retry,
     Model {
@@ -162,9 +165,6 @@ const REJECT: &[(&str, &str)] = &[
     ("plugins", "no plugin hub"),
     ("wake", "no wake word"),
     ("journey", "no memory graph"),
-    ("background", "no parallel background sessions yet"),
-    ("bg", "no parallel background sessions yet"),
-    ("btw", "no parallel background sessions yet"),
     ("agents", "use the Task tool"),
     ("tasks", "use the Task tool"),
     ("branch", "tool-set forks use /mode, not session branch"),
@@ -294,6 +294,9 @@ pub fn parse_slash(text: &str) -> Option<SlashCmd> {
             }
         }
         "busy" => parse_busy(&rest),
+        "background" | "bg" | "btw" => Some(SlashCmd::Background {
+            prompt: nonempty(clip(&rest, HINT_MAX)),
+        }),
         "model" if rest.eq_ignore_ascii_case("setup") => Some(SlashCmd::Setup),
         "model" => Some(SlashCmd::Model { args: rest }),
         "setup" => rest.is_empty().then_some(SlashCmd::Setup),
@@ -582,6 +585,7 @@ Busy
   /queue <text>          next turn (alias /q)
   /steer <text>          inject after next tool
   /busy interrupt|queue|steer
+  /background [text]     run in background and free this chat (alias /bg /btw)
 
 Thinking (same session, no fork)
   /think [low|medium|high|xhigh|off]
@@ -1306,8 +1310,16 @@ mod tests {
             Some(SlashCmd::Queue { .. })
         ));
         assert!(matches!(
-            parse_slash("/steer focus auth"),
-            Some(SlashCmd::Steer { .. })
+            parse_slash("/background fix tests"),
+            Some(SlashCmd::Background { prompt: Some(p) }) if p == "fix tests"
+        ));
+        assert_eq!(
+            parse_slash("/bg"),
+            Some(SlashCmd::Background { prompt: None })
+        );
+        assert!(matches!(
+            parse_slash("/btw also lint"),
+            Some(SlashCmd::Background { prompt: Some(p) }) if p == "also lint"
         ));
         assert!(matches!(
             parse_slash("/busy queue"),

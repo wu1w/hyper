@@ -105,6 +105,12 @@ impl SidecarSession {
                     self.reply_text(format!("busy={}", p.as_str()))
                 }
             },
+            SlashCmd::Background { prompt } => match prompt.filter(|p| !p.trim().is_empty()) {
+                Some(text) => self.enqueue_prompt(text, false),
+                None => self.reply_text(
+                    "Send `/background <task>` to queue a job. In IM, `/background` detaches the live turn so the next message starts a new session.".into(),
+                ),
+            },
             SlashCmd::Undo => self.undo_last(),
             SlashCmd::Retry => self.retry_last(),
             SlashCmd::Model { args } => self.switch_model(&args),

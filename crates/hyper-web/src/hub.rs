@@ -517,6 +517,15 @@ fn spawn_channel_watch(inner: Arc<Mutex<Inner>>) {
                         .collect();
                     g.channel_gen
                 };
+                let mgr =
+                    match hyper_loop::channel::start_im_manager(cfg.clone(), workspace.clone()) {
+                        Ok(mgr) => mgr,
+                        Err(e) => {
+                            eprintln!("hyper channels: start manager: {e}");
+                            last.clear();
+                            continue;
+                        }
+                    };
                 for ep in cfg
                     .channels
                     .endpoints
@@ -524,29 +533,19 @@ fn spawn_channel_watch(inner: Arc<Mutex<Inner>>) {
                     .filter(|e| endpoint_runnable(e))
                 {
                     let ep = ep.clone();
-                    let cfg = cfg.clone();
-                    let workspace = workspace.clone();
                     let inner_ep = inner.clone();
+                    let mgr = mgr.clone();
                     eprintln!("hyper {}: starting in-process client ({})", ep.kind, ep.id);
                     jobs.push(tokio::spawn(async move {
                         let id = ep.id.clone();
                         let kind = ep.kind.clone();
-                        // Adapter exit / panic / lock fight: backoff and start again.
-                        // Fingerprint change aborts this task; gen guards stale writes.
                         hyper_loop::channel::keep_client_watched(
                             &kind,
                             &id,
                             {
-                                let cfg = cfg.clone();
-                                let workspace = workspace.clone();
                                 let ep = ep.clone();
-                                move || {
-                                    hyper_loop::channel::serve_endpoint(
-                                        cfg.clone(),
-                                        workspace.clone(),
-                                        ep.clone(),
-                                    )
-                                }
+                                let mgr = mgr.clone();
+                                move || hyper_loop::channel::serve_adapter(ep.clone(), mgr.clone())
                             },
                             {
                                 let inner_ep = inner_ep.clone();

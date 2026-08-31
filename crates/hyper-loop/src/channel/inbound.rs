@@ -142,14 +142,15 @@ where
     }
 }
 
-/// Start the live client for one enabled endpoint (returns if the adapter exits).
-pub async fn serve_endpoint(cfg: Config, workspace: PathBuf, ep: ChannelEndpoint) -> Result<()> {
-    let kind = ep.kind.to_ascii_lowercase();
+/// Shared IM gateway: one router + one session worker map for every
+/// in-process adapter. Web mode used to start a manager per endpoint, so
+/// `/resume` of the same JSONL from Feishu and Telegram could drive two
+/// agents at once.
+pub fn start_im_manager(cfg: Config, workspace: PathBuf) -> Result<ChannelManager> {
     let router = SessionRouter::in_home()?;
     let cfg = Arc::new(cfg);
     let cfg_h = cfg.clone();
-    let workspace = workspace.clone();
-    let mgr = ChannelManager::start(
+    Ok(ChannelManager::start(
         cfg.channels.clone(),
         router,
         move |env: NativePayload, cancel, steer| {
@@ -157,7 +158,18 @@ pub async fn serve_endpoint(cfg: Config, workspace: PathBuf, ep: ChannelEndpoint
             let workspace = workspace.clone();
             async move { agent_inbound(&cfg, workspace, env, cancel, steer).await }
         },
-    );
+    ))
+}
+
+/// Start the live client for one enabled endpoint (returns if the adapter exits).
+pub async fn serve_endpoint(cfg: Config, workspace: PathBuf, ep: ChannelEndpoint) -> Result<()> {
+    let mgr = start_im_manager(cfg, workspace)?;
+    serve_adapter(ep, mgr).await
+}
+
+/// Run one adapter against an already-started manager (unified gateway).
+pub async fn serve_adapter(ep: ChannelEndpoint, mgr: ChannelManager) -> Result<()> {
+    let kind = ep.kind.to_ascii_lowercase();
     let replay_ep = ep.clone();
     tokio::spawn(async move {
         if let Err(err) = super::outbound::replay_pending(Some(&replay_ep)).await {
@@ -201,6 +213,10 @@ async fn agent_inbound(
     let mut message = env.to_chat_message();
     if let Some(cmd) = crate::slash::parse_slash_with_periphery(&query, &skills, Some(&mcp)) {
         use crate::slash::SlashCmd;
+        super::interaction::claim_owner(&env.session_id, &env.sender_id);
+        if let Some(denied) = super::interaction::deny_foreign_control(&env, &cmd) {
+            return Ok(super::outbound::reply_text(denied));
+        }
         let reply = match cmd {
             SlashCmd::Help => Some(crate::slash::help_text()),
             SlashCmd::Version => Some(crate::slash::version_text()),
@@ -212,13 +228,31 @@ async fn agent_inbound(
                 Some(im_sessions_text(home.as_deref(), search.as_deref())?)
             }
             SlashCmd::History => Some(im_history_text(home.as_deref(), &env.session_id)?),
-            SlashCmd::New { title } => Some(match title {
-                Some(title) => format!(
-                    "已新建会话 `{}`（标题：{}）。下一条消息会进入新会话。",
-                    env.session_id, title
-                ),
-                None => format!("已新建会话 `{}`。下一条消息会进入新会话。", env.session_id),
-            }),
+            SlashCmd::New { title } => {
+                if let (Some(title), Some(home)) = (title.as_deref(), home.as_deref()) {
+                    match crate::session::catalog::seed_title(
+                        home.join("sessions"),
+                        &env.session_id,
+                        title,
+                    ) {
+                        Ok(()) => Some(format!(
+                            "已新建会话 `{}`（标题：{}）。下一条消息会进入新会话。",
+                            env.session_id, title
+                        )),
+                        Err(e) => Some(format!(
+                            "已新建会话 `{}`。标题未能写入：{e}",
+                            env.session_id
+                        )),
+                    }
+                } else if let Some(title) = title {
+                    Some(format!(
+                        "已新建会话 `{}`。标题「{}」未写入（找不到会话目录）。",
+                        env.session_id, title
+                    ))
+                } else {
+                    Some(format!("已新建会话 `{}`。下一条消息会进入新会话。", env.session_id))
+                }
+            }
             SlashCmd::Resume { query } => Some(
                 if let Some(err) = env
                     .meta
@@ -252,6 +286,15 @@ async fn agent_inbound(
                 message.content = Some(text);
                 None
             }
+            SlashCmd::Background { prompt } => match prompt.filter(|p| !p.trim().is_empty()) {
+                Some(text) => {
+                    message.content = Some(text);
+                    None
+                }
+                None => Some(
+                    "没有正在运行的任务。发送 `/background <任务>` 开始后台任务。".into(),
+                ),
+            },
             SlashCmd::InvokeSkill { name, args } => {
                 message.content = Some(crate::sticky::skill_turn_prompt(&name, &args));
                 None
@@ -314,8 +357,14 @@ async fn agent_inbound(
                 let controls = super::interaction::controls(&env.session_id, default);
                 Some(crate::slash::clarify_text(controls.clarify, controls.plan))
             }
+            SlashCmd::Usage => Some(im_usage_text(home.as_deref(), &env.session_id)?),
+            SlashCmd::Undo => Some(im_undo_text(home.as_deref(), &env.session_id)?),
+            SlashCmd::Compress { hint } => {
+                Some(im_compact_text(home.as_deref(), &env.session_id, hint.as_deref())?)
+            }
+            SlashCmd::Model { args } => Some(im_model_text(cfg, &env, &args)?),
             other => Some(format!(
-                "命令 `{}` 尚未开放到 IM 控制面，请在 Web/CLI 使用。",
+                "命令 `{}` 尚未开放到 IM 控制面，请在 Web/CLI 使用。当前可用：`/model` `/compact` `/undo` `/usage` `/background`。",
                 im_cmd_name(&other)
             )),
         };
@@ -346,9 +395,13 @@ async fn agent_inbound(
         env.channel.clone()
     };
     let default_approvals = im_default_approvals();
+    super::interaction::claim_owner(&env.session_id, &env.sender_id);
     let controls = super::interaction::controls(&env.session_id, default_approvals);
     opts.plan_mode = controls.plan;
     opts.clarify_mode = controls.clarify;
+    if !controls.model.is_empty() {
+        opts.config.server.model = controls.model.clone();
+    }
     let (permit, permit_rx) = crate::permit::PermitHub::pair(controls.approvals);
     let (clarify, clarify_rx) = crate::clarify::ClarifyHub::pair();
     for tool in super::interaction::remembered_tools(&env.session_id) {
@@ -407,7 +460,11 @@ fn im_status_text(cfg: &Config, env: &NativePayload) -> String {
             "agent"
         },
         controls.approvals.as_str(),
-        cfg.server.model
+        if controls.model.is_empty() {
+            cfg.server.model.as_str()
+        } else {
+            controls.model.as_str()
+        }
     )
 }
 
@@ -448,6 +505,73 @@ fn im_history_text(home: Option<&std::path::Path>, session_id: &str) -> Result<S
     Ok(crate::slash::history_text(log.events(), 8_000))
 }
 
+fn im_usage_text(home: Option<&std::path::Path>, session_id: &str) -> Result<String> {
+    let Some(home) = home else {
+        return Ok("无法定位会话目录。".into());
+    };
+    let log = crate::session::SessionLog::open_in(home.join("sessions"), session_id)?;
+    Ok(crate::slash::usage_text(log.events()))
+}
+
+fn im_undo_text(home: Option<&std::path::Path>, session_id: &str) -> Result<String> {
+    let Some(home) = home else {
+        return Ok("无法定位会话目录。".into());
+    };
+    let mut log = crate::session::SessionLog::open_in(home.join("sessions"), session_id)?;
+    let Some((from, until)) = crate::slash::undo_range(log.events()) else {
+        return Ok("没有可撤销的回合。".into());
+    };
+    log.append(crate::session::SessionEvent::undo(from, until))?;
+    Ok(format!("已撤销 seq {from}..{until}。"))
+}
+
+fn im_compact_text(
+    home: Option<&std::path::Path>,
+    session_id: &str,
+    hint: Option<&str>,
+) -> Result<String> {
+    let Some(home) = home else {
+        return Ok("无法定位会话目录。".into());
+    };
+    let mut log = crate::session::SessionLog::open_in(home.join("sessions"), session_id)?;
+    let Some(plan) = crate::session::plan_compact(log.events()) else {
+        return Ok(crate::slash::compact_reply(None));
+    };
+    let plan = match hint.map(str::trim).filter(|h| !h.is_empty()) {
+        Some(h) => plan.with_hint(h),
+        None => plan,
+    };
+    let reply = crate::slash::compact_reply(Some(&plan));
+    log.append(crate::session::SessionEvent::compact(plan))?;
+    Ok(reply)
+}
+
+fn im_model_text(cfg: &Config, env: &NativePayload, args: &str) -> Result<String> {
+    let controls = super::interaction::controls(&env.session_id, im_default_approvals());
+    let current = if controls.model.is_empty() {
+        cfg.server.model.as_str()
+    } else {
+        controls.model.as_str()
+    };
+    match crate::slash::model_text(current, args) {
+        crate::slash::ModelAction::Show(text) => Ok(text),
+        crate::slash::ModelAction::Switch { name, global } => {
+            if global {
+                if let Ok(path) = Config::default_path() {
+                    let _ = Config::mutate_disk(&path, |c| {
+                        c.server.model = name.clone();
+                    });
+                }
+            }
+            super::interaction::set_model(&env.session_id, &name);
+            Ok(format!(
+                "model={name} ({})",
+                if global { "global" } else { "session" }
+            ))
+        }
+    }
+}
+
 fn last_real_user(home: Option<&std::path::Path>, session_id: &str) -> Result<Option<String>> {
     let Some(home) = home else {
         return Ok(None);
@@ -482,6 +606,7 @@ fn im_cmd_name(cmd: &crate::slash::SlashCmd) -> &'static str {
         SlashCmd::Imagine { .. } => "/imagine",
         SlashCmd::Tools => "/tools",
         SlashCmd::Usage => "/usage",
+        SlashCmd::Background { .. } => "/background",
         SlashCmd::Diff { .. } => "/diff",
         SlashCmd::Reload => "/reload",
         SlashCmd::Config => "/config",

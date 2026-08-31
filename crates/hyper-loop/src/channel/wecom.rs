@@ -345,6 +345,86 @@ pub async fn send(
     Ok(())
 }
 
+pub(crate) async fn send_choices(
+    ep: Option<&ChannelEndpoint>,
+    env: &NativePayload,
+    text: &str,
+    buttons: &[(String, String)],
+) -> Result<Option<String>> {
+    let Some(ep) = ep else {
+        return Ok(None);
+    };
+    let Some((bot_id, _)) = credentials(ep) else {
+        return Err(Error::msg("wecom send: missing credentials"));
+    };
+    let tx =
+        sender_for(&bot_id).ok_or_else(|| Error::msg("wecom send: websocket not connected"))?;
+    tx.send(wecom_card_frame(env, text, buttons)?)
+        .map_err(|_| Error::msg("wecom send: websocket not connected"))?;
+    Ok(None)
+}
+
+fn wecom_card_frame(
+    env: &NativePayload,
+    text: &str,
+    buttons: &[(String, String)],
+) -> Result<Value> {
+    let title: String = text
+        .lines()
+        .next()
+        .unwrap_or("hyper")
+        .chars()
+        .take(36)
+        .collect();
+    let button_list: Vec<Value> = buttons
+        .iter()
+        .enumerate()
+        .map(|(i, (id, label))| {
+            json!({
+                "text": label,
+                "style": if i + 1 == buttons.len() && buttons.len() >= 3 { 4 } else { 1 },
+                "key": id,
+            })
+        })
+        .collect();
+    let card = json!({
+        "card_type": "button_interaction",
+        "source": { "desc": "hyper" },
+        "main_title": { "title": title },
+        "sub_title_text": text,
+        "button_list": button_list,
+    });
+    let reply_req_id = env
+        .meta
+        .get("reply_req_id")
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .trim();
+    if !reply_req_id.is_empty() {
+        return Ok(json!({
+            "cmd": CMD_RESPOND,
+            "headers": {"req_id": reply_req_id},
+            "body": {
+                "msgtype": "template_card",
+                "template_card": card,
+            }
+        }));
+    }
+    let chat_id = env.chat_id();
+    if chat_id.is_empty() {
+        return Err(Error::msg("wecom send: missing chat_id"));
+    }
+    Ok(json!({
+        "cmd": CMD_SEND,
+        "headers": {"req_id": uuid::Uuid::new_v4().to_string()},
+        "body": {
+            "chatid": chat_id,
+            "msgtype": "template_card",
+            "template_card": card,
+        }
+    }))
+}
+
 fn reply_req_id(env: &NativePayload) -> String {
     env.meta
         .get("reply_req_id")
@@ -580,8 +660,7 @@ fn native_from_callback(ep: &ChannelEndpoint, payload: &Value) -> Option<NativeP
     let mut parts = extract_parts(body);
     let mut mentioned = false;
     if is_group {
-        if let Some(ContentPart::Text { text }) = parts.iter_mut().find(|p| p.as_text().is_some())
-        {
+        if let Some(ContentPart::Text { text }) = parts.iter_mut().find(|p| p.as_text().is_some()) {
             // 企微把开头 @Bot 一并塞在正文里；剥离之前先据此标注 mention。
             // 否则默认 group_policy = mention 下群消息全被 access gate 挡掉，
             // 机器人看起来像没反应。
@@ -629,7 +708,26 @@ fn native_from_callback(ep: &ChannelEndpoint, payload: &Value) -> Option<NativeP
     if !msgid.is_empty() {
         env.meta.insert("msgid".into(), json!(msgid));
     }
+    if wecom_button_key(body).is_some() {
+        env.mark_choice_click();
+        env.meta.insert("is_mentioned".into(), json!(true));
+    }
     Some(env)
+}
+
+fn wecom_button_key(body: &Value) -> Option<String> {
+    let candidates = [
+        js_str(&body["eventkey"]),
+        js_str(&body["event_key"]),
+        js_str(&body["EventKey"]),
+        js_str(&body["event"]["event_key"]),
+        js_str(&body["event"]["key"]),
+        js_str(&body["event"]["template_card_event"]["event_key"]),
+        js_str(&body["template_card_event"]["event_key"]),
+        js_str(&body["selected"]["key"]),
+        js_str(&body["template_card"]["button"]["key"]),
+    ];
+    candidates.into_iter().find(|s| !s.is_empty())
 }
 
 fn extract_text(body: &Value) -> String {
@@ -646,6 +744,11 @@ fn extract_text(body: &Value) -> String {
 }
 
 fn extract_parts(body: &Value) -> Vec<ContentPart> {
+    let mut parts: Vec<ContentPart> = Vec::new();
+    if let Some(key) = wecom_button_key(body) {
+        parts.push(ContentPart::text(&key));
+        return parts;
+    }
     let msgtype = body
         .get("msgtype")
         .and_then(Value::as_str)
@@ -1105,6 +1208,55 @@ mod tests {
         assert!(stream_expired(&json!({"body": {"errcode": 846608}})));
         assert!(!stream_expired(&json!({"errcode": 0})));
         assert!(!stream_expired(&json!({})));
+    }
+
+    #[test]
+    fn template_card_and_button_key() {
+        let mut env = NativePayload::text_only("wecom", "hi");
+        env.meta.insert("chat_id".into(), json!("c1"));
+        let frame = wecom_card_frame(
+            &env,
+            "需要批准\n工具：Write",
+            &[("p:abcd1234:1".into(), "允许".into())],
+        )
+        .unwrap();
+        assert_eq!(frame["body"]["msgtype"], "template_card");
+        assert_eq!(
+            frame["body"]["template_card"]["button_list"][0]["key"],
+            "p:abcd1234:1"
+        );
+        let key = wecom_button_key(&json!({"event": {"event_key": "p:abcd1234:1"}}));
+        assert_eq!(key.as_deref(), Some("p:abcd1234:1"));
+        let parts = extract_parts(&json!({"eventkey": "p:abcd1234:2", "msgtype": "text"}));
+        assert_eq!(parts[0].as_text(), Some("p:abcd1234:2"));
+        let nested = wecom_button_key(&json!({
+            "event": { "template_card_event": { "event_key": "p:abcd1234:3" } }
+        }));
+        assert_eq!(nested.as_deref(), Some("p:abcd1234:3"));
+    }
+
+    #[test]
+    fn group_card_click_is_mentioned() {
+        let ep = ChannelEndpoint {
+            kind: "wecom".into(),
+            ..ChannelEndpoint::default()
+        };
+        let payload = json!({
+            "headers": {"req_id": "req-card"},
+            "body": {
+                "msgid": "m-card",
+                "from": {"userid": "user-2"},
+                "chatid": "wr-group",
+                "chattype": "group",
+                "msgtype": "event",
+                "event": { "event_key": "p:abcd1234:1" }
+            }
+        });
+        let env = native_from_callback(&ep, &payload).unwrap();
+        assert_eq!(env.query_text(), "p:abcd1234:1");
+        assert!(env.is_choice_click());
+        assert!(env.is_group());
+        assert!(env.is_mentioned());
     }
 
     #[tokio::test]

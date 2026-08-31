@@ -27,6 +27,18 @@ impl ImLocale {
         }
     }
 
+    /// Slash commands and callback ids are ASCII; CJK IM channels still
+    /// get Chinese control replies.
+    pub fn detect_channel(text: &str, channel: &str) -> Self {
+        if Self::detect(text) == Self::Zh {
+            return Self::Zh;
+        }
+        match channel.to_ascii_lowercase().as_str() {
+            "feishu" | "lark" | "wechat" | "wecom" | "qq" | "dingtalk" => Self::Zh,
+            _ => Self::En,
+        }
+    }
+
     pub fn ack(self) -> &'static str {
         match self {
             Self::Zh => ACK_TEXT,
@@ -708,7 +720,9 @@ impl ProgressBuf {
         // until it is long enough to be worth a second bubble.
         let fresh = !force
             && char_len(&self.content) >= STACK_DRAFT_MIN
-            && self.content_section().is_some_and(|s| s != self.content_shown);
+            && self
+                .content_section()
+                .is_some_and(|s| s != self.content_shown);
         if !due {
             return Vec::new();
         }
@@ -933,7 +947,9 @@ mod tests {
         assert!(first[0].starts_with("回复中\n"), "{}", first[0]);
         assert!(first[0].contains("本周完成"), "{}", first[0]);
         // More tokens inside the pacing window do not flood the chat.
-        assert!(b.ingest(&content("继续写。"), t0 + Duration::from_secs(1)).is_empty());
+        assert!(b
+            .ingest(&content("继续写。"), t0 + Duration::from_secs(1))
+            .is_empty());
         let next = b.tick(t0 + THINK_FLUSH);
         assert_eq!(next.len(), 1, "{next:?}");
         assert!(next[0].contains("继续写"), "{next:?}");
@@ -954,9 +970,14 @@ mod tests {
     fn answer_draft_rides_the_edit_bubble() {
         let t0 = Instant::now();
         let mut b = ProgressBuf::for_channel(t0, "帮我改标题", "feishu");
-        assert_eq!(b.ingest(&read_tool("src/main.rs"), t0), vec!["读取 src/main.rs"]);
+        assert_eq!(
+            b.ingest(&read_tool("src/main.rs"), t0),
+            vec!["读取 src/main.rs"]
+        );
         let draft = "已把标题改成更短的版本。".repeat(4);
-        assert!(b.ingest(&content(&draft), t0 + Duration::from_secs(1)).is_empty());
+        assert!(b
+            .ingest(&content(&draft), t0 + Duration::from_secs(1))
+            .is_empty());
         let lines = b.tick(t0 + THINK_FLUSH);
         assert_eq!(lines.len(), 1, "{lines:?}");
         assert!(lines[0].contains("读取 src/main.rs"), "{}", lines[0]);
@@ -1005,9 +1026,18 @@ mod tests {
         let t0 = Instant::now();
         // Append-only: 沉默 token 一到就发出去的话，终稿拦截就晚了。
         let mut b = ProgressBuf::for_channel(t0, "群里闲聊", "qq");
-        assert!(b.ingest(&content("NO"), t0).is_empty(), "prefix of NO_REPLY");
-        assert!(b.ingest(&content("_REPLY"), t0).is_empty(), "NO_REPLY complete");
-        assert!(b.tick(t0 + THINK_FLUSH).is_empty(), "tick must not flush it");
+        assert!(
+            b.ingest(&content("NO"), t0).is_empty(),
+            "prefix of NO_REPLY"
+        );
+        assert!(
+            b.ingest(&content("_REPLY"), t0).is_empty(),
+            "NO_REPLY complete"
+        );
+        assert!(
+            b.tick(t0 + THINK_FLUSH).is_empty(),
+            "tick must not flush it"
+        );
         // 编辑类渠道（飞书 tick 刷草稿）同样不渲染沉默段。
         let mut f = ProgressBuf::for_channel(t0, "群里闲聊", "feishu");
         f.ingest(&content("NO_REPLY"), t0);
@@ -1017,7 +1047,10 @@ mod tests {
         );
         // 以 No 开头的正常回答只被压住前几个 token，成形后照常预览。
         let mut n = ProgressBuf::for_channel(t0, "帮我写个回答", "feishu");
-        n.ingest(&content("No problem — here is the full answer.".repeat(12).as_str()), t0);
+        n.ingest(
+            &content("No problem — here is the full answer.".repeat(12).as_str()),
+            t0,
+        );
         let lines = n.tick(t0 + THINK_FLUSH);
         assert_eq!(lines.len(), 1, "{lines:?}");
         assert!(lines[0].contains("No problem"), "{}", lines[0]);
@@ -1027,9 +1060,14 @@ mod tests {
     fn collapse_draft_strips_the_reply_section_off_the_old_bubble() {
         let t0 = Instant::now();
         let mut b = ProgressBuf::for_channel(t0, "帮我改标题", "feishu");
-        assert_eq!(b.ingest(&read_tool("src/main.rs"), t0), vec!["读取 src/main.rs"]);
+        assert_eq!(
+            b.ingest(&read_tool("src/main.rs"), t0),
+            vec!["读取 src/main.rs"]
+        );
         let draft = "已把标题改成更短的版本。".repeat(30);
-        assert!(b.ingest(&content(&draft), t0 + Duration::from_secs(1)).is_empty());
+        assert!(b
+            .ingest(&content(&draft), t0 + Duration::from_secs(1))
+            .is_empty());
         let lines = b.tick(t0 + THINK_FLUSH);
         assert_eq!(lines.len(), 1, "{lines:?}");
         assert!(lines[0].contains("回复中\n"), "{}", lines[0]);

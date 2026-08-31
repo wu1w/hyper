@@ -366,9 +366,29 @@ impl NativePayload {
         string_meta(&self.meta, "reply_url").or_else(|| string_meta(&self.meta, "session_webhook"))
     }
 
-    /// Stable conversation identity. Endpoint and thread/topic dimensions keep
-    /// two bots or two Feishu/Slack threads in the same chat from sharing one
-    /// agent transcript.
+    /// Forum topic / Feishu thread / Slack thread. Empty when the platform
+    /// has no thread dimension (ordinary group chat).
+    pub fn thread_id(&self) -> Option<String> {
+        ["thread_id", "root_id", "topic_id", "message_thread_id"]
+            .into_iter()
+            .find_map(|key| string_meta(&self.meta, key))
+            .filter(|s| !s.is_empty())
+    }
+
+    pub fn stamp_thread(&mut self, id: impl Into<String>) {
+        let id = id.into();
+        let id = id.trim();
+        if id.is_empty() || id == "null" {
+            return;
+        }
+        self.meta.insert("thread_id".into(), serde_json::json!(id));
+        self.meta
+            .insert("message_thread_id".into(), serde_json::json!(id));
+    }
+
+    /// Stable conversation identity. Endpoint, thread/topic, and (in groups)
+    /// sender keep two people in one room from sharing an agent transcript.
+    /// Hermes default: group sessions are per-user.
     pub fn route_key(&self) -> String {
         let ch = string_meta(&self.meta, "endpoint_id").unwrap_or_else(|| {
             if self.channel.is_empty() {
@@ -378,15 +398,22 @@ impl NativePayload {
             }
             .to_string()
         });
-        let thread = ["thread_id", "root_id", "topic_id", "message_thread_id"]
-            .into_iter()
-            .find_map(|key| string_meta(&self.meta, key))
-            .filter(|s| !s.is_empty());
+        let thread = self.thread_id();
         if self.is_group() {
-            match thread {
+            let mut key = match thread {
                 Some(thread) => format!("{ch}:g:{}:t:{thread}", self.chat_id()),
                 None => format!("{ch}:g:{}", self.chat_id()),
+            };
+            let who = if self.sender_id.is_empty() {
+                self.chat_id()
+            } else {
+                self.sender_id.clone()
+            };
+            if !who.is_empty() {
+                key.push_str(":u:");
+                key.push_str(&who);
             }
+            key
         } else {
             let who = if self.sender_id.is_empty() {
                 self.chat_id()
@@ -557,10 +584,16 @@ mod tests {
         env.meta.insert("thread_id".into(), json!("thread-2"));
         assert_eq!(
             env.route_key(),
-            "work-bot:g:group-7:t:thread-2",
-            "threads in a shared room must not collide"
+            "work-bot:g:group-7:t:thread-2:u:u1",
+            "group sessions are per-user; threads must not collide"
         );
         env.meta.insert("endpoint_id".into(), json!("personal-bot"));
-        assert_eq!(env.route_key(), "personal-bot:g:group-7:t:thread-2");
+        assert_eq!(env.route_key(), "personal-bot:g:group-7:t:thread-2:u:u1");
+        env.sender_id = "u2".into();
+        assert_eq!(
+            env.route_key(),
+            "personal-bot:g:group-7:t:thread-2:u:u2",
+            "two speakers in the same thread keep separate transcripts"
+        );
     }
 }

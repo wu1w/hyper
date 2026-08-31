@@ -265,15 +265,17 @@ pub async fn deliver_since(
     deliver(ep, &owned, parts).await
 }
 
-/// Permit / AskQuestion choices: native buttons on Telegram and Feishu,
-/// numbered text everywhere else.
+/// Permit / AskQuestion choices: native buttons where the platform has them
+/// (Telegram / Feishu / QQ / DingTalk / WeCom / webhook `choices`), numbered
+/// text elsewhere. Returns the platform message id when the adapter created a
+/// card we can later settle.
 pub async fn deliver_choices(
     ep: Option<&ChannelEndpoint>,
     env: &NativePayload,
     text: &str,
     buttons: &[(String, String)],
     started: Instant,
-) -> Result<()> {
+) -> Result<Option<String>> {
     let owned = outbound_env(env, started.elapsed());
     let kind = ep
         .map(|e| e.kind.as_str())
@@ -284,8 +286,48 @@ pub async fn deliver_choices(
     if kind.eq_ignore_ascii_case("feishu") {
         return super::feishu::send_choices(ep, &owned, text, buttons).await;
     }
+    if kind.eq_ignore_ascii_case("qq") {
+        return super::qq::send_choices(ep, &owned, text, buttons).await;
+    }
+    if kind.eq_ignore_ascii_case("dingtalk") {
+        return super::dingtalk::send_choices(ep, &owned, text, buttons).await;
+    }
+    if kind.eq_ignore_ascii_case("wecom") {
+        return super::wecom::send_choices(ep, &owned, text, buttons).await;
+    }
+    if kind.is_empty()
+        || kind.eq_ignore_ascii_case("webhook")
+        || kind.eq_ignore_ascii_case("http")
+        || kind.eq_ignore_ascii_case("console")
+    {
+        return post_webhook_choices(ep, &owned, text, buttons).await;
+    }
     let parts = reply_text(text);
-    deliver(ep, &owned, &parts).await
+    deliver(ep, &owned, &parts).await?;
+    Ok(None)
+}
+
+/// Disable a native choice card after a pick (or tell the user the prompt is done).
+pub async fn settle_choices(
+    ep: Option<&ChannelEndpoint>,
+    env: &NativePayload,
+    message_id: &str,
+    summary: &str,
+) -> Result<()> {
+    if message_id.is_empty() {
+        return Ok(());
+    }
+    let kind = ep.map(|e| e.kind.as_str()).unwrap_or(env.channel.as_str());
+    if kind.eq_ignore_ascii_case("telegram") {
+        return super::telegram::settle_choices(ep, env, message_id, summary).await;
+    }
+    if kind.eq_ignore_ascii_case("feishu") {
+        return super::feishu::settle_choices(ep, env, message_id, summary).await;
+    }
+    if kind.eq_ignore_ascii_case("qq") {
+        return super::qq::settle_choices(ep, env, message_id, summary).await;
+    }
+    Ok(())
 }
 
 /// Live IM progress (ACK / think / tools). WeCom stream, Telegram/Feishu
@@ -367,6 +409,53 @@ async fn post_webhook(
     }
     let _ = resp;
     Ok(())
+}
+
+async fn post_webhook_choices(
+    ep: Option<&ChannelEndpoint>,
+    env: &NativePayload,
+    text: &str,
+    buttons: &[(String, String)],
+) -> Result<Option<String>> {
+    let url = env
+        .reply_url()
+        .or_else(|| ep.and_then(|e| nonempty(&e.reply_url).map(|s| s.to_string())))
+        .or_else(|| ep.and_then(|e| e.extra.get("reply_url").cloned()));
+    let Some(url) = url else {
+        let parts = reply_text(text);
+        deliver(ep, env, &parts).await?;
+        return Ok(None);
+    };
+    let body = webhook_choices_body(env, text, buttons);
+    let client = crate::llm_http::env_aware_client(20, &url)?;
+    let mut req = client.post(&url).json(&body);
+    if let Some(secret) = ep.and_then(|e| nonempty(&e.secret).map(|s| s.to_string())) {
+        req = req.header("X-Q38-Token", secret);
+    }
+    let resp = req.send().await?;
+    if !resp.status().is_success() {
+        return Err(crate::error::Error::msg(format!(
+            "channel outbound {} {}",
+            resp.status(),
+            url
+        )));
+    }
+    Ok(None)
+}
+
+fn webhook_choices_body(env: &NativePayload, text: &str, buttons: &[(String, String)]) -> Value {
+    let parts = reply_text(text);
+    let mut body = webhook_payload(env, &parts, false);
+    if let Some(obj) = body.as_object_mut() {
+        obj.insert(
+            "choices".into(),
+            json!(buttons
+                .iter()
+                .map(|(id, label)| json!({"id": id, "label": label}))
+                .collect::<Vec<_>>()),
+        );
+    }
+    body
 }
 
 fn delivery_id(env: &NativePayload, parts: &[ContentPart]) -> String {
@@ -645,5 +734,15 @@ mod tests {
         let q = outbox_root().unwrap().join("quarantine/hyper-garbage.json");
         assert!(q.is_file(), "expected {}", q.display());
         let _ = fs::remove_dir_all(outbox_root().unwrap());
+    }
+
+    #[test]
+    fn webhook_payload_includes_choices() {
+        let env = NativePayload::text_only("webhook", "hi");
+        let body =
+            webhook_choices_body(&env, "需要批准", &[("p:abcd1234:1".into(), "允许".into())]);
+        assert_eq!(body["text"], "需要批准");
+        assert_eq!(body["choices"][0]["id"], "p:abcd1234:1");
+        assert_eq!(body["choices"][0]["label"], "允许");
     }
 }

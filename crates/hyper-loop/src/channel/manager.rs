@@ -93,11 +93,19 @@ impl ChannelManager {
             inner: inner.clone(),
             ingest_tx,
         };
-        tokio::spawn(dispatch_loop(inner, ingest_rx, Arc::new(handler)));
+        let (bg_tx, bg_rx) = mpsc::unbounded_channel();
+        tokio::spawn(dispatch_loop(
+            inner,
+            ingest_rx,
+            Arc::new(handler),
+            bg_tx,
+            bg_rx,
+        ));
         mgr
     }
 
     pub async fn ingest(&self, mut env: NativePayload) -> Result<IngestResult> {
+        super::interaction::stamp_tagged_choice(&mut env);
         let ep = {
             let g = self.inner.lock().await;
             g.cfg
@@ -198,6 +206,8 @@ async fn dispatch_loop<H: ChannelHandler>(
     inner: Arc<Mutex<Inner>>,
     mut rx: mpsc::Receiver<NativePayload>,
     handler: Arc<H>,
+    bg_tx: mpsc::UnboundedSender<NativePayload>,
+    mut bg_rx: mpsc::UnboundedReceiver<NativePayload>,
 ) {
     let mut pending: HashMap<String, Vec<NativePayload>> = HashMap::new();
     let mut ticks: HashMap<String, tokio::task::JoinHandle<()>> = HashMap::new();
@@ -216,8 +226,8 @@ async fn dispatch_loop<H: ChannelHandler>(
                 // 正文，parse_slash 要求整段以 / 开头，/stop 进了模型而任务
                 // 不停。先按原序 flush 该会话已攒的普通消息，再直接投递。
                 if env.query_text().trim_start().starts_with('/') {
-                    flush_pending(&inner, &handler, &mut pending, &mut ticks, &key).await;
-                    let tx = session_tx(&inner, &key, handler.clone()).await;
+                    flush_pending(&inner, &handler, &mut pending, &mut ticks, &key, &bg_tx).await;
+                    let tx = session_tx(&inner, &key, handler.clone(), bg_tx.clone()).await;
                     let _ = tx.send(env).await;
                     continue;
                 }
@@ -233,7 +243,12 @@ async fn dispatch_loop<H: ChannelHandler>(
                 }));
             }
             Some(key) = flush_rx.recv() => {
-                flush_pending(&inner, &handler, &mut pending, &mut ticks, &key).await;
+                flush_pending(&inner, &handler, &mut pending, &mut ticks, &key, &bg_tx).await;
+            }
+            Some(env) = bg_rx.recv() => {
+                let key = env.session_id.clone();
+                let tx = session_tx(&inner, &key, handler.clone(), bg_tx.clone()).await;
+                let _ = tx.send(env).await;
             }
         }
     }
@@ -249,6 +264,7 @@ async fn flush_pending<H: ChannelHandler>(
     pending: &mut HashMap<String, Vec<NativePayload>>,
     ticks: &mut HashMap<String, tokio::task::JoinHandle<()>>,
     key: &str,
+    bg_tx: &mpsc::UnboundedSender<NativePayload>,
 ) {
     if let Some(old) = ticks.remove(key) {
         old.abort();
@@ -257,8 +273,10 @@ async fn flush_pending<H: ChannelHandler>(
         return;
     };
     for group in sender_batches(batch) {
-        let Some(merged) = NativePayload::merge(group) else { continue };
-        let tx = session_tx(inner, &merged.session_id, handler.clone()).await;
+        let Some(merged) = NativePayload::merge(group) else {
+            continue;
+        };
+        let tx = session_tx(inner, &merged.session_id, handler.clone(), bg_tx.clone()).await;
         let _ = tx.send(merged).await;
     }
 }
@@ -285,6 +303,7 @@ async fn session_tx<H: ChannelHandler>(
     inner: &Arc<Mutex<Inner>>,
     session_id: &str,
     handler: Arc<H>,
+    bg_tx: mpsc::UnboundedSender<NativePayload>,
 ) -> mpsc::Sender<NativePayload> {
     let mut g = inner.lock().await;
     if let Some(tx) = g.sessions.get(session_id) {
@@ -294,11 +313,11 @@ async fn session_tx<H: ChannelHandler>(
     let cfg = g.cfg.clone();
     g.sessions.insert(session_id.to_string(), tx.clone());
     drop(g);
-    let inner = inner.clone();
+    let inner_done = inner.clone();
     let sid = session_id.to_string();
     tokio::spawn(async move {
-        session_worker(rx, handler, cfg).await;
-        let mut g = inner.lock().await;
+        session_worker(rx, handler, cfg, inner_done.clone(), bg_tx).await;
+        let mut g = inner_done.lock().await;
         g.sessions.remove(&sid);
     });
     tx
@@ -308,9 +327,12 @@ async fn session_worker<H: ChannelHandler>(
     mut rx: mpsc::Receiver<NativePayload>,
     handler: Arc<H>,
     cfg: ChannelsConfig,
+    inner: Arc<Mutex<Inner>>,
+    bg_tx: mpsc::UnboundedSender<NativePayload>,
 ) {
     let mut busy = cfg.busy_policy();
     let mut queued: VecDeque<NativePayload> = VecDeque::new();
+    let mut detached = false;
     loop {
         let mut env = if let Some(next) = queued.pop_front() {
             next
@@ -320,6 +342,7 @@ async fn session_worker<H: ChannelHandler>(
                 None => break,
             }
         };
+        let mut want_detach = false;
         match live_control(&env) {
             Some(LiveControl::Busy(policy)) => {
                 busy = policy.unwrap_or(busy);
@@ -331,6 +354,19 @@ async fn session_worker<H: ChannelHandler>(
                 let ep = cfg.endpoint_for_payload(&env).cloned();
                 spawn_ack(ep, env.clone(), no_active_status(&env));
                 continue;
+            }
+            Some(LiveControl::Background { prompt }) => {
+                match prompt.filter(|p| !p.trim().is_empty()) {
+                    Some(text) => {
+                        env = env.follow_up_text(text);
+                        want_detach = true;
+                    }
+                    None => {
+                        let ep = cfg.endpoint_for_payload(&env).cloned();
+                        spawn_ack(ep, env.clone(), no_background_status(&env));
+                        continue;
+                    }
+                }
             }
             Some(LiveControl::Queue(text)) | Some(LiveControl::Steer(text)) => {
                 env = env.follow_up_text(text);
@@ -349,7 +385,7 @@ async fn session_worker<H: ChannelHandler>(
             }
         }
         let started = Instant::now();
-        if !im_acked(&env) {
+        if !im_acked(&env) && !want_detach {
             let ack = super::outbound::reply_text(ImLocale::detect(&env.query_text()).ack());
             if let Err(e) =
                 super::outbound::deliver_progress_since(ep.as_ref(), &env, &ack, started).await
@@ -369,6 +405,20 @@ async fn session_worker<H: ChannelHandler>(
         };
         let work = handler.handle(env.clone(), cancel.clone(), steer.clone());
         tokio::pin!(work);
+        if want_detach {
+            match background_rebind(&inner, &env).await {
+                Ok(new_id) => {
+                    let ep2 = cfg.endpoint_for_payload(&env).cloned();
+                    spawn_ack(
+                        ep2,
+                        env.clone(),
+                        background_status(&env, &env.session_id, &new_id),
+                    );
+                    detached = true;
+                }
+                Err(e) => eprintln!("hyper channel background bind: {e}"),
+            }
+        }
         loop {
             tokio::select! {
                 biased;
@@ -393,6 +443,11 @@ async fn session_worker<H: ChannelHandler>(
                         return;
                     };
                     match live_control(&next) {
+                        Some(_) if is_foreign_live_control(&env, &next) => {
+                            let ep2 = cfg.endpoint_for_payload(&next).cloned();
+                            spawn_ack(ep2, next, owner_only_status(&env));
+                            continue;
+                        }
                         Some(LiveControl::Stop) => {
                             cancel.cancel();
                             abort_live(live.take()).await;
@@ -424,6 +479,27 @@ async fn session_worker<H: ChannelHandler>(
                             let ep2 = cfg.endpoint_for_payload(&next).cloned();
                             push_steer(&steer, text);
                             spawn_ack(ep2, next.clone(), ImLocale::detect(&next.query_text()).steer_ack());
+                            continue;
+                        }
+                        Some(LiveControl::Background { prompt }) => {
+                            match background_rebind(&inner, &env).await {
+                                Ok(new_id) => {
+                                    let ep2 = cfg.endpoint_for_payload(&next).cloned();
+                                    spawn_ack(
+                                        ep2,
+                                        next.clone(),
+                                        background_status(&next, &env.session_id, &new_id),
+                                    );
+                                    if let Some(text) = prompt.filter(|p| !p.trim().is_empty()) {
+                                        let mut nxt = next.follow_up_text(text);
+                                        nxt.session_id = new_id.clone();
+                                        mark_im_acked(&mut nxt);
+                                        let _ = bg_tx.send(nxt);
+                                    }
+                                    detached = true;
+                                }
+                                Err(e) => eprintln!("hyper channel background bind: {e}"),
+                            }
                             continue;
                         }
                         None => {}
@@ -502,9 +578,15 @@ async fn session_worker<H: ChannelHandler>(
                     if !cancel.is_cancelled() {
                         enqueue_leftover_steer(&env, take_steer(&steer), &mut queued);
                     }
+                    if detached && queued.is_empty() {
+                        return;
+                    }
                     break;
                 }
             }
+        }
+        if detached && queued.is_empty() {
+            return;
         }
     }
 }
@@ -522,6 +604,7 @@ enum LiveControl {
     Queue(String),
     Steer(String),
     Busy(Option<BusyPolicy>),
+    Background { prompt: Option<String> },
 }
 
 fn live_control(env: &NativePayload) -> Option<LiveControl> {
@@ -530,7 +613,23 @@ fn live_control(env: &NativePayload) -> Option<LiveControl> {
         crate::slash::SlashCmd::Queue { text } => Some(LiveControl::Queue(text)),
         crate::slash::SlashCmd::Steer { text } => Some(LiveControl::Steer(text)),
         crate::slash::SlashCmd::Busy { policy } => Some(LiveControl::Busy(policy)),
+        crate::slash::SlashCmd::Background { prompt } => Some(LiveControl::Background { prompt }),
         _ => None,
+    }
+}
+
+fn is_foreign_live_control(live: &NativePayload, next: &NativePayload) -> bool {
+    live_control(next).is_some()
+        && live.is_group()
+        && !live.sender_id.is_empty()
+        && !next.sender_id.is_empty()
+        && live.sender_id != next.sender_id
+}
+
+fn owner_only_status(env: &NativePayload) -> &'static str {
+    match ImLocale::detect_channel(&env.query_text(), &env.channel) {
+        ImLocale::Zh => "只有任务发起者可以控制当前任务。",
+        ImLocale::En => "Only the user who started this task can control it.",
     }
 }
 
@@ -553,6 +652,34 @@ fn busy_status(env: &NativePayload, busy: BusyPolicy) -> String {
         ImLocale::Zh => format!("当前忙时策略：{}。", busy.as_str()),
         ImLocale::En => format!("Busy policy: {}.", busy.as_str()),
     }
+}
+
+fn no_background_status(env: &NativePayload) -> &'static str {
+    match ImLocale::detect_channel(&env.query_text(), &env.channel) {
+        ImLocale::Zh => "没有正在运行的任务。发送 `/background <任务>` 开始后台任务。",
+        ImLocale::En => "There is no active task. Send `/background <task>` to start one.",
+    }
+}
+
+fn background_status(env: &NativePayload, old_id: &str, new_id: &str) -> String {
+    match ImLocale::detect_channel(&env.query_text(), &env.channel) {
+        ImLocale::Zh => format!(
+            "当前任务已放到后台（会话 `{old_id}`）。下一条消息进入新会话 `{new_id}`。要停后台任务：`/resume {old_id}` 再 `/stop`。"
+        ),
+        ImLocale::En => format!(
+            "Moved the live task to the background (session `{old_id}`). The next message starts `{new_id}`. To stop it: `/resume {old_id}` then `/stop`."
+        ),
+    }
+}
+
+async fn background_rebind(
+    inner: &Arc<Mutex<Inner>>,
+    env: &NativePayload,
+) -> crate::error::Result<String> {
+    let id = crate::session::new_session_id();
+    let mut g = inner.lock().await;
+    g.router.bind(env, &id)?;
+    Ok(id)
 }
 
 #[cfg(test)]
@@ -581,6 +708,34 @@ mod tests {
         });
         assert!(!is_silence(&with_media), "attachments are real content");
         assert!(!is_silence(&[]));
+    }
+
+    #[test]
+    fn foreign_group_member_cannot_stop_live_turn() {
+        use serde_json::json;
+        let mut live = NativePayload::text_only("feishu", "do work");
+        live.sender_id = "ou_a".into();
+        live.meta.insert("is_group".into(), json!(true));
+        live.meta.insert("chat_id".into(), json!("oc_1"));
+        let mut next = NativePayload::text_only("feishu", "/stop");
+        next.sender_id = "ou_b".into();
+        next.meta.insert("is_group".into(), json!(true));
+        next.meta.insert("chat_id".into(), json!("oc_1"));
+        assert!(is_foreign_live_control(&live, &next));
+        next.sender_id = "ou_a".into();
+        assert!(!is_foreign_live_control(&live, &next));
+        let mut bg = NativePayload::text_only("feishu", "/background");
+        bg.sender_id = "ou_b".into();
+        bg.meta.insert("is_group".into(), json!(true));
+        assert!(is_foreign_live_control(&live, &bg));
+        let mut dm = NativePayload::text_only("telegram", "/stop");
+        dm.sender_id = "u2".into();
+        live.meta.insert("is_group".into(), json!(false));
+        live.sender_id = "u1".into();
+        assert!(
+            !is_foreign_live_control(&live, &dm),
+            "DMs are already per-user routes"
+        );
     }
 
     #[test]
@@ -636,7 +791,8 @@ mod tests {
                 Ok(Vec::<super::super::envelope::ContentPart>::new())
             },
         );
-        let task = tokio::spawn(dispatch_loop(inner, rx, handler));
+        let (bg_tx, bg_rx) = mpsc::unbounded_channel();
+        let task = tokio::spawn(dispatch_loop(inner, rx, handler, bg_tx, bg_rx));
         drop(tx);
         tokio::time::timeout(Duration::from_secs(2), task)
             .await

@@ -40,7 +40,11 @@ pub fn chunk_text(text: &str, max_chars: usize) -> Vec<String> {
         let next = rest[chunk.len()..].trim_start_matches(['\n', ' ']);
         let mut chunk = chunk.trim_end().to_string();
         let open = fence_open(&chunk);
-        let lang = if open { open_fence_lang(&chunk).to_string() } else { String::new() };
+        let lang = if open {
+            open_fence_lang(&chunk).to_string()
+        } else {
+            String::new()
+        };
         if open {
             chunk.push_str("\n```");
         }
@@ -57,11 +61,7 @@ pub fn chunk_text(text: &str, max_chars: usize) -> Vec<String> {
 /// Never cut through a fence marker line (```` ``` ```` or ```` ```rust ````);
 /// back the cut off to the start of that line so the marker stays whole.
 fn avoid_fence_split(s: &str, cut: usize) -> usize {
-    let byte = s
-        .char_indices()
-        .nth(cut)
-        .map(|(i, _)| i)
-        .unwrap_or(s.len());
+    let byte = s.char_indices().nth(cut).map(|(i, _)| i).unwrap_or(s.len());
     if byte >= s.len() {
         return cut;
     }

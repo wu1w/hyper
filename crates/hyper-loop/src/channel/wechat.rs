@@ -909,7 +909,10 @@ mod tests {
             "item_list": [{"type": 1, "text_item": {"text": "@小助手 在吗"}}],
         });
         let env = native_from_msg(&ep, &at_group).expect("group @");
-        assert!(env.is_mentioned(), "@ prefix in a group counts as a mention");
+        assert!(
+            env.is_mentioned(),
+            "@ prefix in a group counts as a mention"
+        );
         // 单聊里 @ 只是普通正文，不算 mention。
         let at_dm = json!({
             "message_type": 1,

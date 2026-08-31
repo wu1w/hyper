@@ -27,3 +27,10 @@
 - 中文长回答按句读（。！？；，、：）切泡，不再从无空格句子中间硬断；正文里行内提到 ``` 不再被误判成围栏开闭
 - IM 卡的定位指引改为 Grep（默认冻结 17 没有 Search），不再教模型幻觉调用未挂载的工具
 - Read 目录：先排序再截断；坏 outbox JSON 进 quarantine；频道 poll lock 显示「重试中」
+- IM 群聊会话改为 per-user（可带 Telegram topic / 飞书 thread）；运行中 `/stop` `/approvals` `/plan` 等只有发起者能改
+- `hyper web` 各 IM endpoint 共用一个 SessionRouter / ChannelManager，跨平台 resume 同一 JSONL 不会跑两套 agent
+- AskQuestion / 审批按 prompt id 排队（FIFO、15 分钟 TTL）；过期按钮会提示，飞书 / Telegram 选完后收回卡片
+- IM 增加 `/model` `/compact` `/undo` `/usage`；`/new <title>` 会真正写入会话标题
+- IM `/background`（`/bg` `/btw`）把当前任务留在原会话继续跑，本聊天切到新会话；要停后台：`/resume <id>` 再 `/stop`
+- AskQuestion / 审批卡片选完后标明选择者，并保留原问题
+- QQ 键盘、钉钉 actionCard、企微 template_card、webhook `choices` 走原生按钮（微信 iLink 仍用序号回复）

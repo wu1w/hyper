@@ -31,7 +31,10 @@ pub(crate) mod xfer;
 
 pub use catalog::{catalog_json, endpoint_kind, in_process_kind, CATALOG, IN_PROCESS_HELP};
 pub use envelope::{ChannelAddress, ContentPart, NativePayload};
-pub use inbound::{keep_client_watched, serve_endpoint, serve_qq, spawn_im_pump, ClientWatch};
+pub use inbound::{
+    keep_client_watched, serve_adapter, serve_endpoint, serve_qq, spawn_im_pump, start_im_manager,
+    ClientWatch,
+};
 pub use mailbox::{
     has_steer, push_steer, take_steer, BusyDecision, BusyPolicy, Inbound, Mailbox, SteerSlot,
 };

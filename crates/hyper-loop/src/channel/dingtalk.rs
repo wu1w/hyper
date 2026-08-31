@@ -552,6 +552,74 @@ pub async fn send(
     Ok(())
 }
 
+pub(crate) async fn send_choices(
+    ep: Option<&ChannelEndpoint>,
+    env: &NativePayload,
+    text: &str,
+    buttons: &[(String, String)],
+) -> Result<Option<String>> {
+    let _ = ep;
+    let Some(url) = webhook_from_env(env) else {
+        return Err(Error::msg("dingtalk send: missing session_webhook"));
+    };
+    let http = crate::llm_http::env_aware_client(15, &url)?;
+    let btns: Vec<Value> = buttons
+        .iter()
+        .map(|(id, label)| {
+            json!({
+                "title": clip_btn(label),
+                "actionURL": dingtalk_choice_url(id),
+            })
+        })
+        .collect();
+    let title = text
+        .lines()
+        .next()
+        .unwrap_or("hyper")
+        .chars()
+        .take(20)
+        .collect::<String>();
+    post_webhook(
+        &http,
+        &url,
+        &json!({
+            "msgtype": "actionCard",
+            "actionCard": {
+                "title": title,
+                "text": text,
+                "btnOrientation": "1",
+                "btns": btns,
+            },
+        }),
+    )
+    .await?;
+    Ok(None)
+}
+
+fn clip_btn(s: &str) -> String {
+    s.chars().take(20).collect()
+}
+
+fn dingtalk_choice_url(choice: &str) -> String {
+    format!(
+        "dtmd://dingtalkclient/sendMessage?content={}",
+        query_encode(choice)
+    )
+}
+
+fn query_encode(s: &str) -> String {
+    let mut out = String::new();
+    for b in s.bytes() {
+        match b {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
+                out.push(b as char);
+            }
+            _ => out.push_str(&format!("%{b:02X}")),
+        }
+    }
+    out
+}
+
 async fn post_webhook(http: &reqwest::Client, url: &str, body: &Value) -> Result<()> {
     let resp = http.post(url).json(body).send().await?;
     let status = resp.status();
@@ -774,5 +842,13 @@ mod tests {
             "https://api.dingtalk.com/v1.0/gateway/connections/open"
         );
         assert_eq!(BOT_TOPIC, "/v1.0/im/bot/messages/get");
+    }
+
+    #[test]
+    fn action_card_url_sends_tagged_choice() {
+        let url = dingtalk_choice_url("p:abcd1234:1");
+        assert!(url.starts_with("dtmd://dingtalkclient/sendMessage?content="));
+        assert!(url.contains("p%3Aabcd1234%3A1") || url.contains("p:abcd1234:1"));
+        assert_eq!(query_encode("p:a:1"), "p%3Aa%3A1");
     }
 }

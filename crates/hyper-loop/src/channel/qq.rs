@@ -226,6 +226,18 @@ async fn run_once(
                 if t == "READY" {
                     let sid = payload["d"]["session_id"].as_str().unwrap_or("");
                     eprintln!("hyper qq ready session={sid}");
+                } else if t == "INTERACTION_CREATE" {
+                    let d = &payload["d"];
+                    let iid = js_str(&d["id"]);
+                    if !iid.is_empty() {
+                        let _ = ack_interaction(http, &token, bases, &iid).await;
+                    }
+                    if let Some(mut env) = native_from_interaction(ep, d) {
+                        super::stamp_endpoint(&mut env, ep);
+                        if let Err(e) = mgr.ingest(env).await {
+                            eprintln!("hyper qq interaction: {e}");
+                        }
+                    }
                 } else if let Some(mut env) = native_from_event(ep, t, &payload["d"]) {
                     super::stamp_endpoint(&mut env, ep);
                     super::xfer::hydrate_http_parts(&mut env.content_parts).await;
@@ -432,7 +444,15 @@ pub async fn send(
             owned.meta.remove("msg_id");
             &owned
         };
-        send_typed(&http, &token, &bases, target, 0, json!({ "content": chunk })).await?;
+        send_typed(
+            &http,
+            &token,
+            &bases,
+            target,
+            0,
+            json!({ "content": chunk }),
+        )
+        .await?;
     }
     // 被动回复的 msg_id 已被首个文本泡用掉；其后的媒体和失败兜底一律走
     // 主动消息，否则平台会拒绝重复的 msg_id。
@@ -465,6 +485,171 @@ pub async fn send(
         }
     }
     Ok(())
+}
+
+pub(crate) async fn send_choices(
+    ep: Option<&ChannelEndpoint>,
+    env: &NativePayload,
+    text: &str,
+    buttons: &[(String, String)],
+) -> Result<Option<String>> {
+    let Some(ep) = ep else {
+        return Ok(None);
+    };
+    let Some((app_id, secret)) = credentials(ep) else {
+        return Err(Error::msg("qq send: missing credentials"));
+    };
+    let http = crate::llm_http::env_aware_client(20, TOKEN_URL)?;
+    let token = access_token(&http, &app_id, &secret).await?;
+    let bases = api_bases(ep);
+    let path = messages_path(env)?;
+    let seq = MSG_SEQ.fetch_add(1, Ordering::Relaxed);
+    let mut body = json!({
+        "content": clip_qq(text),
+        "msg_type": 0,
+        "msg_seq": seq,
+        "keyboard": qq_keyboard(buttons),
+    });
+    if let Some(id) = env.meta.get("msg_id").and_then(Value::as_str) {
+        body["msg_id"] = json!(id);
+    }
+    let data = post_first_ok(&http, &token, &bases, &path, &body).await?;
+    Ok(parse_qq_message_id(&data))
+}
+
+pub(crate) async fn settle_choices(
+    ep: Option<&ChannelEndpoint>,
+    env: &NativePayload,
+    message_id: &str,
+    summary: &str,
+) -> Result<()> {
+    let _ = (ep, env, message_id);
+    // QQ C2C/group messages cannot reliably drop an inline keyboard after
+    // the fact; the follow-up ack already tells the user who picked what.
+    let _ = summary;
+    Ok(())
+}
+
+fn qq_keyboard(buttons: &[(String, String)]) -> Value {
+    let rows: Vec<Value> = buttons
+        .iter()
+        .map(|(id, label)| {
+            json!({
+                "buttons": [{
+                    "id": id,
+                    "render_data": {
+                        "label": clip_qq(label),
+                        "visited_label": clip_qq(label),
+                        "style": 1
+                    },
+                    "action": {
+                        "type": 2,
+                        "permission": { "type": 2 },
+                        "data": id,
+                        "unsupport_tips": "请升级QQ客户端"
+                    }
+                }]
+            })
+        })
+        .collect();
+    json!({ "content": { "rows": rows } })
+}
+
+fn parse_qq_message_id(data: &Value) -> Option<String> {
+    for key in ["id", "message_id", "msg_id"] {
+        let s = js_str(&data[key]);
+        if !s.is_empty() {
+            return Some(s);
+        }
+        let s = js_str(&data["data"][key]);
+        if !s.is_empty() {
+            return Some(s);
+        }
+    }
+    None
+}
+
+fn native_from_interaction(ep: &ChannelEndpoint, d: &Value) -> Option<NativePayload> {
+    let choice = first_str(&[
+        &d["data"]["resolved"]["button_data"],
+        &d["data"]["resolved"]["button_id"],
+        &d["data"]["button_data"],
+        &d["data"]["id"],
+    ]);
+    if choice.is_empty() {
+        return None;
+    }
+    let scene = js_str(&d["scene"]).to_ascii_lowercase();
+    let chat_type = js_str(&d["chat_type"]);
+    let is_group = scene == "group" || chat_type == "1" || !js_str(&d["group_openid"]).is_empty();
+    let sender = first_str(&[
+        &d["user_openid"],
+        &d["data"]["resolved"]["user_openid"],
+        &d["author"]["user_openid"],
+        &d["author"]["id"],
+    ]);
+    if sender.is_empty() {
+        return None;
+    }
+    let group = js_str(&d["group_openid"]);
+    let mut env = NativePayload {
+        channel: if ep.kind.is_empty() {
+            "qq".into()
+        } else {
+            ep.kind.clone()
+        },
+        sender_id: sender.clone(),
+        sender_name: String::new(),
+        content_parts: vec![ContentPart::text(&choice)],
+        text: choice,
+        ..NativePayload::default()
+    };
+    env.meta.insert(
+        "message_type".into(),
+        json!(if is_group { "group" } else { "c2c" }),
+    );
+    env.meta.insert("is_group".into(), json!(is_group));
+    env.meta.insert("is_mentioned".into(), json!(true));
+    env.mark_choice_click();
+    if !group.is_empty() {
+        env.meta.insert("group_openid".into(), json!(group));
+    }
+    env.meta.insert("user_openid".into(), json!(sender));
+    Some(env)
+}
+
+async fn ack_interaction(
+    http: &reqwest::Client,
+    token: &str,
+    bases: &[String],
+    id: &str,
+) -> Result<()> {
+    let mut last = Error::msg("qq interaction ack failed");
+    for base in bases {
+        let url = format!("{base}/interactions/{id}");
+        let resp = match http
+            .put(&url)
+            .header("Authorization", format!("QQBot {token}"))
+            .json(&json!({ "code": 0 }))
+            .send()
+            .await
+        {
+            Ok(r) => r,
+            Err(e) => {
+                last = e.into();
+                continue;
+            }
+        };
+        if resp.status().is_success() {
+            return Ok(());
+        }
+        last = Error::msg(format!(
+            "qq interaction ack {} {}",
+            resp.status(),
+            resp.text().await.unwrap_or_default()
+        ));
+    }
+    Err(last)
 }
 
 const TYPING_DEBOUNCE: Duration = Duration::from_secs(50);
@@ -827,5 +1012,33 @@ mod tests {
             "GROUP_MESSAGE_CREATE",
             &json!({"content": "删掉这个"})
         ));
+    }
+
+    #[test]
+    fn keyboard_and_interaction_choice() {
+        let kb = qq_keyboard(&[("p:abcd1234:1".into(), "允许".into())]);
+        assert_eq!(
+            kb["content"]["rows"][0]["buttons"][0]["action"]["data"],
+            "p:abcd1234:1"
+        );
+        let ep = ChannelEndpoint {
+            kind: "qq".into(),
+            ..ChannelEndpoint::default()
+        };
+        let env = native_from_interaction(
+            &ep,
+            &json!({
+                "id": "i1",
+                "scene": "group",
+                "group_openid": "g1",
+                "user_openid": "u9",
+                "data": { "resolved": { "button_data": "p:abcd1234:1" } }
+            }),
+        )
+        .unwrap();
+        assert_eq!(env.query_text(), "p:abcd1234:1");
+        assert!(env.is_choice_click());
+        assert!(env.is_group());
+        assert_eq!(env.sender_id, "u9");
     }
 }

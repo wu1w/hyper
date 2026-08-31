@@ -105,7 +105,7 @@ Cron / 心跳 / 频道入站也是 **主机定时器或适配器** 去调 `turn.
 ## 会话与状态
 
 - 会话文件：`~/.grok-hyper/sessions/<id>.jsonl`
-- IM 控件：`~/.grok-hyper/sessions/<id>.controls.json`（plan / clarify / approvals / always-allow）
+- IM 控件：`~/.grok-hyper/sessions/<id>.controls.json`（plan / clarify / approvals / always-allow / model / owner）
 - 配置：`~/.grok-hyper/config.toml`（`hyper web` 只认这个文件，不认 `HYPER_*`）
 - probe：`~/.grok-hyper/probe.json`
 - 控制台上次工作区：`[console] workspace`
@@ -136,6 +136,8 @@ Web 启动时：若 CLI 没传 `--workspace`，用配置里的路径；路径不
 ## 频道与插件
 
 `hyper-loop::channel` 把 QQ / 飞书 / Telegram / 微信 / 企微 / 钉钉 / webhook 收成同一套 mailbox（目录里只有这些 `in_process` 入口）。凭证在配置里，控制台 **频道** 页编辑。适配器任务退出、panic 或 poll lock 冲突后会指数退避再拉起，pill 显示「重试中」而不是「连接错误」。`hyper web` 与 `hyper --channels` 对同一 bot 互斥（poll lock）。无头进程级保活见 `contrib/systemd/hyper-web.service`（请用 **user unit**，不要以 root 原样 enable）。桌面 Electron 在 `hyper web` 退出后会退避再拉起。IM 进度走 `EventSink` 聚合，不改 `drive()` / 工具 JSON / xhigh。终稿先写 durable outbox；坏掉的 pending JSON 进 `quarantine/`，不再永远 skip。
+
+Web 与 CLI 共用一个 `SessionRouter` + `ChannelManager`：同一会话不会被两个平台同时 resume 成两套 agent。群聊 route 默认 per-user（可带 forum topic / 飞书 thread）；`/approvals` `/plan` `/stop` 等控制项只认会话 owner。AskQuestion / Permit 按 prompt id 排队（FIFO、15 分钟 TTL、过期点击有回复）；选完后飞书 / Telegram 卡片保留原问题并标出选择者。IM 控制面含 `/model` `/compact` `/undo` `/usage` `/background`；`/new <title>` 会写入 session meta。QQ / 钉钉 / 企微 / webhook 审批走原生按钮（微信 iLink 仍回复序号）。
 
 `hyper --sidecar` 是 newline JSON-RPC（stdio）。dsh 插件和 VS Code 扩展只翻译 UI 事件，**禁止**再开一套工具循环。见 `plugins/dsh-plugin-hyper/README.md`、`plugins/vscode-hyper/README.md`。这不是 Cursor.app 那种 VS Code fork：agent 可以住在编辑器侧栏里，工具循环仍是同一份 `hyper --sidecar`。安装：`hyper vscode-install`。
 

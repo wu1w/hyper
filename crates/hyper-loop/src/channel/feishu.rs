@@ -291,9 +291,9 @@ pub(crate) async fn send_choices(
     env: &NativePayload,
     text: &str,
     buttons: &[(String, String)],
-) -> Result<()> {
+) -> Result<Option<String>> {
     let Some(ep) = ep else {
-        return Ok(());
+        return Ok(None);
     };
     let Some((app_id, secret)) = credentials(ep) else {
         return Err(Error::msg("feishu send: missing credentials"));
@@ -301,9 +301,55 @@ pub(crate) async fn send_choices(
     let base = open_base(ep);
     let http = crate::llm_http::env_aware_client(30, base)?;
     let card = feishu_choice_card(text, buttons);
-    send_im(&http, env, base, &app_id, &secret, "interactive", card)
-        .await
-        .map(|_| ())
+    let id = send_im(&http, env, base, &app_id, &secret, "interactive", card).await?;
+    Ok(if id.is_empty() { None } else { Some(id) })
+}
+
+pub(crate) async fn settle_choices(
+    ep: Option<&ChannelEndpoint>,
+    _env: &NativePayload,
+    message_id: &str,
+    summary: &str,
+) -> Result<()> {
+    let Some(ep) = ep else {
+        return Ok(());
+    };
+    let Some((app_id, secret)) = credentials(ep) else {
+        return Ok(());
+    };
+    let base = open_base(ep);
+    let Ok(http) = crate::llm_http::env_aware_client(15, base) else {
+        return Ok(());
+    };
+    let card = json!({
+        "config": { "wide_screen_mode": true },
+        "elements": [
+            { "tag": "div", "text": { "tag": "lark_md", "content": summary } },
+        ]
+    });
+    let content = serde_json::to_string(&card).unwrap_or_else(|_| "{}".into());
+    let body = json!({
+        "msg_type": "interactive",
+        "content": content,
+    });
+    let token = tenant_token(&http, base, &app_id, &secret).await?;
+    let url = patch_url(base, message_id);
+    let resp = http
+        .put(&url)
+        .header("Authorization", format!("Bearer {token}"))
+        .json(&body)
+        .send()
+        .await?;
+    let status = resp.status();
+    let data: Value = resp.json().await.unwrap_or(Value::Null);
+    let code = data.get("code").and_then(Value::as_i64).unwrap_or(-1);
+    if status.is_success() && code == 0 {
+        return Ok(());
+    }
+    Err(Error::msg(format!(
+        "feishu settle choice HTTP {status} code={code} msg={}",
+        js_str(&data["msg"])
+    )))
 }
 
 fn feishu_choice_card(text: &str, buttons: &[(String, String)]) -> Value {
@@ -1747,6 +1793,7 @@ async fn send_im(
             "msg_type": msg_type,
             "content": content,
             "uuid": stable_uuid,
+            "reply_in_thread": env.thread_id().is_some(),
         })
     } else {
         let receive_id = receive_id(env, &id_type);
@@ -1758,6 +1805,7 @@ async fn send_im(
             "msg_type": msg_type,
             "content": content,
             "uuid": stable_uuid,
+            "reply_in_thread": env.thread_id().is_some(),
         })
     };
     let mut last = Error::msg("feishu send failed");
@@ -1917,6 +1965,10 @@ fn native_from_card_action(ep: &ChannelEndpoint, v: &Value) -> Option<NativePayl
     env.meta
         .insert("receive_id_type".into(), json!(receive_id_type));
     env.meta.insert("receive_id".into(), json!(receive_id));
+    let root = first_str(&[&event["message"]["root_id"], &event["context"]["root_id"]]);
+    if !root.is_empty() {
+        env.stamp_thread(&root);
+    }
     Some(env)
 }
 
@@ -2001,6 +2053,14 @@ fn native_from_event(ep: &ChannelEndpoint, event: &Value) -> Option<NativePayloa
         .insert("receive_id_type".into(), json!(receive_id_type));
     env.meta.insert("receive_id".into(), json!(receive_id));
     env.meta.insert("is_mentioned".into(), json!(mentioned));
+    let root = js_str(&message["root_id"]);
+    let thread = js_str(&message["thread_id"]);
+    if !root.is_empty() {
+        env.stamp_thread(&root);
+        env.meta.insert("root_id".into(), json!(root));
+    } else if !thread.is_empty() {
+        env.stamp_thread(&thread);
+    }
     let obj = parse_content_obj(&message["content"]);
     let image_key = js_str(&obj["image_key"]);
     let file_key = js_str(&obj["file_key"]);
@@ -2713,6 +2773,25 @@ mod tests {
         assert_eq!(env.meta["receive_id"], json!("oc_group"));
         assert_eq!(env.meta["is_mentioned"], json!(true));
         assert_eq!(receive_id(&env, "chat_id"), "oc_group");
+        let threaded = json!({
+            "event": {
+                "header": {"event_type": "im.message.receive_v1"},
+                "sender": {"sender_id": {"open_id": "ou_2"}, "sender_type": "user", "name": "Will"},
+                "message": {
+                    "message_id": "om_t",
+                    "root_id": "om_root",
+                    "thread_id": "omt_1",
+                    "chat_id": "oc_group",
+                    "chat_type": "group",
+                    "message_type": "text",
+                    "content": {"text": "in thread"},
+                    "mentions": [{"id": {"open_id": "ou_bot"}}]
+                }
+            }
+        });
+        let env = native_from_envelope(&ep, &threaded).unwrap();
+        assert_eq!(env.thread_id().as_deref(), Some("om_root"));
+        assert!(env.route_key().contains(":t:om_root:u:ou_2"));
     }
 
     #[test]
