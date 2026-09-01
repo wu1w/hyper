@@ -2,11 +2,13 @@
 
 未发版之前以 git log 为准。下面记用户能看见的行为变化。
 
+- 跟进轮对齐 Cursor / grok CLI：compact 优先留下 Write/StrReplace 过的文件，不再只留 Glob/Read 头尾；`[history]` 默认只带本场归档，邻座会话要用户问起才贴；控制台撞步数/时间墙也留一跳收口，方便下一轮接着写。
+- 巡检门对齐 Cursor / grok CLI：`tools[]` 中途不卸。连续只读只催原生 Write，再只读则跳过并回 `[already observed]`，下一跳仍可 Write。泄露旁白不当终稿，也不进 `[history]` / Decisions。步数墙才是硬停。
 - 空跳不再当成功结束：无正文、无工具、无 usage 先重试一次；仍空则收口一跳，再空则给「没有可见回复」兜底（控制台也会，不再交空白气泡）
 - Glob / Shell 只拦工作区根上的无过滤递归扫；`**/*` 给一份顶层样本（跳过 vendor / 嵌套 `release` / `out` / `unpacked`），不再空手训一通。带扩展名的会真扫，满 200 条截断；`target_directory` 指到文件时直接报错
 - Grep 默认不扫打包目录（显式 `path` 进该目录仍可搜）。重复 / 近义 pattern 会折；目录级风暴上限 12 次，与 Search 是否挂上无关；单文件 Grep 不占名额
-- 连续 3 跳低新意，或连续 10 跳只巡检（Read/Grep/Glob…，Write 会重置），下一跳收起工具作答（`no_progress_synthesized`），而不是空正文结束
-- 强制收尾：`effort=low`，Grok 用 `max_output_tokens`（思考+正文合计 2816）封顶，思考通道不再实时铺进聊天；空正文 / 撞上限 / 漏工具只做一次收紧重试（2048，不再扩回 8192）。llama.cpp 仍另切 768 本地思考上限
+- 连续 3 跳低新意，或连续 10 跳只巡检（Read/Grep/Glob…，Write 会重置），催原生 Write；再只读则跳过并回 `[already observed]`，`tools[]` 不卸
+- 思考撞上限：软提醒后按原推理模式给一次更宽重试，不关 thinking。空正文先收口一跳（工具仍在），再空则「没有可见回复」
 - ReadLints：超时 / 没跑 checker 不再报「没有编译错误」；超时也不再标成工具 Error，会说明「不是编译结论」。tsc 从文件向上找最近的 tsconfig.json（例如 `web/console`）
 - `view` 未挂进 tools[] 时幻觉调用返回 unknown；Read 图片/音视频会直接加载，不再指向未挂载的 view
 - `ComputerUse` 未进冻结 17（`features.computer_use` 未开）时幻觉调用返回 unknown，不再真去控桌面；Ask 也不会先弹审批

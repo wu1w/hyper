@@ -512,10 +512,15 @@ pub struct Agent<C> {
     physics_nudged: bool,
     /// Empty toolless hop already got one wrap-up. Second blank → fallback text.
     channel_nudged: bool,
-    /// Next model hop has tools=None so the model must answer from evidence.
+    /// Physics/IM wrap hop: tools=None so the model must answer from evidence.
+    /// Inspect-cap uses `write_hold` instead and keeps `tools[]` mounted.
     force_synthesis: bool,
     /// One leaked-tool retry already used on the synthesis hop.
     synthesis_recovered: bool,
+    /// Write-nudges used this user turn. Inspect-cap never unmounts `tools[]`.
+    write_nudge_count: u32,
+    /// Last hop was a write-nudge; inspect-only calls are not executed.
+    write_hold: bool,
     /// Result-hash / path novelty across recent tool hops this user turn.
     progress: progress::ProgressTracker,
     /// Last official xAI compaction item (opaque). Next Responses `input` should

@@ -217,6 +217,8 @@ impl<C: Completer> Agent<C> {
             channel_nudged: false,
             force_synthesis: false,
             synthesis_recovered: false,
+            write_nudge_count: 0,
+            write_hold: false,
             progress: super::progress::ProgressTracker::default(),
             official_compaction: None,
             xai_compact: opts.xai_compact,

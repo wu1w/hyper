@@ -2,7 +2,8 @@
 //! consecutive identical fingerprints, so DoomLoopGate never sees them.
 //!
 //! Hyper does not decide "is the task done?". It decides whether another
-//! tool hop would add evidence. If not, the next model hop has tools=None.
+//! inspect hop would add evidence. If not, keep the frozen Cursor `tools[]`
+//! mounted and nudge toward native Write / StrReplace / Task.
 
 use std::collections::{BTreeSet, HashMap, HashSet, VecDeque};
 
@@ -17,10 +18,9 @@ use super::dispatch::canon_ws_path;
 
 pub const HOP_HISTORY: usize = 8;
 pub const LOW_STREAK: u32 = 3;
-/// Consecutive inspect-only hops (Read/Grep/Glob/…) before forcing a
-/// synthesis hop. Writes reset this. High enough that a real edit can still
-/// read a handful of files first; low enough that an audit cannot wander
-/// through the tree until the context fills.
+/// Consecutive inspect-only hops (Read/Grep/Glob/…) before a write-nudge.
+/// Writes reset this. High enough that a real edit can still read a handful
+/// of files first; low enough that an audit cannot wander the tree.
 pub const INSPECT_STREAK: u32 = 10;
 pub const NOVELTY_FLOOR: f32 = 0.15;
 
@@ -32,9 +32,24 @@ pub const FORCED_SYNTHESIS_NOTE: &str = "\
 Do not call tools. Answer the user now using the evidence already collected. \
 State remaining uncertainty explicitly.";
 
+/// Trajectory nudge: keep the frozen Cursor `tools[]` mounted. Do not treat
+/// this as tools=None. The next hop must be native Write / StrReplace / Task,
+/// or a finished answer with no tools.
+pub const WRITE_NOW_NOTE: &str = "\
+[trajectory] Further inspection is not adding enough new evidence. \
+Do not Read, Grep, or Glob again. Emit native Write / StrReplace / Task \
+tool calls now — not JSON, HTML fences, or narration. \
+If the work is done, answer without tools.";
+
 pub const ALREADY_OBSERVED_MSG: &str = "\
 [already observed]\nThis exact content was returned earlier this turn.\n\
 No new evidence was added.\nUse the existing result or answer now.";
+
+/// Skip result for inspect-only hops after the write-nudge. Cursor keeps
+/// `tools[]` mounted; the model still sees a paired tool result.
+pub const INSPECT_SKIP_MSG: &str = "\
+[already observed]\nInspection is not adding enough new evidence this turn.\n\
+Do not Read, Grep, or Glob again. Call Write, StrReplace, or Task, or answer now.";
 
 #[derive(Clone, Debug, Default)]
 pub struct ProgressDelta {
@@ -92,8 +107,16 @@ impl ProgressTracker {
         self.synthesize
     }
 
+    /// A recovered Write / Task is progress. Do not keep the inspect-skip hold
+    /// for the rest of the turn after the model finally mutates the workspace.
+    pub fn clear_synthesis(&mut self) {
+        self.synthesize = false;
+        self.inspect_streak = 0;
+        self.low_streak = 0;
+    }
+
     /// Fold repeated blobs, count novelty, then decide whether the next hop
-    /// should run without tools.
+    /// should skip further inspection (tools stay mounted).
     pub fn fold_and_observe(
         &mut self,
         ws: &Workspace,
@@ -202,6 +225,8 @@ impl ProgressTracker {
             self.inspect_streak = self.inspect_streak.saturating_add(1);
         } else if !inspect {
             self.inspect_streak = 0;
+            self.low_streak = 0;
+            self.synthesize = false;
         }
         if self.low_streak >= LOW_STREAK || self.inspect_streak >= INSPECT_STREAK {
             self.synthesize = true;
@@ -302,23 +327,24 @@ fn is_gate_or_nudge(body: &str) -> bool {
         || body.contains("similar pattern this turn")
 }
 
+pub fn is_mutating_dispatch(name: &str) -> bool {
+    matches!(
+        dispatch_name(name),
+        "write"
+            | "edit"
+            | "delete"
+            | "editnotebook"
+            | "generateimage"
+            | "ask"
+            | "switchmode"
+            | "task"
+            | "computeruse"
+            | "calldynamictool"
+    )
+}
+
 fn hop_is_inspect(calls: &[ToolCall]) -> bool {
-    !calls.is_empty()
-        && calls.iter().all(|c| {
-            !matches!(
-                dispatch_name(&c.name),
-                "write"
-                    | "edit"
-                    | "delete"
-                    | "editnotebook"
-                    | "generateimage"
-                    | "ask"
-                    | "switchmode"
-                    | "task"
-                    | "computeruse"
-                    | "calldynamictool"
-            )
-        })
+    !calls.is_empty() && calls.iter().all(|c| !is_mutating_dispatch(&c.name))
 }
 
 fn already_observed_text(hop: u32) -> String {
@@ -517,5 +543,29 @@ mod tests {
             t.low_streak += 1;
         }
         assert_eq!(t.low_streak, 0);
+    }
+
+    #[test]
+    fn write_clears_forced_synthesis() {
+        let dir = std::env::temp_dir().join(format!(
+            "hyper-prog-write-{}",
+            uuid::Uuid::new_v4().simple()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("a.rs"), "fn ping() {}\n").unwrap();
+        let ws = Workspace::open(&dir, true).unwrap();
+        let mut t = ProgressTracker::default();
+        t.inspect_streak = INSPECT_STREAK;
+        t.synthesize = true;
+        assert!(t.should_synthesize());
+        let write = ToolCall {
+            id: "w".into(),
+            name: "Write".into(),
+            arguments: serde_json::json!({"path": "a.rs", "contents": "fn ping() { 1 }\n"}),
+        };
+        let mut wresp = [ToolResponse::text("w", "wrote a.rs", ToolState::Success)];
+        t.fold_and_observe(&ws, &[write], &mut wresp, false, false, None);
+        assert!(!t.should_synthesize());
+        let _ = std::fs::remove_dir_all(dir);
     }
 }

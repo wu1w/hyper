@@ -10,10 +10,10 @@ use crate::channel::take_steer;
 use crate::error::Result;
 use crate::paw_loop::{fs_tool_path, GateCtx, GateDecision, ToolFingerprint};
 use crate::policy::ThinkPolicy;
-use crate::session::{PolicyReason, RunPhase, SessionEvent, StepPhase};
+use crate::session::{PolicyReason, RunPhase, SessionEvent, StepPhase, ToolLifecyclePhase};
 use crate::sticky;
 use crate::template::{is_hidden_user_text, wrap_tool_response, ChatMessage};
-use crate::tool_calls::{ToolCall, ToolState};
+use crate::tool_calls::{ToolCall, ToolResponse, ToolState};
 use crate::tools_schema::dispatch_name;
 
 impl<C: Completer> Agent<C> {
@@ -59,6 +59,8 @@ impl<C: Completer> Agent<C> {
         self.channel_nudged = false;
         self.force_synthesis = false;
         self.synthesis_recovered = false;
+        self.write_nudge_count = 0;
+        self.write_hold = false;
         self.progress.reset();
         self.last_spoken = None;
         self.tool_evidence.clear();
@@ -232,7 +234,18 @@ impl<C: Completer> Agent<C> {
                     turn.content.clear();
                 }
             }
-
+            if !self.force_synthesis
+                && turn.tool_calls.is_empty()
+                && crate::stutter::is_leaked_write_narration(&turn.content)
+            {
+                self.drop_speculate();
+                self.arm_write_nudge("leaked write intent");
+                if self.write_nudge_count > 1 {
+                    turn.content.clear();
+                } else {
+                    continue;
+                }
+            }
             if !turn.reasoning.is_empty()
                 && self.print
                 && !self.stdio.think_streamed()
@@ -274,14 +287,30 @@ impl<C: Completer> Agent<C> {
             }
 
             if self.force_synthesis {
-                let leaked_json = lift_leaked_tool_json(&turn.content);
-                if leaked_json.is_some() {
-                    turn.content.clear();
+                if let Some(calls) = lift_leaked_tool_json(&turn.content) {
+                    if calls
+                        .iter()
+                        .any(|c| super::progress::is_mutating_dispatch(&c.name))
+                    {
+                        turn.tool_calls = calls
+                            .into_iter()
+                            .filter(|c| super::progress::is_mutating_dispatch(&c.name))
+                            .collect();
+                        turn.content.clear();
+                    }
                 }
-                let leaked = !turn.tool_calls.is_empty() || leaked_json.is_some();
-                turn.tool_calls.clear();
-                turn.raw_tool_calls = None;
-                if leaked {
+                let (mutating, inspect_leak) = split_mutating(std::mem::take(&mut turn.tool_calls));
+                if !mutating.is_empty() {
+                    // Implementation finally arrived after an inspect cap.
+                    // Execute it; do not strip Write/Task the way we strip a
+                    // leaked Read on the wrap hop.
+                    turn.tool_calls = mutating;
+                    turn.raw_tool_calls = None;
+                    self.force_synthesis = false;
+                    self.progress.clear_synthesis();
+                } else if inspect_leak {
+                    turn.tool_calls.clear();
+                    turn.raw_tool_calls = None;
                     self.push_assistant(&turn);
                     if self.retry_synthesis_once("synthesis leaked tools") {
                         continue;
@@ -292,29 +321,36 @@ impl<C: Completer> Agent<C> {
                         Some(super::progress::STOP_NO_PROGRESS_EMPTY.into()),
                         steps,
                     );
-                }
-                if !crate::stutter::is_substantial_reply(&turn.content)
-                    && self.retry_synthesis_once("synthesis empty wrap")
-                {
-                    // Grok Responses clips on max_output_tokens without
-                    // watchdog_hit. Do not commit scratch think as an answer.
+                } else if crate::stutter::is_leaked_write_narration(&turn.content) {
+                    self.arm_write_nudge("synthesis leaked write intent");
+                    self.drop_speculate();
                     continue;
-                }
-                self.push_assistant(&turn);
-                self.drop_speculate();
-                if crate::stutter::is_substantial_reply(&turn.content) {
-                    self.last_spoken = Some(turn.content.clone());
+                } else {
+                    turn.tool_calls.clear();
+                    turn.raw_tool_calls = None;
+                    if !crate::stutter::is_substantial_reply(&turn.content)
+                        && self.retry_synthesis_once("synthesis empty wrap")
+                    {
+                        // Grok Responses clips on max_output_tokens without
+                        // watchdog_hit. Do not commit scratch think as an answer.
+                        continue;
+                    }
+                    self.push_assistant(&turn);
+                    self.drop_speculate();
+                    if crate::stutter::is_substantial_reply(&turn.content) {
+                        self.last_spoken = Some(turn.content.clone());
+                        return self.finish(
+                            turn.content,
+                            Some(super::progress::STOP_NO_PROGRESS_SYNTHESIZED.into()),
+                            steps,
+                        );
+                    }
                     return self.finish(
-                        turn.content,
-                        Some(super::progress::STOP_NO_PROGRESS_SYNTHESIZED.into()),
+                        self.last_spoken.clone().unwrap_or_default(),
+                        Some(super::progress::STOP_NO_PROGRESS_EMPTY.into()),
                         steps,
                     );
                 }
-                return self.finish(
-                    self.last_spoken.clone().unwrap_or_default(),
-                    Some(super::progress::STOP_NO_PROGRESS_EMPTY.into()),
-                    steps,
-                );
             }
 
             self.emit_tools_scheduled(&turn.tool_calls);
@@ -328,7 +364,7 @@ impl<C: Completer> Agent<C> {
                 match &decision {
                     GateDecision::Stop { reason } if is_physics_stop(reason) => {
                         self.note(reason);
-                        self.pending_stop = Some(String::new());
+                        self.pending_stop = Some(reason.clone());
                     }
                     GateDecision::Stop { reason } if !reason.is_empty() => {
                         self.pending_stop = Some(reason.clone());
@@ -336,11 +372,20 @@ impl<C: Completer> Agent<C> {
                     _ => {}
                 }
                 let calls = std::mem::take(&mut turn.tool_calls);
-                self.settle_code_index().await;
-                let should_synth = self.execute_tools(calls).await;
-                if should_synth && !self.force_synthesis {
-                    self.force_synthesis = true;
-                    self.push_hidden_user(super::progress::FORCED_SYNTHESIS_NOTE);
+                // Cursor: keep tools[] mounted. Extra Read/Grep/Glob after the
+                // inspect nudge get a paired skip result; Write still runs.
+                // Gate already ran, so max-steps / identical-call still bind.
+                if self.write_hold && hop_is_inspect_only(&calls) {
+                    self.skip_held_inspect(&calls);
+                } else {
+                    if !hop_is_inspect_only(&calls) {
+                        self.write_hold = false;
+                    }
+                    self.settle_code_index().await;
+                    let should_synth = self.execute_tools(calls).await;
+                    if should_synth && !self.force_synthesis {
+                        self.arm_write_nudge("inspect cap");
+                    }
                 }
                 self.drop_speculate();
                 self.flush_steer();
@@ -633,6 +678,37 @@ impl<C: Completer> Agent<C> {
         true
     }
 
+    /// Cursor keeps the frozen `tools[]` mounted. Inspect-cap / leaked
+    /// Write-as-prose is a trajectory nudge, never `tools=None`.
+    fn arm_write_nudge(&mut self, why: &str) {
+        self.write_hold = true;
+        self.force_synthesis = false;
+        self.progress.clear_synthesis();
+        self.write_nudge_count = self.write_nudge_count.saturating_add(1);
+        if self.write_nudge_count == 1 {
+            self.note(&format!("[trajectory] {why}; tools stay mounted"));
+            self.push_hidden_user(super::progress::WRITE_NOW_NOTE);
+        } else {
+            self.note(&format!("[trajectory] {why}; inspect skipped, tools stay"));
+        }
+    }
+
+    fn skip_held_inspect(&mut self, calls: &[ToolCall]) {
+        for call in calls {
+            let response = ToolResponse::text(
+                call.id.clone(),
+                super::progress::INSPECT_SKIP_MSG,
+                ToolState::Success,
+            );
+            self.commit_tool(&call.name, response);
+            self.emit_tool_lifecycle(
+                call,
+                ToolLifecyclePhase::Skipped,
+                Some("inspection skipped; write or answer".into()),
+            );
+        }
+    }
+
     fn drop_speculate(&mut self) {
         self.completer.set_speculate(None);
         if let Some(slot) = self.speculate.take() {
@@ -640,13 +716,15 @@ impl<C: Completer> Agent<C> {
         }
     }
 
-    /// Hermes contract: a turn is not done until there is user-visible text.
-    /// One toolless hop (like `handle_max_iterations`), IM/unattended only.
+    /// Physics cap: one recap hop on every surface so follow-up compact has
+    /// Decisions (Cursor / grok CLI keep a visible end-of-turn). Empty-visible
+    /// wrap stays IM-only; the console uses `needs_channel_rescue`.
     fn arm_im_wrap_up(&mut self, spoken: &str, reason: &str) -> bool {
         if self.physics_nudged || !spoken.trim().is_empty() {
             return false;
         }
-        if super::interactive_channel(&self.channel) || self.channel.is_empty() {
+        let physics = is_physics_stop(reason);
+        if !physics && (super::interactive_channel(&self.channel) || self.channel.is_empty()) {
             return false;
         }
         self.physics_nudged = true;
@@ -974,6 +1052,26 @@ pub(crate) fn is_physics_stop(reason: &str) -> bool {
 /// Cursor identical-call halt. Ends the turn without a `[trajectory]` lecture.
 pub(crate) fn is_quiet_repeat_stop(reason: &str) -> bool {
     reason.starts_with(crate::paw_loop::REPEAT_STOP)
+}
+
+fn hop_is_inspect_only(calls: &[ToolCall]) -> bool {
+    !calls.is_empty()
+        && calls
+            .iter()
+            .all(|c| !super::progress::is_mutating_dispatch(&c.name))
+}
+
+fn split_mutating(calls: Vec<ToolCall>) -> (Vec<ToolCall>, bool) {
+    let mut mutating = Vec::new();
+    let mut inspect_leak = false;
+    for call in calls {
+        if super::progress::is_mutating_dispatch(&call.name) {
+            mutating.push(call);
+        } else {
+            inspect_leak = true;
+        }
+    }
+    (mutating, inspect_leak)
 }
 
 /// Grok sometimes paints a Write/StrReplace as a JSON fence instead of a

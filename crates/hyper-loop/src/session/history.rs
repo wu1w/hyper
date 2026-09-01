@@ -1,16 +1,20 @@
-//! Cross-session (and compacted in-session) recap card.
+//! This-chat archive card, plus on-demand recall of other sessions.
 //!
 //! Frozen Cursor `tools[]` must not gain `recall` / `memory_search`. This is a
-//! hidden `[history]` user card, same shape as `[workset]`.
+//! hidden `[history]` user card, same shape as `[workset]`. Cursor / grok CLI
+//! keep the live session as context; sibling recaps are not pasted unless the
+//! user asks to recall.
 
+use std::collections::HashSet;
 use std::fs;
 use std::path::Path;
 
 use crate::memory::MemoryStore;
 use crate::session::catalog;
-use crate::session::event::{SessionEvent, SessionStart};
+use crate::session::event::{OpenAiToolCall, SessionEvent, SessionStart};
 use crate::session::index::HistoryIndex;
 use crate::template::is_hidden_user_text;
+use crate::tools_schema::dispatch_name;
 
 const CARD_MAX: usize = 2000;
 const SIBLINGS: usize = 4;
@@ -55,10 +59,21 @@ pub fn card(
     recaps: Option<&MemoryStore>,
     current_events: Option<&[SessionEvent]>,
 ) -> Option<String> {
-    let archived = current_events
+    let mut archived = current_events
         .map(|ev| archived_spoken(ev, ARCHIVED))
         .unwrap_or_default();
-    let siblings = sibling_rows(session_dir, current_id, workspace, recaps);
+    if let Some(ev) = current_events {
+        if let Some(changed) = archived_changed_files(ev) {
+            archived.push(changed);
+        }
+    }
+    // Cursor / grok CLI: the live session is the context. Other chats are
+    // not pasted in unless the user asks to recall.
+    let siblings = if wants_recall_search(query) {
+        sibling_rows(session_dir, current_id, workspace, recaps)
+    } else {
+        Vec::new()
+    };
     let hits = if wants_recall_search(query) {
         fts_rows(session_dir, current_id, workspace, query, &siblings)
     } else {
@@ -69,7 +84,19 @@ pub fn card(
     }
 
     let mut out = String::from("[history]\n");
-    if query.chars().any(is_cjk) {
+    if siblings.is_empty() && hits.is_empty() {
+        if query.chars().any(is_cjk) {
+            out.push_str(
+                "本场已压缩的结论。不是当前这条用户消息。\
+不要 Read ~/.grok-hyper/sessions 下的 JSONL，也不要读 sessions/.current。\n",
+            );
+        } else {
+            out.push_str(
+                "This chat's archived conclusions. Not the live user turn. \
+Do not Read ~/.grok-hyper/sessions JSONL or sessions/.current.\n",
+            );
+        }
+    } else if query.chars().any(is_cjk) {
         out.push_str(
             "同一工作区里其他会话的摘要，以及本场已压缩的结论。不是当前这条用户消息。\
 不要 Read ~/.grok-hyper/sessions 下的 JSONL，也不要读 sessions/.current。\n",
@@ -180,7 +207,11 @@ fn sibling_rows(
         let spoken = recap_clip(recaps, &id)
             .or_else(|| tail.as_ref().and_then(|t| t.assistant.clone()))
             .unwrap_or_default();
-        let spoken = clip_text(spoken.trim(), CLIP);
+        let spoken = if crate::stutter::is_leaked_write_narration(&spoken) {
+            String::new()
+        } else {
+            clip_text(spoken.trim(), CLIP)
+        };
         let title_src = tail
             .as_ref()
             .and_then(|t| t.user.clone())
@@ -231,7 +262,9 @@ fn fts_rows(
             if h.kind != "assistant" && h.kind != "user" {
                 continue;
             }
-            if is_session_file_noise(&h.snippet) {
+            if is_session_file_noise(&h.snippet)
+                || crate::stutter::is_leaked_write_narration(&h.snippet)
+            {
                 continue;
             }
             if siblings.iter().any(|s| s.id == h.session_id) {
@@ -384,6 +417,7 @@ fn archived_spoken(events: &[SessionEvent], limit: usize) -> Vec<String> {
                     && a.tool_calls.is_none()
                     && !turn_noise
                     && !is_session_file_noise(spoken_text)
+                    && !crate::stutter::is_leaked_write_narration(spoken_text)
                 {
                     spoken.push(spoken_text.to_string());
                 }
@@ -401,6 +435,56 @@ fn archived_spoken(events: &[SessionEvent], limit: usize) -> Vec<String> {
     }
     let skip = spoken.len().saturating_sub(limit);
     spoken.into_iter().skip(skip).collect()
+}
+
+/// Native Write / StrReplace / Delete from the archived range. Follow-up
+/// compact used to keep only Glob/Read head+tail, so this card is the
+/// Cursor-shaped "files this chat changed" recap when there was no spoken final.
+fn archived_changed_files(events: &[SessionEvent]) -> Option<String> {
+    let until = events.iter().rev().find_map(|e| match e {
+        SessionEvent::Compact(c) => Some(c.until_seq as usize),
+        _ => None,
+    })?;
+    let mut seen = HashSet::new();
+    let mut files = Vec::new();
+    for event in events.iter().take(until.saturating_add(1)) {
+        let SessionEvent::Assistant(a) = event else {
+            continue;
+        };
+        let Some(calls) = &a.tool_calls else {
+            continue;
+        };
+        for c in calls {
+            if let Some(line) = mutation_file_line(c) {
+                if seen.insert(line.clone()) {
+                    files.push(line);
+                }
+            }
+        }
+    }
+    if files.is_empty() {
+        return None;
+    }
+    Some(format!(
+        "changed files: {}",
+        clip_text(&files.join("; "), CLIP * 2)
+    ))
+}
+
+fn mutation_file_line(c: &OpenAiToolCall) -> Option<String> {
+    if !matches!(
+        dispatch_name(&c.function.name),
+        "write" | "edit" | "delete" | "editnotebook"
+    ) {
+        return None;
+    }
+    let args: serde_json::Value = serde_json::from_str(&c.function.arguments).ok()?;
+    let path = args
+        .get("path")
+        .or_else(|| args.get("file_path"))
+        .and_then(|v| v.as_str())
+        .filter(|s| !s.is_empty())?;
+    Some(format!("{} {path}", c.function.name))
 }
 
 fn wants_recall_search(user: &str) -> bool {
@@ -547,6 +631,82 @@ mod tests {
             "probe session leaked: {card}"
         );
         let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn leaked_write_narration_is_not_a_sibling_clip() {
+        let dir = tmp();
+        let ws = dir.to_string_lossy().to_string();
+        let mut sib = SessionLog::create_in(&dir, start("sib-leak", &ws, "console")).unwrap();
+        sib.append(SessionEvent::user("请继续根据工作区已有文件和设计进行开发"))
+            .unwrap();
+        sib.append(SessionEvent::assistant(
+            "I'll write files with the write tool.\n```html\n```\nThe write tool is available.",
+            "",
+            None,
+        ))
+        .unwrap();
+        let card = card(&dir, "fresh", &ws, "hello", None, None);
+        assert!(
+            card.as_deref()
+                .map(|c| !c.contains("I'll write files"))
+                .unwrap_or(true),
+            "leaked write narration in history: {card:?}"
+        );
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn continue_prompt_does_not_paste_sibling_delivery() {
+        let dir = tmp();
+        let ws = dir.to_string_lossy().to_string();
+        let mut sib = SessionLog::create_in(&dir, start("sib-done", &ws, "console")).unwrap();
+        sib.append(SessionEvent::user("继续闭环")).unwrap();
+        sib.append(SessionEvent::assistant(
+            "已补上控制面入口 cmd/boce-api，go build 已通过。",
+            "",
+            None,
+        ))
+        .unwrap();
+        let card = card(&dir, "fresh", &ws, "继续开发", None, None);
+        assert!(
+            card.as_deref()
+                .map(|c| !c.contains("cmd/boce-api") && !c.contains("go build"))
+                .unwrap_or(true),
+            "sibling delivery pasted into a continue turn: {card:?}"
+        );
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn this_chat_lists_changed_files_when_no_spoken_final() {
+        let events = vec![
+            SessionEvent::Start(start("cur", "/ws", "console")),
+            SessionEvent::user("continue"),
+            SessionEvent::assistant(
+                "",
+                "",
+                Some(vec![crate::session::event::OpenAiToolCall::function(
+                    "w",
+                    "Write",
+                    r#"{"path":"cmd/boce-api/main.go","contents":"package main"}"#,
+                )]),
+            ),
+            SessionEvent::tool("w", "Write", "Wrote 12 bytes"),
+            SessionEvent::Compact(CompactEvent {
+                until_seq: 3,
+                keep_user_seq: 4,
+                summary: "x".into(),
+                index: String::new(),
+            }),
+            SessionEvent::user("继续开发"),
+        ];
+        let empty = tmp();
+        let card =
+            card(&empty, "cur", "/ws", "继续开发", None, Some(&events)).expect("this-chat card");
+        assert!(card.contains("this chat:"), "{card}");
+        assert!(card.contains("cmd/boce-api/main.go"), "{card}");
+        let _ = std::fs::remove_dir_all(empty);
     }
 
     #[test]

@@ -42,8 +42,11 @@ pub use xai_compact::{
 };
 
 const INDEX_LINES: usize = 80;
-/// Keep the first tools as well as the latest — same shape as Current State.
+/// Keep the first tools as well as the latest — inspect-only Current State.
 const INDEX_HEAD: usize = 20;
+/// Cursor / grok CLI follow-up sees files the previous turn actually changed.
+const MUTATION_STATE_CAP: usize = 24;
+const STATE_INSPECT_WHEN_MUTATIONS: usize = 4;
 const CLIP: usize = 120;
 const ARCHIVE_CHARS: usize = 4000;
 const STATE_CAP: usize = 10;
@@ -529,7 +532,7 @@ fn merge_index(prev: &str, new: &str) -> String {
         .filter(|l| !l.is_empty() && !crate::session::history::is_session_file_noise(l))
         .collect();
     if lines.len() > INDEX_LINES {
-        lines = head_tail(lines, INDEX_LINES, INDEX_HEAD);
+        lines = prefer_mutation_index(lines);
     }
     lines.join("\n")
 }
@@ -682,11 +685,17 @@ fn extract(
                 }
                 let spoken = crate::platform_prefix::wash_message_content("assistant", &a.content);
                 if !spoken.trim().is_empty() && a.tool_calls.is_none() {
-                    // Last answer is what a follow-up ("复查这些建议") must see.
-                    // CLIP (120) turned a 4k audit into a stub, so grok re-Read
-                    // the tree. Keep earlier decisions short; keep the latest long.
-                    decisions.push(spoken.clone());
-                    lines.push(format!("seq {seq}  assistant  {}", clip(&spoken, CLIP)));
+                    if crate::stutter::is_leaked_write_narration(&spoken) {
+                        lines.push(format!(
+                            "seq {seq}  assistant  [leaked write narration omitted]"
+                        ));
+                    } else {
+                        // Last answer is what a follow-up ("复查这些建议") must see.
+                        // CLIP (120) turned a 4k audit into a stub, so grok re-Read
+                        // the tree. Keep earlier decisions short; keep the latest long.
+                        decisions.push(spoken.clone());
+                        lines.push(format!("seq {seq}  assistant  {}", clip(&spoken, CLIP)));
+                    }
                 }
                 // Full think stays out of FTS. A short note is only useful when
                 // the turn has no user-facing text (those go to Decisions) and
@@ -717,9 +726,38 @@ fn extract(
     }
 
     let already = collapse_runs(tools);
-    let mut state = head_tail(already.clone(), STATE_CAP, STATE_HEAD);
+    let mutations: Vec<String> = already
+        .iter()
+        .filter(|l| is_fs_mutation_state(l))
+        .cloned()
+        .collect();
+    let inspect: Vec<String> = already
+        .iter()
+        .filter(|l| !is_fs_mutation_state(l))
+        .cloned()
+        .collect();
+    // Writes in the middle of a long inspect tour used to fall out of
+    // head+tail, so the next user turn looked like a cold start.
+    let mut state = if mutations.is_empty() {
+        head_tail(already.clone(), STATE_CAP, STATE_HEAD)
+    } else {
+        let mut s = unique_keep_last_key(&mutations, MUTATION_STATE_CAP);
+        s.extend(head_tail(
+            inspect,
+            STATE_INSPECT_WHEN_MUTATIONS,
+            1.min(STATE_INSPECT_WHEN_MUTATIONS),
+        ));
+        s
+    };
     for note in take_last(notes, NOTE_CAP) {
         state.push(note);
+    }
+
+    let mut decision_items = clip_decisions(decisions);
+    if decision_items.is_empty() {
+        if let Some(changed) = changed_files_line(&mutations) {
+            decision_items.push(changed);
+        }
     }
 
     let mut summary = String::from("## Active Task\n");
@@ -732,15 +770,12 @@ fn extract(
         write_bullets(&mut summary, &constraints);
     }
     summary.push_str("\n## Decisions\n");
-    write_bullets(&mut summary, &clip_decisions(decisions));
+    write_bullets(&mut summary, &decision_items);
     summary.push_str("\n## Open Work\n");
     summary.push_str(&format_open_work(&already, keep_user <= until));
     summary.push('\n');
 
-    (
-        summary,
-        head_tail(lines, INDEX_LINES, INDEX_HEAD).join("\n"),
-    )
+    (summary, prefer_mutation_index(lines).join("\n"))
 }
 
 fn collect_tool_states(events: &[SessionEvent], from: usize, until: usize) -> Vec<String> {
@@ -778,15 +813,24 @@ fn format_open_work(already: &[String], intra_turn: bool) -> String {
     if already.is_empty() {
         return "(see live user)".into();
     }
-    let heads: Vec<String> = take_last(already.to_vec(), 6)
-        .into_iter()
-        .map(|line| {
-            line.split(" → ")
-                .next()
-                .unwrap_or(line.as_str())
-                .to_string()
-        })
+    let muts: Vec<String> = already
+        .iter()
+        .filter(|l| is_fs_mutation_state(l))
+        .cloned()
         .collect();
+    let heads: Vec<String> = if muts.is_empty() {
+        take_last(already.to_vec(), 6)
+    } else {
+        unique_keep_last_key(&muts, 8)
+    }
+    .into_iter()
+    .map(|line| {
+        line.split(" → ")
+            .next()
+            .unwrap_or(line.as_str())
+            .to_string()
+    })
+    .collect();
     let mut items = vec![format!("already: {}", clip(&heads.join("; "), CLIP * 2))];
     if !intra_turn {
         items.push("(see live user)".into());
@@ -868,6 +912,81 @@ fn head_tail(items: Vec<String>, cap: usize, head: usize) -> Vec<String> {
 fn take_last<T>(items: Vec<T>, n: usize) -> Vec<T> {
     let skip = items.len().saturating_sub(n);
     items.into_iter().skip(skip).collect()
+}
+
+fn is_fs_mutation_state(line: &str) -> bool {
+    let label = line.split(" → ").next().unwrap_or(line);
+    let name = label.split_whitespace().next().unwrap_or("");
+    matches!(
+        crate::tools_schema::dispatch_name(name),
+        "write" | "edit" | "delete" | "editnotebook"
+    )
+}
+
+fn is_fs_mutation_index(line: &str) -> bool {
+    line.split_whitespace().any(|w| {
+        matches!(
+            crate::tools_schema::dispatch_name(w),
+            "write" | "edit" | "delete" | "editnotebook"
+        )
+    })
+}
+
+fn unique_keep_last_key(lines: &[String], cap: usize) -> Vec<String> {
+    let mut seen = std::collections::HashSet::new();
+    let mut rev = Vec::new();
+    for line in lines.iter().rev() {
+        let key = line.split(" → ").next().unwrap_or(line);
+        if seen.insert(key.to_string()) {
+            rev.push(line.clone());
+        }
+    }
+    rev.reverse();
+    if rev.len() > cap {
+        take_last(rev, cap)
+    } else {
+        rev
+    }
+}
+
+fn changed_files_line(mutations: &[String]) -> Option<String> {
+    if mutations.is_empty() {
+        return None;
+    }
+    let keys: Vec<String> = unique_keep_last_key(mutations, MUTATION_STATE_CAP)
+        .into_iter()
+        .map(|l| l.split(" → ").next().unwrap_or(&l).to_string())
+        .collect();
+    Some(format!(
+        "changed files: {}",
+        clip(&keys.join("; "), DECISION_KEEP)
+    ))
+}
+
+fn prefer_mutation_index(lines: Vec<String>) -> Vec<String> {
+    let muts: Vec<String> = lines
+        .iter()
+        .filter(|l| is_fs_mutation_index(l))
+        .cloned()
+        .collect();
+    if muts.is_empty() {
+        return head_tail(lines, INDEX_LINES, INDEX_HEAD);
+    }
+    let rest: Vec<String> = lines
+        .iter()
+        .filter(|l| !is_fs_mutation_index(l))
+        .cloned()
+        .collect();
+    let mut out = if muts.len() > INDEX_LINES {
+        take_last(muts, INDEX_LINES)
+    } else {
+        muts
+    };
+    let room = INDEX_LINES.saturating_sub(out.len());
+    if room > 0 {
+        out.extend(head_tail(rest, room, room.min(INDEX_HEAD)));
+    }
+    out
 }
 
 fn call_detail(c: &OpenAiToolCall) -> String {
@@ -1188,6 +1307,14 @@ mod tests {
         OpenAiToolCall::function(id, "bash", format!(r#"{{"command":"{cmd}"}}"#))
     }
 
+    fn write_call(id: &str, path: &str) -> OpenAiToolCall {
+        OpenAiToolCall::function(
+            id,
+            "Write",
+            format!(r#"{{"path":"{path}","contents":"x"}}"#),
+        )
+    }
+
     #[test]
     fn previous_turn_evicted_last_user_kept() {
         let events = vec![
@@ -1296,6 +1423,74 @@ mod tests {
             plan.index.contains("obsidian-compact") || plan.index.contains("fact.txt"),
             "{}",
             plan.index
+        );
+    }
+
+    #[test]
+    fn follow_up_compact_keeps_writes_not_only_glob_head() {
+        let mut events = vec![start(), SessionEvent::user("continue the project")];
+        events.push(SessionEvent::assistant(
+            "",
+            "",
+            Some(vec![OpenAiToolCall::function(
+                "g",
+                "Glob",
+                r#"{"glob_pattern":"**/*.rs"}"#,
+            )]),
+        ));
+        events.push(SessionEvent::tool("g", "Glob", "a.rs\nb.rs\nc.rs"));
+        for i in 0..12 {
+            let id = format!("r{i}");
+            let path = format!("f{i}.rs");
+            events.push(SessionEvent::assistant(
+                "",
+                "",
+                Some(vec![read_call(&id, &path)]),
+            ));
+            events.push(SessionEvent::tool(&id, "read", "fn filler() {}"));
+        }
+        events.push(SessionEvent::assistant(
+            "",
+            "",
+            Some(vec![write_call("w", "cmd/boce-api/main.go")]),
+        ));
+        events.push(SessionEvent::tool(
+            "w",
+            "Write",
+            "Wrote 120 bytes to cmd/boce-api/main.go.",
+        ));
+        for i in 12..16 {
+            let id = format!("t{i}");
+            let path = format!("tail{i}.rs");
+            events.push(SessionEvent::assistant(
+                "",
+                "",
+                Some(vec![read_call(&id, &path)]),
+            ));
+            events.push(SessionEvent::tool(&id, "read", "fn tail() {}"));
+        }
+        events.push(SessionEvent::user("continue"));
+        let plan = plan_compact(&events).expect("prev turn");
+        assert!(
+            plan.summary.contains("cmd/boce-api/main.go"),
+            "follow-up archive must name the Write: {}",
+            plan.summary
+        );
+        assert!(
+            plan.summary.contains("changed files:") || plan.summary.contains("Write"),
+            "Decisions/State must record the mutation: {}",
+            plan.summary
+        );
+        assert!(
+            plan.index.contains("cmd/boce-api/main.go"),
+            "index dropped the Write: {}",
+            plan.index
+        );
+        let sections = parse_sections(&plan.summary);
+        let ow = section_get(&sections, "Open Work").unwrap_or("");
+        assert!(
+            ow.contains("Write") || ow.contains("cmd/boce-api"),
+            "Open Work must not be only the last Reads: {ow}"
         );
     }
 
@@ -1670,6 +1865,30 @@ mod tests {
         assert!(
             dec.chars().count() > 200,
             "last Decision should keep the audit body: {dec}"
+        );
+    }
+
+    #[test]
+    fn leaked_write_narration_is_not_a_decision() {
+        let leak = "I'll write files with the write tool.\n```html\n```\nThe write tool is available. Let me actually invoke Write.";
+        let events = vec![
+            start(),
+            SessionEvent::user("继续"),
+            SessionEvent::assistant("", "", Some(vec![read_call("r", "main.go")])),
+            SessionEvent::tool("r", "read", "package main"),
+            SessionEvent::assistant(leak, "", None),
+            SessionEvent::user("还是继续"),
+        ];
+        let plan = plan_compact(&events).expect("compact");
+        assert!(
+            !plan.summary.contains("I'll write files"),
+            "leaked intent must not become Decisions: {}",
+            plan.summary
+        );
+        assert!(
+            plan.index.contains("leaked write narration omitted"),
+            "{}",
+            plan.index
         );
     }
 

@@ -1578,7 +1578,7 @@ impl<C: Completer> Agent<C> {
         ToolResponse::text(&call.id, text, ToolState::Success)
     }
 
-    fn emit_tool_lifecycle(
+    pub(crate) fn emit_tool_lifecycle(
         &mut self,
         call: &ToolCall,
         phase: ToolLifecyclePhase,

@@ -28,6 +28,40 @@ pub fn is_substantial_reply(s: &str) -> bool {
     reply_units(s) >= MIN_RESTATE_CHARS
 }
 
+/// Grok synthesis hop sometimes narrates Write instead of emitting a native
+/// tool call (`I'll write files`, empty ` ```html ` fences). That is not a
+/// finished answer and must not be archived as a Decision.
+pub fn is_leaked_write_narration(s: &str) -> bool {
+    let l = s.to_ascii_lowercase();
+    const MARKS: &[&str] = &[
+        "i'll write",
+        "i will write",
+        "write files with the write",
+        "the write tool is available",
+        "let me actually invoke",
+        "function call format",
+        "i'll call write",
+        "i'll batch writes",
+        "continuing with file writes",
+        "invoke write",
+        "call write now",
+        "正在写",
+        "接下来写入",
+        "我会调用 write",
+        "用 write 工具",
+    ];
+    if MARKS.iter().any(|m| l.contains(m) || s.contains(m)) {
+        return true;
+    }
+    let mut fences = 0u32;
+    let mut rest = l.as_str();
+    while let Some(i) = rest.find("```html") {
+        fences += 1;
+        rest = &rest[i + 7..];
+    }
+    fences >= 2 || (fences == 1 && !l.contains("</html>"))
+}
+
 /// Thinking that is still planning, not a finished user-facing answer.
 /// Flash-Next / grok-4.6 sometimes stop with this still in `reasoning`.
 pub fn is_scratch_think(s: &str) -> bool {
@@ -531,6 +565,20 @@ This is a different task from architecture review and names different files on p
         assert!(is_substantial_reply(original));
         assert!(!is_source_recap(ESSAY, original));
         assert!(!is_source_recap("pong\n", ESSAY));
+    }
+
+    #[test]
+    fn leaked_write_narration_is_not_an_answer() {
+        assert!(is_leaked_write_narration(
+            "I'll write files with the write tool.\n```html\n```\nThe write tool is available."
+        ));
+        assert!(is_leaked_write_narration(
+            "正在写控制面装配、gRPC 客户端与 Compose。\n```html\n```"
+        ));
+        assert!(!is_leaked_write_narration(
+            "已写入 `cmd/boce-api/main.go`。控制面主程序连 PG / Redis。"
+        ));
+        assert!(!is_leaked_write_narration(ESSAY));
     }
 
     #[test]
