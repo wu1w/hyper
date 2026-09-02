@@ -1,4 +1,8 @@
 //! ReAct agent. Cursor hop geometry: empty tool-hop text, no Qwen lectures.
+//!
+//! Stop authority is one hop in, one verdict out (`adjudicate`) and one
+//! terminal (`conclude`). Transport keeps think-cap fragments and retries a
+//! stream cut with no `finish_reason` / `response.completed`.
 
 mod delta;
 mod dispatch;
@@ -510,17 +514,27 @@ pub struct Agent<C> {
     read_full: Mutex<HashSet<String>>,
     /// Physics cap (steps / wall / context / tool budget) already got a wrap-up hop.
     physics_nudged: bool,
-    /// Empty toolless hop already got one wrap-up. Second blank → fallback text.
+    /// Empty / stub toolless hop already got one wrap-up. Second blank → fallback text.
     channel_nudged: bool,
-    /// Physics/IM wrap hop: tools=None so the model must answer from evidence.
-    /// Inspect-cap uses `write_hold` instead and keeps `tools[]` mounted.
+    /// Dead: inspect-cap uses `write_hold` and keeps `tools[]` mounted. Always false.
     force_synthesis: bool,
-    /// One leaked-tool retry already used on the synthesis hop.
-    synthesis_recovered: bool,
     /// Write-nudges used this user turn. Inspect-cap never unmounts `tools[]`.
     write_nudge_count: u32,
     /// Last hop was a write-nudge; inspect-only calls are not executed.
     write_hold: bool,
+    /// First think-cap of this user turn already got the roomy retry.
+    watchdog_roomy_tried: bool,
+    /// Physics / follow-up wrap hop: leaked tool calls are dropped, not executed.
+    wrap_up_after_tools: bool,
+    /// Progress-narration wrap already used this turn.
+    stub_nudged: bool,
+    /// Consecutive length-truncated tool hops. Cap before giving up.
+    length_truncations: u32,
+    /// Model hops this user turn (primary + roomy retry).
+    turn_steps: u32,
+    turn_prompt_tokens: u64,
+    turn_completion_tokens: u64,
+    parse_retries: u32,
     /// Result-hash / path novelty across recent tool hops this user turn.
     progress: progress::ProgressTracker,
     /// Last official xAI compaction item (opaque). Next Responses `input` should

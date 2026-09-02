@@ -5,16 +5,34 @@ use serde_json::Value;
 use super::dispatch::{
     normalize_tool_calls, observed_from_messages, openai_stored, openai_tool_calls,
 };
-use super::{Agent, AgentOutcome, Completer, ModelTurn, TokenSink};
+use super::{Agent, AgentOutcome, Completer, ModelTurn};
 use crate::channel::take_steer;
 use crate::error::Result;
 use crate::paw_loop::{fs_tool_path, GateCtx, GateDecision, ToolFingerprint};
-use crate::policy::ThinkPolicy;
 use crate::session::{PolicyReason, RunPhase, SessionEvent, StepPhase, ToolLifecyclePhase};
 use crate::sticky;
 use crate::template::{is_hidden_user_text, wrap_tool_response, ChatMessage};
 use crate::tool_calls::{ToolCall, ToolResponse, ToolState};
 use crate::tools_schema::dispatch_name;
+
+/// One hop in, one ruling out. `drive` only runs mechanisms.
+enum Verdict {
+    Continue,
+    Tools {
+        calls: Vec<ToolCall>,
+        notes: Vec<String>,
+    },
+    Stop(StopCause),
+}
+
+enum StopCause {
+    Aborted,
+    Deliver {
+        text: String,
+        reason: Option<String>,
+    },
+    Exhausted,
+}
 
 impl<C: Completer> Agent<C> {
     pub async fn run(&mut self, prompt: &str) -> Result<AgentOutcome> {
@@ -58,9 +76,16 @@ impl<C: Completer> Agent<C> {
         self.physics_nudged = false;
         self.channel_nudged = false;
         self.force_synthesis = false;
-        self.synthesis_recovered = false;
         self.write_nudge_count = 0;
         self.write_hold = false;
+        self.watchdog_roomy_tried = false;
+        self.wrap_up_after_tools = false;
+        self.stub_nudged = false;
+        self.length_truncations = 0;
+        self.turn_steps = 0;
+        self.turn_prompt_tokens = 0;
+        self.turn_completion_tokens = 0;
+        self.parse_retries = 0;
         self.progress.reset();
         self.last_spoken = None;
         self.tool_evidence.clear();
@@ -79,38 +104,15 @@ impl<C: Completer> Agent<C> {
         self.oracle_cmd = None;
         self.snapshot_test_baseline().await;
         self.start_code_index();
-        let mut steps = 0u32;
-        let mut prompt_tokens = 0u64;
-        let mut completion_tokens = 0u64;
-        let mut parse_retries = 0u32;
         let mut first_hop = true;
 
         loop {
             self.drain_background();
             if self.cancel.is_cancelled() {
-                return self.finish(String::new(), Some("aborted".into()), steps);
+                return self.conclude(StopCause::Aborted);
             }
-            // Pending gate TERMINATE fires before the next model call.
-            if let Some(reason) = self.pending_stop.take() {
-                let text = self.last_spoken.clone().unwrap_or_default();
-                if self.arm_im_wrap_up(&text, &reason) {
-                    continue;
-                }
-                if reason.is_empty() || is_physics_stop(&reason) {
-                    if !reason.is_empty() {
-                        self.note(&reason);
-                    }
-                    return self.finish(text, None, steps);
-                }
-                if is_quiet_repeat_stop(&reason) {
-                    return self.finish(text, Some(reason), steps);
-                }
-                self.note(&reason);
-                return self.finish(text, Some(reason), steps);
-            }
-
-            if let Some(reason) = self.compact_if_needed().await {
-                self.note(&reason);
+            if let Some(cause) = self.preflight_stop().await {
+                return self.conclude(cause);
             }
 
             if !first_hop {
@@ -118,28 +120,20 @@ impl<C: Completer> Agent<C> {
             }
             first_hop = false;
 
+            // Tools stay mounted on wrap hops. The schema is in the system
+            // prefix; dropping `tools[]` mid-turn refills the prompt. Leaked
+            // wrap-hop calls are cleared after parsing instead.
             let tools_owned = self.tools.clone();
-            let tools = if self.force_synthesis || self.physics_nudged || tools_owned.is_empty() {
+            let tools = if tools_owned.is_empty() {
                 None
             } else {
                 Some(tools_owned.as_slice())
             };
 
-            self.current_step = steps.saturating_add(1);
+            self.current_step = self.turn_steps.saturating_add(1);
             self.emit_step(StepPhase::Started, None, None);
-            let synthesis_policy = if self.force_synthesis {
-                self.arm_synthesis_completion()
-            } else {
-                None
-            };
             self.arm_speculate();
             let completed = self.complete_or_abort(tools).await;
-            if let Some(prev) = synthesis_policy {
-                self.completer.set_policy(prev);
-            }
-            if self.force_synthesis {
-                self.arm_sink();
-            }
             self.completer.set_speculate(None);
             let completed = match completed {
                 Ok(turn) => turn,
@@ -151,293 +145,370 @@ impl<C: Completer> Agent<C> {
             let Some(mut turn) = completed else {
                 self.emit_step(StepPhase::Error, Some("aborted".into()), None);
                 self.drop_speculate();
-                return self.finish(String::new(), Some("aborted".into()), steps);
+                return self.conclude(StopCause::Aborted);
             };
-            steps += 1;
-            self.current_step = steps;
+            self.absorb_turn_usage(&turn);
             self.emit_step(
                 StepPhase::Completed,
                 None,
                 Some((turn.prompt_tokens, turn.completion_tokens)),
             );
-            prompt_tokens += turn.prompt_tokens;
-            completion_tokens += turn.completion_tokens;
 
-            if self.force_synthesis && turn.watchdog_hit {
-                self.drop_speculate();
-                if self.retry_synthesis_once("synthesis think cap") {
-                    continue;
-                }
-                return self.finish(
-                    self.last_spoken
-                        .clone()
-                        .unwrap_or_else(|| EMPTY_STOP_FALLBACK.to_string()),
-                    Some(super::progress::STOP_NO_PROGRESS_EMPTY.into()),
-                    steps,
-                );
-            }
-
-            if turn.watchdog_hit {
-                // A cap hit is evidence of a runaway trajectory, not evidence
-                // that thinking itself should be disabled. Give the model one
-                // concise side observation and more room to choose a course.
-                self.note("[watchdog] think cap; soft nudge and one roomy retry");
-                self.drop_speculate();
-                self.current_step = steps.saturating_add(1);
-                self.emit_step(StepPhase::Started, Some("watchdog retry".into()), None);
-                self.arm_speculate();
-                let widened = self.retry_with_runaway_room(tools).await;
-                self.completer.set_speculate(None);
-                if self.cancel.is_cancelled() {
-                    self.emit_step(
-                        StepPhase::Error,
-                        Some("watchdog retry aborted".into()),
-                        None,
-                    );
+            match self.adjudicate(&mut turn, tools).await? {
+                Verdict::Continue => {
                     self.drop_speculate();
-                    return self.finish(String::new(), Some("aborted".into()), steps);
                 }
-                match widened {
-                    Some(t) => {
-                        steps += 1;
-                        self.current_step = steps;
-                        self.emit_step(
-                            StepPhase::Completed,
-                            Some("watchdog retry".into()),
-                            Some((t.prompt_tokens, t.completion_tokens)),
-                        );
-                        prompt_tokens += t.prompt_tokens;
-                        completion_tokens += t.completion_tokens;
-                        if !t.watchdog_hit || !t.content.is_empty() || !t.tool_calls.is_empty() {
-                            turn = t;
+                Verdict::Tools { calls, notes } => {
+                    if self.write_hold && hop_is_inspect_only(&calls) {
+                        self.skip_held_inspect(&calls);
+                    } else {
+                        if !hop_is_inspect_only(&calls) {
+                            self.write_hold = false;
+                        }
+                        self.settle_code_index().await;
+                        let should_synth = self.execute_tools(calls).await;
+                        if should_synth {
+                            self.arm_write_nudge("inspect cap");
                         }
                     }
-                    None => self.emit_step(
-                        StepPhase::Error,
-                        Some("watchdog retry produced no turn".into()),
-                        None,
-                    ),
-                }
-                if turn.watchdog_hit && turn.content.is_empty() && turn.tool_calls.is_empty() {
-                    self.drop_speculate();
-                    if self.arm_im_wrap_up("", "[watchdog] think cap") {
-                        continue;
-                    }
-                    self.mark_clean();
-                    return self.finish(self.last_spoken.clone().unwrap_or_default(), None, steps);
-                }
-            }
-
-            if turn.tool_calls.is_empty() && !self.force_synthesis {
-                if let Some(calls) = lift_leaked_tool_json(&turn.content) {
-                    turn.tool_calls = calls;
-                    turn.content.clear();
-                }
-            }
-            if !self.force_synthesis
-                && turn.tool_calls.is_empty()
-                && crate::stutter::is_leaked_write_narration(&turn.content)
-            {
-                self.drop_speculate();
-                self.arm_write_nudge("leaked write intent");
-                if self.write_nudge_count > 1 {
-                    turn.content.clear();
-                } else {
-                    continue;
-                }
-            }
-            if !turn.reasoning.is_empty()
-                && self.print
-                && !self.stdio.think_streamed()
-                && turn.tool_calls.is_empty()
-            {
-                let vis = crate::think_visible::visible_think(turn.reasoning.trim());
-                if !vis.trim().is_empty() {
-                    eprintln!("[think]\n{vis}");
-                }
-            }
-
-            if turn.parse_fail {
-                self.effort.note_parse_fail();
-                self.sync_effort(PolicyReason::Upgrade);
-                parse_retries += 1;
-                self.note("[parse] retry");
-                self.drop_speculate();
-                if parse_retries >= self.parse_stop_after {
-                    return self.finish(self.last_spoken.clone().unwrap_or_default(), None, steps);
-                }
-                continue;
-            }
-
-            if turn.tool_calls.is_empty() {
-                if let Some(body) = Self::promote_reasoning_reply(&turn) {
-                    turn.content = body;
-                }
-            }
-            if !self.force_synthesis && self.needs_channel_rescue(&turn) {
-                if !self.channel_nudged {
-                    self.channel_nudged = true;
-                    self.note("[channel] empty visible reply; one wrap-up");
-                    self.push_hidden_user(EMPTY_CHANNEL_NOTE);
-                    self.drop_speculate();
-                    continue;
-                }
-                self.mark_clean();
-                return self.finish(String::new(), None, steps);
-            }
-
-            if self.force_synthesis {
-                if let Some(calls) = lift_leaked_tool_json(&turn.content) {
-                    if calls
-                        .iter()
-                        .any(|c| super::progress::is_mutating_dispatch(&c.name))
-                    {
-                        turn.tool_calls = calls
-                            .into_iter()
-                            .filter(|c| super::progress::is_mutating_dispatch(&c.name))
-                            .collect();
-                        turn.content.clear();
-                    }
-                }
-                let (mutating, inspect_leak) = split_mutating(std::mem::take(&mut turn.tool_calls));
-                if !mutating.is_empty() {
-                    // Implementation finally arrived after an inspect cap.
-                    // Execute it; do not strip Write/Task the way we strip a
-                    // leaked Read on the wrap hop.
-                    turn.tool_calls = mutating;
-                    turn.raw_tool_calls = None;
-                    self.force_synthesis = false;
-                    self.progress.clear_synthesis();
-                } else if inspect_leak {
-                    turn.tool_calls.clear();
-                    turn.raw_tool_calls = None;
-                    self.push_assistant(&turn);
-                    if self.retry_synthesis_once("synthesis leaked tools") {
-                        continue;
+                    for note in notes {
+                        self.push_hidden_user(note);
                     }
                     self.drop_speculate();
-                    return self.finish(
-                        self.last_spoken.clone().unwrap_or_default(),
-                        Some(super::progress::STOP_NO_PROGRESS_EMPTY.into()),
-                        steps,
-                    );
-                } else if crate::stutter::is_leaked_write_narration(&turn.content) {
-                    self.arm_write_nudge("synthesis leaked write intent");
-                    self.drop_speculate();
-                    continue;
-                } else {
-                    turn.tool_calls.clear();
-                    turn.raw_tool_calls = None;
-                    if !crate::stutter::is_substantial_reply(&turn.content)
-                        && self.retry_synthesis_once("synthesis empty wrap")
-                    {
-                        // Grok Responses clips on max_output_tokens without
-                        // watchdog_hit. Do not commit scratch think as an answer.
-                        continue;
+                    self.flush_steer();
+                    if self.cancel.is_cancelled() {
+                        return self.conclude(StopCause::Aborted);
                     }
-                    self.push_assistant(&turn);
-                    self.drop_speculate();
-                    if crate::stutter::is_substantial_reply(&turn.content) {
-                        self.last_spoken = Some(turn.content.clone());
-                        return self.finish(
-                            turn.content,
-                            Some(super::progress::STOP_NO_PROGRESS_SYNTHESIZED.into()),
-                            steps,
-                        );
-                    }
-                    return self.finish(
-                        self.last_spoken.clone().unwrap_or_default(),
-                        Some(super::progress::STOP_NO_PROGRESS_EMPTY.into()),
-                        steps,
-                    );
                 }
+                Verdict::Stop(cause) => return self.conclude(cause),
             }
+        }
+    }
 
-            self.emit_tools_scheduled(&turn.tool_calls);
-            self.push_assistant(&turn);
-            if turn.tool_calls.is_empty() && crate::stutter::is_substantial_reply(&turn.content) {
-                self.last_spoken = Some(turn.content.clone());
+    fn conclude(&mut self, cause: StopCause) -> Result<AgentOutcome> {
+        let (text, stop_reason) = match cause {
+            StopCause::Aborted => (String::new(), Some("aborted".into())),
+            StopCause::Deliver { text, reason } => (text, reason),
+            StopCause::Exhausted => (String::new(), None),
+        };
+        self.finish(text, stop_reason, self.turn_steps)
+    }
+
+    /// Supervisor pre-flight: pending gate TERMINATE. Compact is a note only.
+    async fn preflight_stop(&mut self) -> Option<StopCause> {
+        if let Some(reason) = self.pending_stop.take() {
+            let text = self.last_spoken.clone().unwrap_or_default();
+            if self.arm_im_wrap_up(&text, &reason) {
+                return None;
             }
-            let decision = self.gate_decision(&turn, steps, prompt_tokens, completion_tokens);
-
-            if !turn.tool_calls.is_empty() {
-                match &decision {
-                    GateDecision::Stop { reason } if is_physics_stop(reason) => {
-                        self.note(reason);
-                        self.pending_stop = Some(reason.clone());
-                    }
-                    GateDecision::Stop { reason } if !reason.is_empty() => {
-                        self.pending_stop = Some(reason.clone());
-                    }
-                    _ => {}
+            if reason.is_empty() || is_physics_stop(&reason) {
+                if !reason.is_empty() {
+                    self.note(&reason);
                 }
-                let calls = std::mem::take(&mut turn.tool_calls);
-                // Cursor: keep tools[] mounted. Extra Read/Grep/Glob after the
-                // inspect nudge get a paired skip result; Write still runs.
-                // Gate already ran, so max-steps / identical-call still bind.
-                if self.write_hold && hop_is_inspect_only(&calls) {
-                    self.skip_held_inspect(&calls);
-                } else {
-                    if !hop_is_inspect_only(&calls) {
-                        self.write_hold = false;
-                    }
-                    self.settle_code_index().await;
-                    let should_synth = self.execute_tools(calls).await;
-                    if should_synth && !self.force_synthesis {
-                        self.arm_write_nudge("inspect cap");
-                    }
-                }
-                self.drop_speculate();
-                self.flush_steer();
-                if self.cancel.is_cancelled() {
-                    return self.finish(String::new(), Some("aborted".into()), steps);
-                }
-                continue;
+                return Some(StopCause::Deliver { text, reason: None });
             }
+            if is_quiet_repeat_stop(&reason) {
+                return Some(StopCause::Deliver {
+                    text,
+                    reason: Some(reason),
+                });
+            }
+            self.note(&reason);
+            return Some(StopCause::Deliver {
+                text,
+                reason: Some(reason),
+            });
+        }
+        if let Some(reason) = self.compact_if_needed().await {
+            self.note(&reason);
+        }
+        None
+    }
 
+    fn absorb_turn_usage(&mut self, turn: &ModelTurn) {
+        self.turn_steps = self.turn_steps.saturating_add(1);
+        self.turn_prompt_tokens += turn.prompt_tokens;
+        self.turn_completion_tokens += turn.completion_tokens;
+        self.current_step = self.turn_steps;
+    }
+
+    /// Single termination authority. One hop in, one verdict out.
+    async fn adjudicate(
+        &mut self,
+        turn: &mut ModelTurn,
+        tools: Option<&[Value]>,
+    ) -> Result<Verdict> {
+        let mut hop_recorded = false;
+
+        if turn.watchdog_hit
+            && turn.tool_calls.is_empty()
+            && !crate::stutter::is_substantial_reply(&turn.content)
+            && !self.watchdog_roomy_tried
+            && !self.wrap_up_after_tools
+        {
+            self.watchdog_roomy_tried = true;
+            self.note("[watchdog] think cap; soft nudge and one roomy retry");
+            hop_recorded = self.push_failed_hop(turn);
             self.drop_speculate();
-            match decision {
-                GateDecision::Continue { continuation, .. } => {
-                    self.mark_clean();
-                    if self.arm_im_wrap_up(&turn.content, "") {
-                        continue;
-                    }
-                    let stop_reason = if continuation.is_empty() {
-                        None
-                    } else {
-                        Some(continuation)
-                    };
-                    return self.finish(turn.content, stop_reason, steps);
-                }
-                GateDecision::Stop { reason } => {
-                    self.mark_clean();
-                    if self.arm_im_wrap_up(&turn.content, &reason) {
-                        continue;
-                    }
-                    if is_physics_stop(&reason) {
-                        self.note(&reason);
-                        return self.finish(turn.content, None, steps);
-                    }
-                    if is_quiet_repeat_stop(&reason) {
-                        return self.finish(turn.content, Some(reason), steps);
-                    }
-                    let stop_reason = if reason.is_empty() {
-                        None
-                    } else {
-                        Some(reason)
-                    };
-                    return self.finish(turn.content, stop_reason, steps);
-                }
-                // Handler swallows per-gate Bypass; keep this arm so a future
-                // handler contract change cannot panic the loop.
-                GateDecision::Bypass => {
-                    self.mark_clean();
-                    if self.arm_im_wrap_up(&turn.content, "") {
-                        continue;
-                    }
-                    return self.finish(turn.content, None, steps);
-                }
+            self.current_step = self.turn_steps.saturating_add(1);
+            self.emit_step(StepPhase::Started, Some("watchdog retry".into()), None);
+            self.arm_speculate();
+            let widened = self.retry_with_runaway_room(tools).await;
+            self.completer.set_speculate(None);
+            if self.cancel.is_cancelled() {
+                self.emit_step(
+                    StepPhase::Error,
+                    Some("watchdog retry aborted".into()),
+                    None,
+                );
+                return Ok(Verdict::Stop(StopCause::Aborted));
             }
+            match widened {
+                Some(t) => {
+                    self.absorb_turn_usage(&t);
+                    self.emit_step(
+                        StepPhase::Completed,
+                        Some("watchdog retry".into()),
+                        Some((t.prompt_tokens, t.completion_tokens)),
+                    );
+                    *turn = t;
+                    hop_recorded = false;
+                }
+                None => self.emit_step(
+                    StepPhase::Error,
+                    Some("watchdog retry produced no turn".into()),
+                    None,
+                ),
+            }
+        }
+
+        if turn.watchdog_hit {
+            if !turn.tool_calls.is_empty() {
+                self.length_truncations = self.length_truncations.saturating_add(1);
+                if self.length_truncations >= LENGTH_TRUNCATION_ABORT {
+                    return Ok(Verdict::Stop(StopCause::Exhausted));
+                }
+                self.note("[watchdog] length; fail truncated tool calls");
+                self.emit_tools_scheduled(&turn.tool_calls);
+                self.push_assistant(turn);
+                self.fail_truncated_tools(std::mem::take(&mut turn.tool_calls));
+                return Ok(Verdict::Continue);
+            }
+            if Self::hop_is_delivery(turn) {
+                self.push_assistant(turn);
+                self.last_spoken = Some(turn.content.clone());
+                return Ok(Verdict::Stop(StopCause::Deliver {
+                    text: turn.content.clone(),
+                    reason: None,
+                }));
+            }
+            if !hop_recorded {
+                self.push_failed_hop(turn);
+            }
+            // Roomy retry already spent, or wrap hop. Thinking stays on;
+            // truncated think is not the user-visible answer (Cursor).
+            return Ok(Verdict::Stop(StopCause::Exhausted));
+        }
+
+        if self.wrap_up_after_tools && !turn.tool_calls.is_empty() {
+            self.note("[watchdog] wrap-up leaked tools; not executed");
+            turn.tool_calls.clear();
+            turn.raw_tool_calls = None;
+        }
+
+        if !self.wrap_up_after_tools && turn.tool_calls.is_empty() {
+            if let Some(calls) = lift_leaked_tool_json(&turn.content) {
+                turn.tool_calls = calls;
+                turn.content.clear();
+            }
+        }
+        if !self.wrap_up_after_tools
+            && turn.tool_calls.is_empty()
+            && crate::stutter::is_leaked_write_narration(&turn.content)
+        {
+            self.arm_write_nudge("leaked write intent");
+            if self.write_nudge_count > 1 {
+                turn.content.clear();
+            } else {
+                return Ok(Verdict::Continue);
+            }
+        }
+
+        if !turn.reasoning.is_empty()
+            && self.print
+            && !self.stdio.think_streamed()
+            && turn.tool_calls.is_empty()
+        {
+            let vis = crate::think_visible::visible_think(turn.reasoning.trim());
+            if !vis.trim().is_empty() {
+                eprintln!("[think]\n{vis}");
+            }
+        }
+
+        if turn.parse_fail {
+            self.effort.note_parse_fail();
+            self.sync_effort(PolicyReason::Upgrade);
+            self.parse_retries += 1;
+            self.note("[parse] retry");
+            if self.parse_retries >= self.parse_stop_after {
+                return Ok(Verdict::Stop(StopCause::Deliver {
+                    text: self.last_spoken.clone().unwrap_or_default(),
+                    reason: None,
+                }));
+            }
+            return Ok(Verdict::Continue);
+        }
+
+        if turn.tool_calls.is_empty() {
+            if let Some(body) = Self::promote_reasoning_reply(turn) {
+                turn.content = body;
+            }
+        }
+        if turn.tool_calls.is_empty() && !Self::hop_is_delivery(turn) {
+            self.push_failed_hop(turn);
+            return Ok(self.rescue_incomplete(turn));
+        }
+
+        self.emit_tools_scheduled(&turn.tool_calls);
+        self.push_assistant(turn);
+        if turn.tool_calls.is_empty() && crate::stutter::is_substantial_reply(&turn.content) {
+            self.last_spoken = Some(turn.content.clone());
+        }
+        let decision = self.gate_decision(turn);
+
+        if !turn.tool_calls.is_empty() {
+            let mut notes: Vec<String> = Vec::new();
+            match &decision {
+                GateDecision::Stop { reason } if is_physics_stop(reason) => {
+                    if !self.physics_nudged {
+                        self.physics_nudged = true;
+                        self.wrap_up_after_tools = true;
+                        self.note(reason);
+                        notes.push(PHYSICS_WRAP_NOTE.to_string());
+                    } else {
+                        self.note(reason);
+                        self.pending_stop = Some(String::new());
+                    }
+                }
+                GateDecision::Stop { reason } if !reason.is_empty() => {
+                    self.pending_stop = Some(reason.clone());
+                }
+                _ => {}
+            }
+            return Ok(Verdict::Tools {
+                calls: std::mem::take(&mut turn.tool_calls),
+                notes,
+            });
+        }
+
+        self.mark_clean();
+        match decision {
+            GateDecision::Continue { continuation, .. } => {
+                let reason = if continuation.is_empty() {
+                    None
+                } else {
+                    Some(continuation)
+                };
+                Ok(Verdict::Stop(StopCause::Deliver {
+                    text: std::mem::take(&mut turn.content),
+                    reason,
+                }))
+            }
+            GateDecision::Stop { reason } => {
+                if is_physics_stop(&reason) {
+                    if self.arm_im_wrap_up(&turn.content, &reason) {
+                        return Ok(Verdict::Continue);
+                    }
+                    self.note(&reason);
+                    return Ok(Verdict::Stop(StopCause::Deliver {
+                        text: std::mem::take(&mut turn.content),
+                        reason: None,
+                    }));
+                }
+                if is_quiet_repeat_stop(&reason) {
+                    return Ok(Verdict::Stop(StopCause::Deliver {
+                        text: std::mem::take(&mut turn.content),
+                        reason: Some(reason),
+                    }));
+                }
+                let reason = if reason.is_empty() {
+                    None
+                } else {
+                    Some(reason)
+                };
+                Ok(Verdict::Stop(StopCause::Deliver {
+                    text: std::mem::take(&mut turn.content),
+                    reason,
+                }))
+            }
+            GateDecision::Bypass => Ok(Verdict::Stop(StopCause::Deliver {
+                text: std::mem::take(&mut turn.content),
+                reason: None,
+            })),
+        }
+    }
+
+    fn push_failed_hop(&mut self, turn: &ModelTurn) -> bool {
+        if turn.content.trim().is_empty() && turn.reasoning.trim().is_empty() {
+            return false;
+        }
+        self.push_assistant(turn);
+        true
+    }
+
+    fn hop_is_delivery(turn: &ModelTurn) -> bool {
+        turn.tool_calls.is_empty()
+            && !turn.content.trim().is_empty()
+            && !crate::stutter::is_progress_narration(&turn.content)
+            && !crate::stutter::is_leaked_write_narration(&turn.content)
+    }
+
+    fn rescue_incomplete(&mut self, turn: &ModelTurn) -> Verdict {
+        if self.wrap_up_after_tools {
+            return Verdict::Stop(StopCause::Exhausted);
+        }
+        if turn.content.trim().is_empty() {
+            if self
+                .last_spoken
+                .as_deref()
+                .map(str::trim)
+                .is_some_and(|s| !s.is_empty())
+            {
+                return Verdict::Stop(StopCause::Deliver {
+                    text: String::new(),
+                    reason: None,
+                });
+            }
+            if !self.channel_nudged {
+                self.channel_nudged = true;
+                self.note("[channel] empty visible reply; one wrap-up");
+                self.push_hidden_user(EMPTY_CHANNEL_NOTE);
+                return Verdict::Continue;
+            }
+            return Verdict::Stop(StopCause::Exhausted);
+        }
+        if !self.stub_nudged && !self.channel_nudged {
+            self.stub_nudged = true;
+            self.channel_nudged = true;
+            self.note("[channel] next-step line without tools");
+            self.push_hidden_user(STUB_CONTINUE_NOTE);
+            return Verdict::Continue;
+        }
+        Verdict::Stop(StopCause::Exhausted)
+    }
+
+    fn fail_truncated_tools(&mut self, calls: Vec<ToolCall>) {
+        for call in calls {
+            let name = if call.name.is_empty() {
+                "unknown"
+            } else {
+                call.name.as_str()
+            };
+            self.note(&format!("[{name}] skipped truncated"));
+            self.commit_tool(
+                name,
+                ToolResponse::text(call.id.clone(), LENGTH_TRUNCATED_TOOL, ToolState::Error),
+            );
         }
     }
 
@@ -584,13 +655,7 @@ impl<C: Completer> Agent<C> {
         }
     }
 
-    pub(crate) fn gate_decision(
-        &self,
-        turn: &ModelTurn,
-        steps: u32,
-        prompt_tokens: u64,
-        completion_tokens: u64,
-    ) -> GateDecision {
+    pub(crate) fn gate_decision(&self, turn: &ModelTurn) -> GateDecision {
         let fingerprints: Vec<ToolFingerprint> = turn
             .tool_calls
             .iter()
@@ -601,10 +666,10 @@ impl<C: Completer> Agent<C> {
             .collect();
         let names: Vec<String> = turn.tool_calls.iter().map(|c| c.name.clone()).collect();
         let mut ctx = GateCtx::new(&self.session_id);
-        ctx.iteration = steps;
+        ctx.iteration = self.turn_steps;
         ctx.prompt_tokens = turn.prompt_tokens;
         ctx.completion_tokens = turn.completion_tokens;
-        ctx.tokens_used = prompt_tokens + completion_tokens;
+        ctx.tokens_used = self.turn_prompt_tokens + self.turn_completion_tokens;
         ctx.tool_names = &names;
         ctx.fingerprints = &fingerprints;
         ctx.last_tool = fingerprints.last();
@@ -621,7 +686,7 @@ impl<C: Completer> Agent<C> {
     ) -> Option<ModelTurn> {
         let Some(prev) = self.completer.policy() else {
             let retry = self.complete_resilient(tools).await.ok().flatten();
-            return retry.filter(|t| !t.watchdog_hit && !t.parse_fail);
+            return retry.filter(|t| !t.parse_fail);
         };
         if !prev.enabled {
             return None;
@@ -632,50 +697,13 @@ impl<C: Completer> Agent<C> {
         self.completer.set_policy(raised);
         let retry = self.complete_resilient(tools).await.ok().flatten();
         self.completer.set_policy(prev);
-        retry.filter(|t| !t.watchdog_hit && !t.parse_fail)
+        retry.filter(|t| !t.parse_fail)
     }
 
     fn arm_speculate(&mut self) {
         let slot = super::SpeculativeSlot::new(self.speculate_ctx());
         self.speculate = Some(slot.clone());
         self.completer.set_speculate(Some(slot));
-    }
-
-    /// A convergence hop is not another research hop. Stream only answer
-    /// tokens. Grok Responses honors `max_tokens` as `max_output_tokens`
-    /// (reasoning + answer); llama.cpp also cuts local think at 768. Recovery
-    /// tightens the wire cap instead of widening to the 8k no-tool floor.
-    /// Grok still forwards `effort=low` when thinking is off.
-    fn arm_synthesis_completion(&self) -> Option<ThinkPolicy> {
-        self.completer
-            .set_token_sink(self.live_sink().map(TokenSink::content_only));
-        let prev = self.completer.policy()?;
-        let mut synthesis = if self.synthesis_recovered {
-            ThinkPolicy::off()
-        } else {
-            prev.clone()
-        };
-        if !self.synthesis_recovered {
-            synthesis.enabled = true;
-            synthesis.effort = Some(crate::policy::Effort::Low);
-            synthesis.max_think_tokens = SYNTHESIS_THINK_CAP;
-            synthesis.max_tokens = SYNTHESIS_OUTPUT_CAP;
-        } else {
-            synthesis.max_tokens = SYNTHESIS_ANSWER_RESERVE;
-        }
-        self.completer.set_policy(synthesis);
-        Some(prev)
-    }
-
-    fn retry_synthesis_once(&mut self, why: &str) -> bool {
-        if self.synthesis_recovered {
-            return false;
-        }
-        self.synthesis_recovered = true;
-        self.note(&format!("[trajectory] {why}; one tight retry"));
-        self.push_hidden_user(super::progress::FORCED_SYNTHESIS_NOTE);
-        self.drop_speculate();
-        true
     }
 
     /// Cursor keeps the frozen `tools[]` mounted. Inspect-cap / leaked
@@ -718,7 +746,7 @@ impl<C: Completer> Agent<C> {
 
     /// Physics cap: one recap hop on every surface so follow-up compact has
     /// Decisions (Cursor / grok CLI keep a visible end-of-turn). Empty-visible
-    /// wrap stays IM-only; the console uses `needs_channel_rescue`.
+    /// wrap stays in `rescue_incomplete` (`EMPTY_CHANNEL_NOTE`).
     fn arm_im_wrap_up(&mut self, spoken: &str, reason: &str) -> bool {
         if self.physics_nudged || !spoken.trim().is_empty() {
             return false;
@@ -733,22 +761,6 @@ impl<C: Completer> Agent<C> {
         }
         self.push_hidden_user(PHYSICS_WRAP_NOTE);
         true
-    }
-
-    /// Empty visible hop: leftover think, or a naked empty stop with nothing
-    /// already spoken. Do not dump unfinished CoT; do not deliver `""`.
-    fn needs_channel_rescue(&self, turn: &ModelTurn) -> bool {
-        if !turn.tool_calls.is_empty() || !turn.content.trim().is_empty() {
-            return false;
-        }
-        if !turn.reasoning.trim().is_empty() {
-            return true;
-        }
-        self.last_spoken
-            .as_deref()
-            .map(str::trim)
-            .filter(|s| !s.is_empty())
-            .is_none()
     }
 
     /// Lift a finished answer that landed only in `reasoning`. Scratch plans
@@ -1017,6 +1029,18 @@ pub(crate) const EMPTY_CHANNEL_NOTE: &str = "\
 Write the full conclusion in the normal reply — thinking is not shown as the answer. \
 If the task is unfinished, call a tool. Do not submit another empty reply.";
 
+/// No-tool hop that only announced the next step.
+pub(crate) const STUB_CONTINUE_NOTE: &str = "\
+[trajectory] The last hop only announced a next step — no tool call and no conclusion. \
+Call the tool, or write the full answer. Do not submit another next-step line.";
+
+/// Truncated native tool calls are not executed (pi / grok CLI length salvage).
+const LENGTH_TRUNCATED_TOOL: &str =
+    "Tool call was not executed: the response hit the think/output \
+token limit, so its arguments may be truncated. Re-issue the tool call with complete arguments.";
+
+const LENGTH_TRUNCATION_ABORT: u32 = 3;
+
 /// Console fallback when a wrap-up hop is still blank. IM uses `im_no_reply_text`.
 pub(crate) const EMPTY_STOP_FALLBACK: &str =
     "没有可见回复：模型这一跳交了空正文。直接发「继续」我再收一次。";
@@ -1054,24 +1078,12 @@ pub(crate) fn is_quiet_repeat_stop(reason: &str) -> bool {
     reason.starts_with(crate::paw_loop::REPEAT_STOP)
 }
 
+/// Write-hold skips extra Read/Grep/Glob/Search, not Shell / TodoWrite / web.
 fn hop_is_inspect_only(calls: &[ToolCall]) -> bool {
     !calls.is_empty()
         && calls
             .iter()
-            .all(|c| !super::progress::is_mutating_dispatch(&c.name))
-}
-
-fn split_mutating(calls: Vec<ToolCall>) -> (Vec<ToolCall>, bool) {
-    let mut mutating = Vec::new();
-    let mut inspect_leak = false;
-    for call in calls {
-        if super::progress::is_mutating_dispatch(&call.name) {
-            mutating.push(call);
-        } else {
-            inspect_leak = true;
-        }
-    }
-    (mutating, inspect_leak)
+            .all(|c| super::progress::is_held_inspect(&c.name))
 }
 
 /// Grok sometimes paints a Write/StrReplace as a JSON fence instead of a

@@ -1,9 +1,12 @@
 //! OpenAI-compat chat completion. Same request builder as probe.
 //!
 //! Streams when a token sink is armed (TUI/CLI) or when thinking is on and
-//! `max_think_tokens > 0` so the watchdog can drop the body at the think cap.
+//! `max_think_tokens > 0` so the watchdog can stop at the think cap. A cap
+//! hit keeps the partial SSE (pi / Cursor / grok CLI `stopReason=length`):
+//! the loop may fail truncated tools instead of discarding the hop.
 //! Tool calls come from the native OpenAI `tool_calls` array only — no Qwen XML.
 
+use std::collections::HashSet;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Mutex;
 use std::time::Duration;
@@ -194,10 +197,6 @@ impl Completer for HttpCompleter {
                 Ok(turn) => {
                     offer_turn(self.speculate(), &turn);
                     return Ok(turn);
-                }
-                Err(Error::Watchdog) => {
-                    drop(resp);
-                    return Ok(ModelTurn::watchdog());
                 }
                 Err(e) => return Err(e),
             }
@@ -653,6 +652,7 @@ struct StreamAcc {
     completion_tokens: u64,
     cached_tokens: Option<u64>,
     timings: Option<Value>,
+    finish_reason: Option<String>,
 }
 
 impl StreamAcc {
@@ -665,6 +665,7 @@ impl StreamAcc {
             completion_tokens: 0,
             cached_tokens: None,
             timings: None,
+            finish_reason: None,
         }
     }
 
@@ -686,6 +687,9 @@ impl StreamAcc {
         let choice = &chunk["choices"][0];
         if choice.is_null() {
             return;
+        }
+        if let Some(r) = choice["finish_reason"].as_str() {
+            self.finish_reason = Some(r.to_string());
         }
         if choice.get("delta").is_none() {
             if let Some(msg) = choice.get("message") {
@@ -830,7 +834,7 @@ async fn read_sse(
                 p.push_raw(&acc.reasoning, &acc.content, !acc.tool_calls.is_empty());
             }
             if watchdog_hit(family, watchdog, &acc) {
-                return Err(Error::Watchdog);
+                return finalize_sse(acc, true, paint.as_mut(), slot.as_ref());
             }
         }
     }
@@ -847,16 +851,73 @@ async fn read_sse(
             p.push_raw(&acc.reasoning, &acc.content, !acc.tool_calls.is_empty());
         }
         if watchdog_hit(family, watchdog, &acc) {
-            return Err(Error::Watchdog);
+            return finalize_sse(acc, true, paint.as_mut(), slot.as_ref());
         }
     }
-    if let Some(s) = &slot {
+    // A finished generation always terminates with `finish_reason` and/or
+    // `data: [DONE]`. A body that just ends is a gateway/upstream cut;
+    // accepting the fragment as a normal stop turns one flaky hop into a
+    // silent empty answer. Surface it as transient so the hop retries.
+    if !sse.done && acc.finish_reason.is_none() {
+        return Err(Error::Http(
+            "stream connection closed before completion (no finish_reason)".into(),
+        ));
+    }
+    finalize_sse(acc, false, paint.as_mut(), slot.as_ref())
+}
+
+fn finalize_sse(
+    acc: StreamAcc,
+    watchdog: bool,
+    paint: Option<&mut StreamPaint>,
+    slot: Option<&SpeculativeSlot>,
+) -> Result<ModelTurn> {
+    if let Some(s) = slot {
         s.offer(&openai_ready_calls(&acc.tool_calls, true));
     }
-    if let Some(p) = paint.as_mut() {
+    if let Some(p) = paint {
         p.finish(&acc.reasoning, &acc.content, !acc.tool_calls.is_empty());
     }
-    turn_from_json(&acc.into_message_json(), false)
+    let v = acc.into_message_json();
+    let mut turn = turn_from_json(&v, watchdog)?;
+    if watchdog {
+        turn.watchdog_hit = true;
+        reattach_truncated_tools(&mut turn, &v);
+    }
+    Ok(turn)
+}
+
+/// Incomplete JSON args are dropped by truncated parse. Keep named stubs so
+/// the loop can fail them (pi / grok CLI: do not execute a length-truncated batch).
+fn reattach_truncated_tools(turn: &mut ModelTurn, v: &Value) {
+    let Some(arr) = v
+        .pointer("/choices/0/message/tool_calls")
+        .and_then(Value::as_array)
+    else {
+        return;
+    };
+    let mut have: HashSet<String> = turn.tool_calls.iter().map(|c| c.id.clone()).collect();
+    for item in arr {
+        let name = item["function"]["name"].as_str().unwrap_or("");
+        if name.is_empty() {
+            continue;
+        }
+        let id = match item["id"].as_str() {
+            Some(s) if !s.is_empty() => s.to_string(),
+            _ => format!("truncated-{name}"),
+        };
+        if !have.insert(id.clone()) {
+            continue;
+        }
+        turn.tool_calls.push(ToolCall {
+            id,
+            name: name.to_string(),
+            arguments: json!({}),
+        });
+    }
+    if !turn.tool_calls.is_empty() {
+        turn.raw_tool_calls = Some(super::openai_tool_calls(&turn.tool_calls));
+    }
 }
 
 fn watchdog_hit(family: Family, cap: Option<u32>, acc: &StreamAcc) -> bool {
@@ -894,6 +955,9 @@ fn think_blob(reasoning: &str, content: &str) -> String {
 #[derive(Default)]
 struct SseBuf {
     leftover: String,
+    /// A `data: [DONE]` terminator arrived. Absence at body end means the
+    /// connection died mid-stream (gateway cut), not a finished generation.
+    done: bool,
 }
 
 impl SseBuf {
@@ -908,6 +972,9 @@ impl SseBuf {
                 2
             };
             self.leftover = self.leftover[idx + skip..].to_string();
+            if sse_event_is_done(&raw) {
+                self.done = true;
+            }
             if let Some(v) = parse_sse_event(&raw) {
                 out.push(v);
             }
@@ -920,6 +987,9 @@ impl SseBuf {
             return Vec::new();
         }
         let raw = std::mem::take(&mut self.leftover);
+        if sse_event_is_done(&raw) {
+            self.done = true;
+        }
         parse_sse_event(&raw).into_iter().collect()
     }
 }
@@ -931,6 +1001,14 @@ fn find_event_break(s: &str) -> Option<usize> {
         (None, Some(b)) => Some(b),
         (None, None) => None,
     }
+}
+
+fn sse_event_is_done(raw: &str) -> bool {
+    raw.lines().any(|line| {
+        line.trim_end_matches('\r')
+            .strip_prefix("data:")
+            .is_some_and(|rest| rest.trim() == "[DONE]")
+    })
 }
 
 fn parse_sse_event(raw: &str) -> Option<Value> {
@@ -1362,5 +1440,84 @@ mod tests {
         assert!(!should_probe_slots(EngineProfile::Generic));
         assert!(!should_probe_slots(EngineProfile::Auto));
         assert!(!should_probe_slots(EngineProfile::Vllm));
+    }
+
+    async fn sse_server(body: &'static str) -> String {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let (mut sock, _) = listener.accept().await.unwrap();
+            let mut buf = [0u8; 4096];
+            let _ = sock.read(&mut buf).await;
+            let resp = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nConnection: close\r\n\r\n{body}"
+            );
+            let _ = sock.write_all(resp.as_bytes()).await;
+            let _ = sock.shutdown().await;
+        });
+        format!("http://{addr}/v1/chat/completions")
+    }
+
+    #[tokio::test]
+    async fn premature_stream_close_is_transient_error() {
+        let url = sse_server(
+            "data: {\"choices\":[{\"delta\":{\"reasoning_content\":\"partial think\"}}]}\n\n",
+        )
+        .await;
+        let mut resp = reqwest::Client::new().get(&url).send().await.unwrap();
+        let err = read_sse(&mut resp, Family::Qwen38, None, None, None)
+            .await
+            .expect_err("body cut without finish_reason must error");
+        let msg = err.to_string();
+        assert!(msg.contains("closed before completion"), "{msg}");
+        assert!(crate::llm_http::is_transient(&err), "must retry: {msg}");
+    }
+
+    #[tokio::test]
+    async fn finish_reason_without_done_is_accepted() {
+        let url = sse_server(
+            "data: {\"choices\":[{\"delta\":{\"content\":\"ok\"}}]}\n\n\
+             data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}]}\n\n",
+        )
+        .await;
+        let mut resp = reqwest::Client::new().get(&url).send().await.unwrap();
+        let turn = read_sse(&mut resp, Family::Qwen38, None, None, None)
+            .await
+            .expect("finish_reason terminates the stream cleanly");
+        assert_eq!(turn.content, "ok");
+        assert!(!turn.watchdog_hit);
+    }
+
+    #[tokio::test]
+    async fn done_marker_without_finish_reason_is_accepted() {
+        let url = sse_server(
+            "data: {\"choices\":[{\"delta\":{\"content\":\"ok\"}}]}\n\ndata: [DONE]\n\n",
+        )
+        .await;
+        let mut resp = reqwest::Client::new().get(&url).send().await.unwrap();
+        let turn = read_sse(&mut resp, Family::Qwen38, None, None, None)
+            .await
+            .expect("[DONE] terminates the stream cleanly");
+        assert_eq!(turn.content, "ok");
+    }
+
+    #[tokio::test]
+    async fn watchdog_keeps_partial_think() {
+        let url = sse_server(
+            "data: {\"choices\":[{\"delta\":{\"reasoning_content\":\"long analysis of the repo\"}}]}\n\n\
+             data: [DONE]\n\n",
+        )
+        .await;
+        let mut resp = reqwest::Client::new().get(&url).send().await.unwrap();
+        let turn = read_sse(&mut resp, Family::Qwen38, Some(1), None, None)
+            .await
+            .expect("cap hit must keep the fragment");
+        assert!(turn.watchdog_hit);
+        assert!(
+            turn.reasoning.contains("long analysis"),
+            "{}",
+            turn.reasoning
+        );
     }
 }

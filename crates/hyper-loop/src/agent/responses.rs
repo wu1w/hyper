@@ -508,6 +508,10 @@ struct ResponsesAcc {
     completion_tokens: u64,
     cached_tokens: Option<u64>,
     done_ids: HashSet<String>,
+    /// Saw `response.completed` or `response.incomplete`.
+    terminal: bool,
+    /// `incomplete_details.reason = max_output_tokens` — length salvage, not a clean stop.
+    incomplete_length: bool,
 }
 
 #[derive(Default, Clone)]
@@ -582,6 +586,7 @@ impl ResponsesAcc {
                 }
             }
             "response.completed" => {
+                self.note_terminal(ev.get("response"));
                 if let Some(resp) = ev.get("response") {
                     if let Some(output) = resp.get("output") {
                         let mut fresh = ResponsesAcc::default();
@@ -605,6 +610,12 @@ impl ResponsesAcc {
                     } else {
                         self.apply_usage(resp);
                     }
+                }
+            }
+            "response.incomplete" => {
+                self.note_terminal(ev.get("response"));
+                if let Some(resp) = ev.get("response") {
+                    self.apply_usage(resp);
                 }
             }
             "error" => {}
@@ -746,6 +757,20 @@ impl ResponsesAcc {
             return None;
         }
         self.calls.iter_mut().rev().find(|c| c.matches_id(id))
+    }
+
+    fn note_terminal(&mut self, resp: Option<&Value>) {
+        self.terminal = true;
+        let Some(resp) = resp else {
+            return;
+        };
+        let reason = resp
+            .pointer("/incomplete_details/reason")
+            .and_then(|v| v.as_str())
+            .or_else(|| resp.get("status").and_then(|v| v.as_str()));
+        if reason == Some("max_output_tokens") || reason == Some("incomplete") {
+            self.incomplete_length = true;
+        }
     }
 
     fn mark_done(&mut self, id: &str) {
@@ -897,7 +922,7 @@ impl ResponsesAcc {
             raw_tool_calls,
             prompt_tokens: self.prompt_tokens,
             completion_tokens: self.completion_tokens,
-            watchdog_hit: false,
+            watchdog_hit: self.incomplete_length,
             parse_fail: false,
             cached_tokens: self.cached_tokens,
             decode_tok_s: None,
@@ -1037,6 +1062,11 @@ async fn read_responses_sse(
     }
     if let Some(p) = paint.as_mut() {
         p.finish(&acc.reasoning, &acc.content, !acc.calls.is_empty());
+    }
+    if !sse.done && !acc.terminal {
+        return Err(Error::Http(
+            "stream connection closed before completion (no response.completed)".into(),
+        ));
     }
     acc.into_turn()
 }
@@ -1232,6 +1262,7 @@ fn offer_turn(slot: Option<SpeculativeSlot>, turn: &ModelTurn) {
 #[derive(Default)]
 struct SseNamed {
     leftover: String,
+    done: bool,
 }
 
 impl SseNamed {
@@ -1246,6 +1277,9 @@ impl SseNamed {
                 2
             };
             self.leftover = self.leftover[idx + skip..].to_string();
+            if sse_event_is_done(&raw) {
+                self.done = true;
+            }
             if let Some(v) = parse_sse_event(&raw) {
                 out.push(v);
             }
@@ -1258,8 +1292,19 @@ impl SseNamed {
             return Vec::new();
         }
         let raw = std::mem::take(&mut self.leftover);
+        if sse_event_is_done(&raw) {
+            self.done = true;
+        }
         parse_sse_event(&raw).into_iter().collect()
     }
+}
+
+fn sse_event_is_done(raw: &str) -> bool {
+    raw.lines().any(|line| {
+        line.trim_end_matches('\r')
+            .strip_prefix("data:")
+            .is_some_and(|rest| rest.trim() == "[DONE]")
+    })
 }
 
 fn find_event_break(s: &str) -> Option<usize> {

@@ -343,6 +343,15 @@ pub fn is_mutating_dispatch(name: &str) -> bool {
     )
 }
 
+/// Inspect tools skipped after write-nudge. Matches `WRITE_NOW_NOTE`.
+/// Shell / TodoWrite / Web* are work, not a re-read.
+pub fn is_held_inspect(name: &str) -> bool {
+    matches!(
+        dispatch_name(name),
+        "read" | "grep" | "glob" | "search" | "view"
+    )
+}
+
 fn hop_is_inspect(calls: &[ToolCall]) -> bool {
     !calls.is_empty() && calls.iter().all(|c| !is_mutating_dispatch(&c.name))
 }
@@ -567,5 +576,18 @@ mod tests {
         t.fold_and_observe(&ws, &[write], &mut wresp, false, false, None);
         assert!(!t.should_synthesize());
         let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn held_inspect_is_read_family_not_shell() {
+        assert!(is_held_inspect("Read"));
+        assert!(is_held_inspect("Grep"));
+        assert!(is_held_inspect("Glob"));
+        assert!(is_held_inspect("Search"));
+        assert!(!is_held_inspect("Shell"));
+        assert!(!is_held_inspect("bash"));
+        assert!(!is_held_inspect("TodoWrite"));
+        assert!(!is_held_inspect("WebSearch"));
+        assert!(!is_held_inspect("Write"));
     }
 }

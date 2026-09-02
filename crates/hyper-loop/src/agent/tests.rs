@@ -19,7 +19,8 @@ use super::notes::{
 use super::progress::{FORCED_SYNTHESIS_NOTE, INSPECT_SKIP_MSG, INSPECT_STREAK, WRITE_NOW_NOTE};
 use super::turn::{
     EMPTY_CHANNEL_NOTE, EMPTY_STOP_FALLBACK, NO_TOOL_THINK_FLOOR, PARSE_REPAIR_NOTE,
-    PHYSICS_WRAP_NOTE, SYNTHESIS_OUTPUT_CAP, SYNTHESIS_THINK_CAP, THINK_DIVERGENCE_NOTE,
+    PHYSICS_WRAP_NOTE, STUB_CONTINUE_NOTE, SYNTHESIS_OUTPUT_CAP, SYNTHESIS_THINK_CAP,
+    THINK_DIVERGENCE_NOTE,
 };
 use super::*;
 use crate::error::Error;
@@ -4137,6 +4138,111 @@ async fn watchdog_second_empty_cap_ends_quietly() {
 }
 
 #[tokio::test]
+async fn watchdog_keeps_partial_think_in_transcript() {
+    let dir = std::env::temp_dir().join(format!("hyper-wd-keep-{}", uuid::Uuid::new_v4().simple()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let think = "The repo layout is crates/hyper-loop with a ReAct drive loop.";
+    let scripted = Scripted {
+        turns: Mutex::new(VecDeque::from([
+            {
+                let mut t = ModelTurn::watchdog();
+                t.reasoning = think.into();
+                t.prompt_tokens = 1;
+                t.completion_tokens = 12;
+                t
+            },
+            turn_text("recovered after partial think"),
+        ])),
+        meter: false,
+    };
+    let mut agent = Agent::new(scripted, opts(&dir)).unwrap();
+    let out = agent.run("hi").await.unwrap();
+    assert_eq!(out.text, "recovered after partial think");
+    assert!(
+        agent.messages.iter().any(|m| {
+            m.role == "assistant"
+                && m.reasoning_content
+                    .as_deref()
+                    .is_some_and(|r| r.contains("repo layout"))
+        }),
+        "truncated think must stay in the transcript: {:?}",
+        agent
+            .messages
+            .iter()
+            .map(|m| (
+                m.role.as_str(),
+                m.reasoning_content.clone(),
+                m.content.clone()
+            ))
+            .collect::<Vec<_>>()
+    );
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+#[tokio::test]
+async fn progress_narration_without_tools_wraps() {
+    let dir = std::env::temp_dir().join(format!("hyper-stub-{}", uuid::Uuid::new_v4().simple()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let scripted = Scripted {
+        turns: Mutex::new(VecDeque::from([
+            turn_text("I'll read the file next."),
+            turn_text("here is the answer"),
+        ])),
+        meter: false,
+    };
+    let mut agent = Agent::new(scripted, opts(&dir)).unwrap();
+    let out = agent.run("look at the repo").await.unwrap();
+    assert_eq!(out.text, "here is the answer", "{:?}", out.stop_reason);
+    let hidden: Vec<_> = agent
+        .messages
+        .iter()
+        .filter(|m| m.role == "user")
+        .map(|m| m.content.clone().unwrap_or_default())
+        .filter(|c| crate::template::is_hidden_user_text(c))
+        .collect();
+    assert!(
+        hidden.iter().any(|c| c.contains(STUB_CONTINUE_NOTE)),
+        "next-step line must wrap, not finish: {hidden:?}"
+    );
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+#[tokio::test]
+async fn truncated_named_tools_are_not_executed() {
+    let dir = std::env::temp_dir().join(format!(
+        "hyper-trunc-tool-{}",
+        uuid::Uuid::new_v4().simple()
+    ));
+    std::fs::create_dir_all(&dir).unwrap();
+    let mut hit = turn_tool(
+        "write",
+        json!({"path": "should-not-land.rs", "contents": "partial"}),
+    );
+    hit.watchdog_hit = true;
+    let scripted = Scripted {
+        turns: Mutex::new(VecDeque::from([hit, turn_text("recovered without the write")])),
+        meter: false,
+    };
+    let mut o = opts(&dir);
+    o.peripheral = false;
+    let mut agent = Agent::new(scripted, o).unwrap();
+    let out = agent.run("write the file").await.unwrap();
+    assert_eq!(out.text, "recovered without the write", "{:?}", out.stop_reason);
+    assert!(
+        !dir.join("should-not-land.rs").exists(),
+        "length-truncated Write must not execute"
+    );
+    assert!(agent.messages.iter().any(|m| {
+        m.role == "tool"
+            && m.content
+                .as_deref()
+                .unwrap_or("")
+                .contains("was not executed")
+    }));
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+#[tokio::test]
 async fn doom_five_identical_reads_still_let_model_stop() {
     let dir = std::env::temp_dir().join(format!("grok-hyper-{}", uuid::Uuid::new_v4().simple()));
     std::fs::create_dir_all(&dir).unwrap();
@@ -7869,6 +7975,59 @@ async fn inspect_cap_write_intent_reenables_tools() {
     assert!(
         hidden.iter().any(|c| c.contains(WRITE_NOW_NOTE)),
         "write-now note missing: {hidden:?}"
+    );
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+#[tokio::test]
+async fn inspect_cap_still_executes_shell() {
+    let dir = std::env::temp_dir().join(format!(
+        "hyper-inspect-shell-after-cap-{}",
+        uuid::Uuid::new_v4().simple()
+    ));
+    std::fs::create_dir_all(&dir).unwrap();
+    let n = INSPECT_STREAK as usize;
+    for i in 0..n {
+        std::fs::write(
+            dir.join(format!("f{i}.rs")),
+            format!("fn keep_{i}() {{}}\n"),
+        )
+        .unwrap();
+    }
+    let mut hops: Vec<_> = (0..n)
+        .map(|i| turn_tool("read", json!({"path": format!("f{i}.rs")})))
+        .collect();
+    hops.push(inspect_after_nudge("f0.rs"));
+    hops.push(turn_tool(
+        "bash",
+        json!({"command": "echo shell-ok > flag.txt"}),
+    ));
+    hops.push(turn_text(SYNTH_ANSWER));
+    let scripted = Scripted {
+        turns: Mutex::new(VecDeque::from(hops)),
+        meter: false,
+    };
+    let mut o = opts(&dir);
+    o.max_steps = INSPECT_STREAK + 8;
+    o.peripheral = false;
+    let mut agent = Agent::new(scripted, o).unwrap();
+    let out = agent.run("read then verify").await.unwrap();
+    assert_eq!(out.text, SYNTH_ANSWER);
+    assert_eq!(out.stop_reason, None, "{:?}", out.stop_reason);
+    let flag = std::fs::read_to_string(dir.join("flag.txt")).unwrap_or_default();
+    assert!(
+        flag.contains("shell-ok"),
+        "Shell after write-nudge must run, not skip: {flag:?}"
+    );
+    let bodies: Vec<String> = agent
+        .messages
+        .iter()
+        .filter(|m| m.role == "tool")
+        .map(|m| m.content.clone().unwrap_or_default())
+        .collect();
+    assert!(
+        bodies.iter().any(|t| t.contains(INSPECT_SKIP_MSG)),
+        "extra Read must still skip: {bodies:?}"
     );
     let _ = std::fs::remove_dir_all(dir);
 }

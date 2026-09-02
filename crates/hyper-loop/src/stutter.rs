@@ -28,14 +28,57 @@ pub fn is_substantial_reply(s: &str) -> bool {
     reply_units(s) >= MIN_RESTATE_CHARS
 }
 
+/// Short next-step line. A no-tool hop that is only this is not a finish:
+/// the model announced work, it did not deliver. Substantial replies are
+/// never narration, even if they mention a next step.
+pub fn is_progress_narration(s: &str) -> bool {
+    let t = s.trim();
+    if t.is_empty() || is_substantial_reply(t) {
+        return false;
+    }
+    if is_scratch_think(t) {
+        return true;
+    }
+    const MARK: &[&str] = &[
+        "先克隆",
+        "先看",
+        "先读",
+        "先查",
+        "先把",
+        "接着",
+        "通读",
+        "补看",
+        "补读",
+        "再看",
+        "再读",
+        "再查",
+        "仓库很小",
+    ];
+    if MARK.iter().any(|m| t.contains(m)) {
+        return true;
+    }
+    let l = t.to_ascii_lowercase();
+    if l.contains("let me ") || l.contains("i'll ") || l.contains("next i") || l.contains("next,") {
+        return true;
+    }
+    matches!(t.chars().next(), Some('看' | '读' | '查'))
+        && !t.contains("结论")
+        && !t.contains("建议")
+        && !t.contains("问题")
+        && !t.contains("修复")
+        && !t.contains("没问题")
+        && !t.contains("读完")
+        && !t.contains("看完")
+}
+
 /// Grok synthesis hop sometimes narrates Write instead of emitting a native
 /// tool call (`I'll write files`, empty ` ```html ` fences). That is not a
 /// finished answer and must not be archived as a Decision.
 pub fn is_leaked_write_narration(s: &str) -> bool {
     let l = s.to_ascii_lowercase();
     const MARKS: &[&str] = &[
-        "i'll write",
-        "i will write",
+        "i'll write files",
+        "i will write files",
         "write files with the write",
         "the write tool is available",
         "let me actually invoke",
@@ -45,21 +88,28 @@ pub fn is_leaked_write_narration(s: &str) -> bool {
         "continuing with file writes",
         "invoke write",
         "call write now",
-        "正在写",
         "接下来写入",
         "我会调用 write",
-        "用 write 工具",
+        "我会用 write",
     ];
     if MARKS.iter().any(|m| l.contains(m) || s.contains(m)) {
         return true;
     }
-    let mut fences = 0u32;
-    let mut rest = l.as_str();
+    empty_html_fence(&l)
+}
+
+/// Grok paints empty ` ```html ` fences instead of Write. A real HTML
+/// snippet with content is a finished answer, not leaked intent.
+fn empty_html_fence(l: &str) -> bool {
+    let mut rest = l;
     while let Some(i) = rest.find("```html") {
-        fences += 1;
+        let after = rest[i + 7..].trim_start();
+        if after.starts_with("```") {
+            return true;
+        }
         rest = &rest[i + 7..];
     }
-    fences >= 2 || (fences == 1 && !l.contains("</html>"))
+    false
 }
 
 /// Thinking that is still planning, not a finished user-facing answer.
@@ -578,6 +628,18 @@ This is a different task from architecture review and names different files on p
         assert!(!is_leaked_write_narration(
             "已写入 `cmd/boce-api/main.go`。控制面主程序连 PG / Redis。"
         ));
+        assert!(!is_leaked_write_narration(
+            "已用 Write 工具写入 `cmd/boce-api/main.go`。接下来看测试。"
+        ));
+        assert!(!is_leaked_write_narration(
+            "正在写完最后的测试。主程序已经落在 `main.go`。"
+        ));
+        assert!(!is_leaked_write_narration(
+            "I'll write a short recap of the files already saved."
+        ));
+        assert!(!is_leaked_write_narration(
+            "Example:\n```html\n<div>hi</div>\n```\nThat snippet is the template."
+        ));
         assert!(!is_leaked_write_narration(ESSAY));
     }
 
@@ -635,5 +697,24 @@ This is a different task from architecture review and names different files on p
         let done = "已经把登录页标题改好并核对路由配置。空回复必须有兜底，控制台不能交空白气泡。";
         assert!(is_substantial_reply(&done.repeat(3)));
         assert!(!is_scratch_think(&done.repeat(3)));
+    }
+
+    #[test]
+    fn progress_narration_is_not_a_finish() {
+        assert!(is_progress_narration("补看构建对拍脚本。"));
+        assert!(is_progress_narration("先克隆仓库到本地看看。"));
+        assert!(is_progress_narration("仓库很小，通读全部文件。"));
+        assert!(is_progress_narration("接着读补丁脚本和 JIT 脚本。"));
+        assert!(is_progress_narration("看 HIP 核的 .cu 源码。"));
+        assert!(is_progress_narration("Let me read build_and_test.py next."));
+        assert!(is_progress_narration("I'll read the file next."));
+        assert!(!is_progress_narration("仓库审查结论"));
+        assert!(!is_progress_narration("recovered"));
+        assert!(!is_progress_narration("你好"));
+        assert!(!is_progress_narration("读完了。"));
+        assert!(!is_progress_narration(
+            "修得没问题。复查通过。c2f9bca 跳过 URL 端口里的三位数字，不再误判成 HTTP 状态码。\
+网关软上限与空回复路径已经对齐。用户可见结论写在这里，没有未完成的计划。"
+        ));
     }
 }
