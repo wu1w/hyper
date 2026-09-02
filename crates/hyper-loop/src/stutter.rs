@@ -55,20 +55,23 @@ pub fn is_progress_narration(s: &str) -> bool {
         "仓库很小",
     ];
     if MARK.iter().any(|m| t.contains(m)) {
-        return true;
+        return !is_verdict_like(t);
     }
     let l = t.to_ascii_lowercase();
     if l.contains("let me ") || l.contains("i'll ") || l.contains("next i") || l.contains("next,") {
         return true;
     }
-    matches!(t.chars().next(), Some('看' | '读' | '查'))
-        && !t.contains("结论")
-        && !t.contains("建议")
-        && !t.contains("问题")
-        && !t.contains("修复")
-        && !t.contains("没问题")
-        && !t.contains("读完")
-        && !t.contains("看完")
+    matches!(t.chars().next(), Some('看' | '读' | '查')) && !is_verdict_like(t)
+}
+
+fn is_verdict_like(t: &str) -> bool {
+    t.contains("结论")
+        || t.contains("建议")
+        || t.contains("问题")
+        || t.contains("修复")
+        || t.contains("没问题")
+        || t.contains("读完")
+        || t.contains("看完")
 }
 
 /// Grok synthesis hop sometimes narrates Write instead of emitting a native
@@ -712,6 +715,8 @@ This is a different task from architecture review and names different files on p
         assert!(!is_progress_narration("recovered"));
         assert!(!is_progress_narration("你好"));
         assert!(!is_progress_narration("读完了。"));
+        assert!(!is_progress_narration("建议：先看日志，再看指标。"));
+        assert!(!is_progress_narration("结论：再看一遍也一样。"));
         assert!(!is_progress_narration(
             "修得没问题。复查通过。c2f9bca 跳过 URL 端口里的三位数字，不再误判成 HTTP 状态码。\
 网关软上限与空回复路径已经对齐。用户可见结论写在这里，没有未完成的计划。"

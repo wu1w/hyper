@@ -152,6 +152,12 @@ fn turn_blank_transport() -> ModelTurn {
     t
 }
 
+fn turn_truncated_write(path: &str) -> ModelTurn {
+    let mut t = turn_tool("write", json!({"path": path, "contents": "partial"}));
+    t.watchdog_hit = true;
+    t
+}
+
 fn turn_tool(name: &str, args: Value) -> ModelTurn {
     turn_tools(vec![("call_1", name, args)])
 }
@@ -224,6 +230,10 @@ fn opts(dir: &std::path::Path) -> RunOpts {
     // own dedicated test below.
     o.narrate = false;
     o
+}
+
+fn responses_wire(messages: &[crate::template::ChatMessage]) -> String {
+    serde_json::to_string(&crate::session::messages_to_responses_input(messages)).unwrap()
 }
 
 fn opts_search(dir: &std::path::Path) -> RunOpts {
@@ -565,6 +575,12 @@ async fn physics_step_cap_wraps_then_keeps_spoken_text() {
         hidden.iter().any(|c| c.contains(PHYSICS_WRAP_NOTE)),
         "console physics cap must recap like Cursor/grok CLI: {hidden:?}"
     );
+    let wire = responses_wire(&agent.messages);
+    assert!(
+        wire.contains("[channel]"),
+        "physics wrap must reach grok-4.6: {wire}"
+    );
+    assert!(!wire.contains("[trajectory]"), "{wire}");
     let _ = std::fs::remove_dir_all(dir);
 }
 
@@ -681,6 +697,12 @@ async fn console_empty_hop_wraps_then_keeps_real_answer() {
         hidden.iter().any(|c| c.contains(EMPTY_CHANNEL_NOTE)),
         "console empty hop must wrap once: {hidden:?}"
     );
+    let wire = responses_wire(&agent.messages);
+    assert!(
+        wire.contains("[channel]"),
+        "empty-channel wrap must reach grok-4.6: {wire}"
+    );
+    assert!(wire.contains("no user-visible reply"), "{wire}");
     let _ = std::fs::remove_dir_all(dir);
 }
 
@@ -701,6 +723,48 @@ async fn console_dual_empty_uses_fallback() {
     let mut agent = Agent::new(scripted, o).unwrap();
     let out = agent.run("what did you find").await.unwrap();
     assert_eq!(out.text, EMPTY_STOP_FALLBACK, "{:?}", out.stop_reason);
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+#[tokio::test]
+async fn empty_fallback_is_logged_as_assistant_before_stop() {
+    let dir = std::env::temp_dir().join(format!(
+        "hyper-fallback-log-{}",
+        uuid::Uuid::new_v4().simple()
+    ));
+    let sess = dir.join("sessions");
+    std::fs::create_dir_all(&sess).unwrap();
+    let mut o = opts(&dir);
+    o.max_steps = 8;
+    o.peripheral = false;
+    o.persist_session = true;
+    o.session_id = "fb1".into();
+    o.session_dir = Some(sess.clone());
+    let scripted = Scripted {
+        turns: Mutex::new(VecDeque::from([turn_text(""), turn_text("")])),
+        meter: false,
+    };
+    let mut agent = Agent::new(scripted, o).unwrap();
+    let out = agent.run("what did you find").await.unwrap();
+    assert_eq!(out.text, EMPTY_STOP_FALLBACK, "{:?}", out.stop_reason);
+    assert!(!out.streamed_text);
+    let log = SessionLog::open_in(&sess, "fb1").unwrap();
+    let assistants: Vec<_> = log
+        .events()
+        .iter()
+        .filter_map(|e| match e {
+            SessionEvent::Assistant(a) => Some(a.content.as_str()),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(assistants, vec![EMPTY_STOP_FALLBACK], "{assistants:?}");
+    let kinds: Vec<_> = log.events().iter().map(|e| e.type_name()).collect();
+    let assistant_at = kinds.iter().position(|k| *k == "assistant").unwrap();
+    let stop_at = kinds.iter().position(|k| *k == "stop").unwrap();
+    assert!(
+        assistant_at < stop_at,
+        "fallback must land before stop: {kinds:?}"
+    );
     let _ = std::fs::remove_dir_all(dir);
 }
 
@@ -4204,6 +4268,51 @@ async fn progress_narration_without_tools_wraps() {
         hidden.iter().any(|c| c.contains(STUB_CONTINUE_NOTE)),
         "next-step line must wrap, not finish: {hidden:?}"
     );
+    let wire = responses_wire(&agent.messages);
+    assert!(
+        wire.contains("[channel]"),
+        "stub wrap must reach grok-4.6: {wire}"
+    );
+    assert!(wire.contains("only announced a next step"), "{wire}");
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+#[tokio::test]
+async fn progress_narration_is_not_the_visible_bubble() {
+    let dir = std::env::temp_dir().join(format!(
+        "hyper-stub-bubble-{}",
+        uuid::Uuid::new_v4().simple()
+    ));
+    let sess = dir.join("sessions");
+    std::fs::create_dir_all(&sess).unwrap();
+    let mut o = opts(&dir);
+    o.persist_session = true;
+    o.session_id = "stub1".into();
+    o.session_dir = Some(sess.clone());
+    let scripted = Scripted {
+        turns: Mutex::new(VecDeque::from([
+            turn_text("I'll read the file next."),
+            turn_text("here is the answer"),
+        ])),
+        meter: false,
+    };
+    let mut agent = Agent::new(scripted, o).unwrap();
+    let out = agent.run("look at the repo").await.unwrap();
+    assert_eq!(out.text, "here is the answer", "{:?}", out.stop_reason);
+    let log = SessionLog::open_in(&sess, "stub1").unwrap();
+    let assistants: Vec<_> = log
+        .events()
+        .iter()
+        .filter_map(|e| match e {
+            SessionEvent::Assistant(a) => Some(a.content.as_str()),
+            _ => None,
+        })
+        .collect();
+    assert!(
+        assistants.iter().all(|c| !c.contains("I'll read")),
+        "progress sentence must not be the user bubble: {assistants:?}"
+    );
+    assert_eq!(assistants.last().copied(), Some("here is the answer"));
     let _ = std::fs::remove_dir_all(dir);
 }
 
@@ -4220,14 +4329,21 @@ async fn truncated_named_tools_are_not_executed() {
     );
     hit.watchdog_hit = true;
     let scripted = Scripted {
-        turns: Mutex::new(VecDeque::from([hit, turn_text("recovered without the write")])),
+        turns: Mutex::new(VecDeque::from([
+            hit,
+            turn_text("recovered without the write"),
+        ])),
         meter: false,
     };
     let mut o = opts(&dir);
     o.peripheral = false;
     let mut agent = Agent::new(scripted, o).unwrap();
     let out = agent.run("write the file").await.unwrap();
-    assert_eq!(out.text, "recovered without the write", "{:?}", out.stop_reason);
+    assert_eq!(
+        out.text, "recovered without the write",
+        "{:?}",
+        out.stop_reason
+    );
     assert!(
         !dir.join("should-not-land.rs").exists(),
         "length-truncated Write must not execute"
@@ -4239,6 +4355,42 @@ async fn truncated_named_tools_are_not_executed() {
                 .unwrap_or("")
                 .contains("was not executed")
     }));
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+#[tokio::test]
+async fn length_truncations_reset_after_a_clean_hop() {
+    let dir = std::env::temp_dir().join(format!(
+        "hyper-trunc-reset-{}",
+        uuid::Uuid::new_v4().simple()
+    ));
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(dir.join("ping.txt"), "pong\n").unwrap();
+    let ping = json!({"path": "ping.txt"});
+    let scripted = Scripted {
+        turns: Mutex::new(VecDeque::from([
+            turn_truncated_write("a.rs"),
+            turn_tool("read", ping.clone()),
+            turn_truncated_write("b.rs"),
+            turn_tool("read", ping.clone()),
+            turn_truncated_write("c.rs"),
+            turn_text("still delivered after spaced truncations"),
+        ])),
+        meter: false,
+    };
+    let mut o = opts(&dir);
+    o.max_steps = 12;
+    o.peripheral = false;
+    let mut agent = Agent::new(scripted, o).unwrap();
+    let out = agent.run("write then answer").await.unwrap();
+    assert_eq!(
+        out.text, "still delivered after spaced truncations",
+        "{:?}",
+        out.stop_reason
+    );
+    assert!(!dir.join("a.rs").exists());
+    assert!(!dir.join("b.rs").exists());
+    assert!(!dir.join("c.rs").exists());
     let _ = std::fs::remove_dir_all(dir);
 }
 
@@ -7251,6 +7403,12 @@ async fn no_progress_permuted_hops_force_synthesis() {
         hidden.iter().any(|c| c.contains(WRITE_NOW_NOTE)),
         "write-now note missing: {hidden:?}"
     );
+    let wire = responses_wire(&agent.messages);
+    assert!(
+        wire.contains("[channel]"),
+        "write-now note must reach grok-4.6: {wire}"
+    );
+    assert!(wire.contains("Emit native Write"), "{wire}");
     assert!(
         hidden.iter().all(|c| !c.contains(FORCED_SYNTHESIS_NOTE)),
         "inspect cap must not unmount tools: {hidden:?}"

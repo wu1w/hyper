@@ -36,7 +36,7 @@ State remaining uncertainty explicitly.";
 /// this as tools=None. The next hop must be native Write / StrReplace / Task,
 /// or a finished answer with no tools.
 pub const WRITE_NOW_NOTE: &str = "\
-[trajectory] Further inspection is not adding enough new evidence. \
+[channel] Further inspection is not adding enough new evidence. \
 Do not Read, Grep, or Glob again. Emit native Write / StrReplace / Task \
 tool calls now — not JSON, HTML fences, or narration. \
 If the work is done, answer without tools.";

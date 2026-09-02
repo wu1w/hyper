@@ -2,6 +2,7 @@
 
 未发版之前以 git log 为准。下面记用户能看见的行为变化。
 
+- Grok Responses 收得到收口/催 Write 备注（`[channel]`）；进度旁白不再当成用户气泡，空跳兜底会作为 assistant 落下。Chat Completions 的 `finish_reason=length` 与 Responses `incomplete`/`failed` 按截断/失败处理；长度截断计数在干净跳后清零。
 - 停止权收拢到单裁决器：撞思考帽保留残稿并失败截断工具，无 finish_reason 的断流当瞬时错误重试；无工具的进度旁白不当终稿。Thinking 保持开启（Cursor / grok CLI），不走 27B thinking-off。
 - 跟进轮对齐 Cursor / grok CLI：compact 优先留下 Write/StrReplace 过的文件，不再只留 Glob/Read 头尾；`[history]` 默认只带本场归档，邻座会话要用户问起才贴；控制台撞步数/时间墙也留一跳收口，方便下一轮接着写。
 - 巡检门对齐 Cursor / grok CLI：`tools[]` 中途不卸。连续只读只催原生 Write，再 Read/Grep/Glob 则跳过并回 `[already observed]`，Shell / TodoWrite 仍执行。泄露旁白（空 html 围栏、I'll write files）不当终稿；「已用 Write 工具写入」仍是终稿。步数墙才是硬停。

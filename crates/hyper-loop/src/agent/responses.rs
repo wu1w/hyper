@@ -487,15 +487,43 @@ fn turn_from_responses(v: &Value) -> Result<ModelTurn> {
     if let Some(err) = crate::llm_http::json_api_error(v) {
         return Err(Error::Http(format_api_error(err)));
     }
-    let output = v
+    let root = v.get("response").unwrap_or(v);
+    if let Some(err) = crate::llm_http::json_api_error(root) {
+        return Err(Error::Http(format_api_error(err)));
+    }
+    let status = root.get("status").and_then(|s| s.as_str()).unwrap_or("");
+    if status.eq_ignore_ascii_case("failed") {
+        let err = root
+            .get("error")
+            .or_else(|| v.get("error"))
+            .map(format_api_error)
+            .filter(|s| !s.is_empty())
+            .unwrap_or_else(|| "responses failed".into());
+        return Err(Error::Http(err));
+    }
+    let output = root
         .get("output")
-        .or_else(|| v.pointer("/response/output"))
+        .or_else(|| v.get("output"))
         .cloned()
         .unwrap_or(Value::Array(Vec::new()));
     let mut acc = ResponsesAcc::default();
     acc.apply_output(&output);
     acc.apply_usage(v);
+    acc.apply_usage(root);
+    if status.eq_ignore_ascii_case("incomplete") || incomplete_length_reason(root) {
+        acc.incomplete_length = true;
+    }
     acc.into_turn()
+}
+
+fn incomplete_length_reason(v: &Value) -> bool {
+    matches!(
+        v.pointer("/incomplete_details/reason")
+            .and_then(|r| r.as_str())
+            .map(|s| s.trim().to_ascii_lowercase())
+            .as_deref(),
+        Some("max_output_tokens" | "incomplete")
+    )
 }
 
 #[derive(Default)]
@@ -512,6 +540,8 @@ struct ResponsesAcc {
     terminal: bool,
     /// `incomplete_details.reason = max_output_tokens` — length salvage, not a clean stop.
     incomplete_length: bool,
+    /// `response.failed` — into_turn returns Http, not a partial hop.
+    failed: Option<String>,
 }
 
 #[derive(Default, Clone)]
@@ -586,37 +616,13 @@ impl ResponsesAcc {
                 }
             }
             "response.completed" => {
-                self.note_terminal(ev.get("response"));
-                if let Some(resp) = ev.get("response") {
-                    if let Some(output) = resp.get("output") {
-                        let mut fresh = ResponsesAcc::default();
-                        fresh.apply_output(output);
-                        fresh.apply_usage(resp);
-                        if !fresh.content.is_empty() {
-                            self.content = fresh.content;
-                        }
-                        if !fresh.reasoning.is_empty() {
-                            self.reasoning = fresh.reasoning;
-                        }
-                        if !fresh.calls.is_empty() {
-                            self.calls = fresh.calls;
-                        }
-                        if !fresh.images.is_empty() {
-                            self.images = fresh.images;
-                        }
-                        self.prompt_tokens = fresh.prompt_tokens;
-                        self.completion_tokens = fresh.completion_tokens;
-                        self.cached_tokens = fresh.cached_tokens;
-                    } else {
-                        self.apply_usage(resp);
-                    }
-                }
+                self.absorb_response(ev.get("response"));
             }
             "response.incomplete" => {
-                self.note_terminal(ev.get("response"));
-                if let Some(resp) = ev.get("response") {
-                    self.apply_usage(resp);
-                }
+                self.absorb_response(ev.get("response"));
+            }
+            "response.failed" => {
+                self.fail_response(ev);
             }
             "error" => {}
             _ => {
@@ -773,6 +779,47 @@ impl ResponsesAcc {
         }
     }
 
+    fn absorb_response(&mut self, resp: Option<&Value>) {
+        self.note_terminal(resp);
+        let Some(resp) = resp else {
+            return;
+        };
+        if let Some(output) = resp.get("output") {
+            let mut fresh = ResponsesAcc::default();
+            fresh.apply_output(output);
+            fresh.apply_usage(resp);
+            if !fresh.content.is_empty() {
+                self.content = fresh.content;
+            }
+            if !fresh.reasoning.is_empty() {
+                self.reasoning = fresh.reasoning;
+            }
+            if !fresh.calls.is_empty() {
+                self.calls = fresh.calls;
+            }
+            if !fresh.images.is_empty() {
+                self.images = fresh.images;
+            }
+            self.prompt_tokens = fresh.prompt_tokens;
+            self.completion_tokens = fresh.completion_tokens;
+            self.cached_tokens = fresh.cached_tokens;
+        } else {
+            self.apply_usage(resp);
+        }
+    }
+
+    fn fail_response(&mut self, ev: &Value) {
+        self.terminal = true;
+        let msg = ev
+            .get("response")
+            .and_then(|r| r.get("error"))
+            .or_else(|| ev.get("error"))
+            .map(format_api_error)
+            .filter(|s| !s.is_empty())
+            .unwrap_or_else(|| "responses failed".into());
+        self.failed = Some(msg);
+    }
+
     fn mark_done(&mut self, id: &str) {
         if id.is_empty() {
             if let Some(c) = self
@@ -890,6 +937,9 @@ impl ResponsesAcc {
     }
 
     fn into_turn(self) -> Result<ModelTurn> {
+        if let Some(msg) = self.failed {
+            return Err(Error::Http(msg));
+        }
         let mut tool_calls = Vec::new();
         for c in &self.calls {
             if c.name.is_empty() {
@@ -1723,6 +1773,102 @@ mod tests {
         let dumped = serde_json::to_string(&body["input"]).unwrap();
         assert!(!dumped.contains("<tool_response>"), "{dumped}");
         assert!(!dumped.contains("[trajectory]"), "{dumped}");
+    }
+
+    #[test]
+    fn channel_wrap_notes_reach_responses_body() {
+        let msgs = vec![
+            ChatMessage::user("go"),
+            ChatMessage::hidden_user("[channel] The last hop had no user-visible reply."),
+        ];
+        let body = build_responses_body(&ResponsesSpec {
+            model: "grok-4.6",
+            messages: &msgs,
+            tools: None,
+            stream: false,
+            policy: &policy_high(),
+            cache_key: None,
+            compaction: None,
+            skip: 0,
+        });
+        let dumped = serde_json::to_string(&body["input"]).unwrap();
+        assert!(dumped.contains("[channel]"), "{dumped}");
+        assert!(dumped.contains("no user-visible reply"), "{dumped}");
+        assert!(!dumped.contains("<tool_response>"), "{dumped}");
+    }
+
+    #[test]
+    fn incomplete_status_is_length_salvage() {
+        let v = json!({
+            "status": "incomplete",
+            "incomplete_details": {"reason": "max_output_tokens"},
+            "output": [{
+                "type": "message",
+                "content": [{"type": "output_text", "text": "partial reply"}]
+            }],
+            "usage": {"input_tokens": 2, "output_tokens": 3}
+        });
+        let turn = turn_from_responses(&v).unwrap();
+        assert!(turn.watchdog_hit);
+        assert!(turn.content.contains("partial reply"), "{}", turn.content);
+        assert_eq!(turn.prompt_tokens, 2);
+    }
+
+    #[test]
+    fn failed_status_is_http_error() {
+        let err = turn_from_responses(&json!({
+            "status": "failed",
+            "error": {"message": "provider down"}
+        }))
+        .unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("provider down"), "{msg}");
+    }
+
+    #[test]
+    fn incomplete_stream_merges_output_as_length_salvage() {
+        let mut acc = ResponsesAcc::default();
+        acc.apply_event(&json!({
+            "type": "response.output_text.delta",
+            "delta": "stale"
+        }));
+        acc.apply_event(&json!({
+            "type": "response.incomplete",
+            "response": {
+                "status": "incomplete",
+                "incomplete_details": {"reason": "max_output_tokens"},
+                "output": [{
+                    "type": "message",
+                    "content": [{"type": "output_text", "text": "snapshot reply"}]
+                }],
+                "usage": {"input_tokens": 4, "output_tokens": 5}
+            }
+        }));
+        assert!(acc.terminal);
+        assert!(acc.incomplete_length);
+        let turn = acc.into_turn().unwrap();
+        assert!(turn.watchdog_hit);
+        assert_eq!(turn.content, "snapshot reply");
+        assert_eq!(turn.prompt_tokens, 4);
+    }
+
+    #[test]
+    fn failed_stream_is_http_error() {
+        let mut acc = ResponsesAcc::default();
+        acc.apply_event(&json!({
+            "type": "response.output_text.delta",
+            "delta": "partial"
+        }));
+        acc.apply_event(&json!({
+            "type": "response.failed",
+            "response": {
+                "status": "failed",
+                "error": {"message": "provider down"}
+            }
+        }));
+        let err = acc.into_turn().unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("provider down"), "{msg}");
     }
 
     #[test]

@@ -287,6 +287,8 @@ fn is_cursor_noise_user(msg: &ChatMessage) -> bool {
     }
     let inner = unwrap_qwen_hidden(t);
     let inner = inner.trim();
+    // Wrap / write-now notes use `[channel]` so grok-4.6 still sees them.
+    // Qwen-loop lectures stay `[trajectory]` and are dropped here.
     const DROP: &[&str] = &[
         "[locate]",
         "[trajectory]",
@@ -753,6 +755,26 @@ mod tests {
         let blob = serde_json::to_string(&input).unwrap();
         assert_eq!(input.len(), 1, "{blob}");
         assert!(!blob.contains("[trajectory]"), "{blob}");
+    }
+
+    #[test]
+    fn channel_wrap_notes_reach_responses() {
+        let msgs = vec![
+            ChatMessage::user("task"),
+            ChatMessage::hidden_user(
+                "[channel] The last hop had no user-visible reply. Write the full conclusion.",
+            ),
+            ChatMessage::hidden_user(
+                "[channel] Further inspection is not adding enough new evidence.",
+            ),
+        ];
+        let input = messages_to_responses_input(&msgs);
+        let blob = serde_json::to_string(&input).unwrap();
+        assert_eq!(input.len(), 3, "{blob}");
+        assert!(blob.contains("[channel]"), "{blob}");
+        assert!(blob.contains("no user-visible reply"), "{blob}");
+        assert!(blob.contains("Further inspection"), "{blob}");
+        assert!(!blob.contains("<tool_response>"), "{blob}");
     }
 
     #[test]

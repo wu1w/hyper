@@ -310,6 +310,11 @@ impl<C: Completer> Agent<C> {
             return Ok(Verdict::Stop(StopCause::Exhausted));
         }
 
+        // A clean hop (answer or executed tools) is not consecutive with a
+        // later length-truncated tool batch. Reset so a long turn with
+        // scattered salvage hops does not trip Exhausted.
+        self.length_truncations = 0;
+
         if self.wrap_up_after_tools && !turn.tool_calls.is_empty() {
             self.note("[watchdog] wrap-up leaked tools; not executed");
             turn.tool_calls.clear();
@@ -452,7 +457,17 @@ impl<C: Completer> Agent<C> {
         if turn.content.trim().is_empty() && turn.reasoning.trim().is_empty() {
             return false;
         }
-        self.push_assistant(turn);
+        if turn.content.trim().is_empty() {
+            // Think-only: keep the panel, no user bubble.
+            self.record_assistant(turn, true);
+            return true;
+        }
+        // Progress / empty-wrap stubs stay in the in-flight transcript so
+        // the next hop can see them. Do not log them as the visible reply.
+        self.record_assistant(turn, false);
+        if let Some(sink) = self.live_sink() {
+            sink.clear_content();
+        }
         true
     }
 
@@ -513,6 +528,10 @@ impl<C: Completer> Agent<C> {
     }
 
     pub(crate) fn push_assistant(&mut self, turn: &ModelTurn) {
+        self.record_assistant(turn, true);
+    }
+
+    fn record_assistant(&mut self, turn: &ModelTurn, visible: bool) {
         let tool_calls = if turn.tool_calls.is_empty() {
             None
         } else {
@@ -549,6 +568,9 @@ impl<C: Completer> Agent<C> {
             })
             .collect();
         self.messages.push(msg);
+        if !visible {
+            return;
+        }
         self.log_event(
             SessionEvent::assistant_usage(
                 content.unwrap_or_default(),
@@ -907,27 +929,34 @@ impl<C: Completer> Agent<C> {
         if self.print {
             self.stdio.close_think();
         }
-        let reason = stop_reason.clone().unwrap_or_else(|| "end_turn".into());
-        self.log_event(SessionEvent::stop(reason));
         let aborted = stop_reason.as_deref() == Some("aborted");
-        let run_phase = if aborted {
-            RunPhase::Aborted
-        } else {
-            RunPhase::Completed
-        };
-        self.end_run(run_phase, stop_reason.clone());
         let mut text = if aborted || !text.trim().is_empty() {
             text
         } else {
             self.last_spoken.clone().unwrap_or_default()
         };
+        let mut streamed_text = self.stdio.text_streamed();
         if !aborted && text.trim().is_empty() {
             if !super::interactive_channel(&self.channel) && !self.channel.is_empty() {
                 text = im_no_reply_text(stop_reason.as_deref());
             } else {
                 text = EMPTY_STOP_FALLBACK.to_string();
             }
+            // Stub hops are not logged as the user bubble. Sidecar hardcodes
+            // `streamed: true`, so the canned line must be an assistant event
+            // before `stop` or the UI never shows it. CLI prints when
+            // `streamed_text` is false.
+            self.emit_canned_fallback(&text);
+            streamed_text = false;
         }
+        let reason = stop_reason.clone().unwrap_or_else(|| "end_turn".into());
+        self.log_event(SessionEvent::stop(reason));
+        let run_phase = if aborted {
+            RunPhase::Aborted
+        } else {
+            RunPhase::Completed
+        };
+        self.end_run(run_phase, stop_reason.clone());
         if !aborted {
             self.maybe_write_chat_recap(&text);
         }
@@ -937,11 +966,24 @@ impl<C: Completer> Agent<C> {
             steps,
             session_id: self.session_id.clone(),
             pending_steer: take_steer(&self.steer),
-            streamed_text: self.stdio.text_streamed(),
+            streamed_text,
             channel_files: std::mem::take(&mut self.channel_files),
             plan_mode: self.plan_mode,
             clarify_mode: self.clarify_mode,
         })
+    }
+
+    fn emit_canned_fallback(&mut self, text: &str) {
+        self.messages.push(ChatMessage::assistant_reply(
+            Some(text.to_string()),
+            None,
+            None,
+        ));
+        self.log_event(SessionEvent::assistant(
+            text.to_string(),
+            String::new(),
+            None,
+        ));
     }
 
     fn maybe_write_chat_recap(&self, text: &str) {
@@ -1019,19 +1061,22 @@ pub(crate) const THINK_DIVERGENCE_NOTE: &str = "[trajectory] This turn's thinkin
 Compress known facts and open questions first; answer or act if the evidence is enough, else take only the smallest missing step.";
 
 pub(crate) const PHYSICS_WRAP_NOTE: &str =
-    "[trajectory] No user-visible reply yet. Summarize what you found and accomplished; \
+    "[channel] No user-visible reply yet. Summarize what you found and accomplished; \
 do not call any more tools.";
 
 /// One wrap-up hop after a toolless hop with empty visible content.
 /// Thinking is not the answer (Cursor hop geometry).
+///
+/// `[channel]` reaches grok-4.6 Responses. `[trajectory]` notes are washed
+/// off that wire so Qwen-loop lectures stay local.
 pub(crate) const EMPTY_CHANNEL_NOTE: &str = "\
-[trajectory] The last hop had no user-visible reply. \
+[channel] The last hop had no user-visible reply. \
 Write the full conclusion in the normal reply — thinking is not shown as the answer. \
 If the task is unfinished, call a tool. Do not submit another empty reply.";
 
 /// No-tool hop that only announced the next step.
 pub(crate) const STUB_CONTINUE_NOTE: &str = "\
-[trajectory] The last hop only announced a next step — no tool call and no conclusion. \
+[channel] The last hop only announced a next step — no tool call and no conclusion. \
 Call the tool, or write the full answer. Do not submit another next-step line.";
 
 /// Truncated native tool calls are not executed (pi / grok CLI length salvage).

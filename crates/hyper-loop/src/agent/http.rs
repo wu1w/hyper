@@ -409,11 +409,11 @@ fn turn_from_json(v: &Value, truncated: bool) -> Result<ModelTurn> {
     if let Some(err) = crate::llm_http::json_api_error(v) {
         return Err(Error::Http(err.to_string()));
     }
-    Ok(if truncated {
-        parse_turn_opts(v, true)?.into_turn()
-    } else {
-        parse_turn(v)?.into_turn()
-    })
+    let mut turn = parse_turn_opts(v, truncated)?.into_turn();
+    if turn.watchdog_hit {
+        reattach_truncated_tools(&mut turn, v);
+    }
+    Ok(turn)
 }
 
 /// Parsed completion plus a parse-fail signal for the agent loop.
@@ -457,11 +457,13 @@ fn parse_turn_opts(v: &Value, truncated: bool) -> Result<ParseOutcome> {
     }
 
     let raw_openai = msg["tool_calls"].as_array().cloned();
+    let finish = v["choices"][0]["finish_reason"].as_str();
+    let length_hit = truncated || is_length_finish(finish);
     let tool_calls: Vec<ToolCall> = raw_openai
         .as_ref()
         .map(|arr| {
             arr.iter()
-                .filter_map(|item| parse_tool_call(item, truncated))
+                .filter_map(|item| parse_tool_call(item, length_hit))
                 .collect()
         })
         .unwrap_or_default();
@@ -481,7 +483,7 @@ fn parse_turn_opts(v: &Value, truncated: bool) -> Result<ParseOutcome> {
             raw_tool_calls,
             prompt_tokens: parse_prompt_tokens(v),
             completion_tokens: parse_completion_tokens(v),
-            watchdog_hit: false,
+            watchdog_hit: length_hit,
             parse_fail,
             cached_tokens: parse_cached_tokens(v),
             decode_tok_s: parse_decode_tok_s(v),
@@ -489,6 +491,13 @@ fn parse_turn_opts(v: &Value, truncated: bool) -> Result<ParseOutcome> {
         },
         parse_fail,
     })
+}
+
+fn is_length_finish(reason: Option<&str>) -> bool {
+    matches!(
+        reason.map(|s| s.trim().to_ascii_lowercase()).as_deref(),
+        Some("length" | "max_tokens" | "content_filter")
+    )
 }
 
 fn json_u64(v: &Value) -> Option<u64> {
@@ -745,14 +754,18 @@ impl StreamAcc {
             usage["prompt_tokens_details"] = json!({"cached_tokens": cached});
             usage["cache_n"] = json!(cached);
         }
+        let mut choice = json!({
+            "message": {
+                "content": self.content,
+                "reasoning_content": self.reasoning,
+                "tool_calls": tool_calls,
+            }
+        });
+        if let Some(reason) = self.finish_reason {
+            choice["finish_reason"] = json!(reason);
+        }
         let mut root = json!({
-            "choices": [{
-                "message": {
-                    "content": self.content,
-                    "reasoning_content": self.reasoning,
-                    "tool_calls": tool_calls,
-                }
-            }],
+            "choices": [choice],
             "usage": usage,
         });
         if let Some(t) = self.timings {
@@ -879,12 +892,7 @@ fn finalize_sse(
         p.finish(&acc.reasoning, &acc.content, !acc.tool_calls.is_empty());
     }
     let v = acc.into_message_json();
-    let mut turn = turn_from_json(&v, watchdog)?;
-    if watchdog {
-        turn.watchdog_hit = true;
-        reattach_truncated_tools(&mut turn, &v);
-    }
-    Ok(turn)
+    turn_from_json(&v, watchdog)
 }
 
 /// Incomplete JSON args are dropped by truncated parse. Keep named stubs so
@@ -1485,6 +1493,75 @@ mod tests {
         let turn = read_sse(&mut resp, Family::Qwen38, None, None, None)
             .await
             .expect("finish_reason terminates the stream cleanly");
+        assert_eq!(turn.content, "ok");
+        assert!(!turn.watchdog_hit);
+    }
+
+    #[tokio::test]
+    async fn finish_reason_length_is_watchdog() {
+        let url = sse_server(
+            "data: {\"choices\":[{\"delta\":{\"content\":\"partial\"}}]}\n\n\
+             data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"length\"}]}\n\n",
+        )
+        .await;
+        let mut resp = reqwest::Client::new().get(&url).send().await.unwrap();
+        let turn = read_sse(&mut resp, Family::Qwen38, None, None, None)
+            .await
+            .expect("length stop is a finished stream, not a cut");
+        assert_eq!(turn.content, "partial");
+        assert!(turn.watchdog_hit);
+    }
+
+    #[test]
+    fn finish_reason_length_marks_valid_tools_truncated() {
+        let v = json!({
+            "choices": [{
+                "finish_reason": "length",
+                "message": {
+                    "content": null,
+                    "tool_calls": [{
+                        "id": "c1",
+                        "type": "function",
+                        "function": {"name": "read", "arguments": "{\"path\":\"a.rs\"}"}
+                    }]
+                }
+            }]
+        });
+        let turn = turn_from_json(&v, false).unwrap();
+        assert!(turn.watchdog_hit);
+        assert_eq!(turn.tool_calls.len(), 1);
+        assert_eq!(turn.tool_calls[0].name, "read");
+    }
+
+    #[test]
+    fn finish_reason_length_reattaches_incomplete_json_tools() {
+        let v = json!({
+            "choices": [{
+                "finish_reason": "length",
+                "message": {
+                    "content": null,
+                    "tool_calls": [{
+                        "id": "c1",
+                        "function": {"name": "write", "arguments": "{\"path\":"}
+                    }]
+                }
+            }]
+        });
+        let turn = turn_from_json(&v, false).unwrap();
+        assert!(turn.watchdog_hit);
+        assert_eq!(turn.tool_calls.len(), 1);
+        assert_eq!(turn.tool_calls[0].name, "write");
+    }
+
+    #[test]
+    fn finish_reason_stop_is_not_watchdog() {
+        let v = json!({
+            "choices": [{
+                "finish_reason": "stop",
+                "message": {"content": "ok"}
+            }]
+        });
+        let turn = turn_from_json(&v, false).unwrap();
         assert_eq!(turn.content, "ok");
         assert!(!turn.watchdog_hit);
     }
