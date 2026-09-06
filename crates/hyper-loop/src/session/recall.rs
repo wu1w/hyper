@@ -1,5 +1,4 @@
-//! Session archive recall. Not in the frozen Cursor schema. Kept for live
-//! tests that mount the tool explicitly; compact no longer appends it.
+//! Session archive recall, mounted from session start.
 
 use crate::session::event::SessionEvent;
 use crate::session::log::SessionLog;
@@ -33,18 +32,26 @@ fn search(log: Option<&SessionLog>, id: &str, query: &str, limits: ToolLimits) -
     let Some(log) = log else {
         return ToolResponse::text(id, "Error: no session index.", ToolState::Error);
     };
-    match log.search(query, 8) {
+    match log.search(query, 4) {
         Ok(hits) if hits.is_empty() => ToolResponse::text(id, "No matches.", ToolState::Success),
         Ok(hits) => {
             let mut text = String::new();
             for h in hits {
+                // Include small source events in one hop; keep a focused
+                // snippet plus expansion handle for larger results.
+                let original = log
+                    .events()
+                    .get(h.seq as usize)
+                    .map(|event| format_event(h.seq as u32, event))
+                    .filter(|text| text.chars().count() <= 1600);
+                let evidence = original.as_deref().unwrap_or(h.snippet.trim());
                 text.push_str(&format!(
                     "seq={} kind={} name={} blob={}\n{}\n\n",
                     h.seq,
                     h.kind,
                     h.name.as_deref().unwrap_or("-"),
                     h.blob.as_deref().unwrap_or("-"),
-                    h.snippet.trim()
+                    evidence,
                 ));
             }
             folded_response(id, text, ToolState::Success, limits, None)

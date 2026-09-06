@@ -82,6 +82,7 @@ pub fn is_parallel_safe(name: &str) -> bool {
             | "grep"
             | "glob"
             | "search"
+            | "recall"
             | "web"
             | "task"
             | "readlints"
@@ -110,10 +111,11 @@ pub fn agent_tools() -> Vec<Value> {
         parse(SWITCH_MODE),
         parse(TASK),
         parse(AWAIT_SHELL),
+        parse(RECALL),
     ]
 }
 
-pub fn agent_tool_names() -> [&'static str; 17] {
+pub fn agent_tool_names() -> [&'static str; 18] {
     [
         "Read",
         "Write",
@@ -132,6 +134,7 @@ pub fn agent_tool_names() -> [&'static str; 17] {
         "SwitchMode",
         "Task",
         "AwaitShell",
+        "recall",
     ]
 }
 
@@ -143,7 +146,7 @@ pub fn code_tool_names() -> [&'static str; 3] {
     ["run_code", "Read", "Shell"]
 }
 
-/// Separate blob. Not in the frozen Cursor set; live tests may still mount it.
+/// Mounted from session start so archive access does not change the tool prefix.
 pub fn recall_tool() -> Value {
     parse(RECALL)
 }
@@ -231,8 +234,8 @@ pub fn has_recall(tools: &[Value]) -> bool {
     has_tool(tools, "recall")
 }
 
-/// Drop `recall` if a previous Hyper version appended it. Cursor compact
-/// continues from the archive card; it does not expose a search-archive tool.
+/// Legacy utility for callers constructing a surface without session storage.
+/// Normal agent compaction never calls this: archive recovery stays mounted.
 pub fn strip_recall(tools: &mut Vec<Value>) -> bool {
     let before = tools.len();
     tools.retain(|t| {
@@ -390,9 +393,9 @@ mod tests {
             .iter()
             .map(|t| t["function"]["name"].as_str().unwrap())
             .collect();
-        assert!(!names.contains(&"recall"));
+        assert!(names.contains(&"recall"));
         assert_eq!(serde_json::to_string(&recall_tool()).unwrap(), RECALL);
-        assert!(!has_recall(&tools));
+        assert!(has_recall(&tools));
         let mut with = vec![recall_tool()];
         assert!(has_recall(&with));
         assert!(strip_recall(&mut with));

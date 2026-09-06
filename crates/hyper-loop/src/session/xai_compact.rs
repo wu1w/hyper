@@ -505,8 +505,18 @@ pub async fn run_official_compact(
     api_key: &str,
     messages: &[ChatMessage],
 ) -> Result<OfficialCompaction> {
-    let url = compact_url(base_url);
     let input = messages_to_responses_input(messages);
+    run_official_compact_input(base_url, api_key, input).await
+}
+
+/// Accept the previous opaque snapshot plus its new suffix for repeated
+/// compaction. Never regenerate an old snapshot from its lossy local summary.
+pub async fn run_official_compact_input(
+    base_url: &str,
+    api_key: &str,
+    input: Vec<Value>,
+) -> Result<OfficialCompaction> {
+    let url = compact_url(base_url);
     let body = json!({
         "model": OFFICIAL_MODEL,
         "input": input,

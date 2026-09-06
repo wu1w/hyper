@@ -178,10 +178,22 @@ impl SessionLog {
     }
 
     pub fn search(&self, query: &str, limit: usize) -> Result<Vec<Hit>> {
-        match &self.index {
-            Some(index) => index.search(query, Some(&self.id), limit),
-            None => Ok(Vec::new()),
+        if query.is_ascii() {
+            if let Some(index) = &self.index {
+                if let Ok(hits) = index.search(query, Some(&self.id), limit) {
+                    if !hits.is_empty() {
+                        return Ok(hits);
+                    }
+                }
+            }
         }
+        Ok(crate::session::index::search_events(
+            &self.id,
+            &self.events,
+            query,
+            limit,
+            false,
+        ))
     }
 
     fn write_event(&mut self, event: SessionEvent) -> Result<()> {

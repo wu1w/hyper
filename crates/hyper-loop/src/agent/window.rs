@@ -9,7 +9,6 @@ use crate::media::MediaKind;
 use crate::session::{compact_messages, derive_messages, plan_compact, SessionEvent};
 use crate::template::{render, ChatMessage, RenderOpts};
 use crate::tokenize::count_tokens;
-use crate::tools_schema::strip_recall;
 use serde_json::Value;
 
 /// Painted into the think panel so a follow-up compact is not silent "等待模型".
@@ -25,6 +24,11 @@ impl<C: Completer> Agent<C> {
             return None;
         }
         if self.over_soft_window() || self.mid_turn_computer_use() {
+            // Compact the actual transcript, before a lossy local archive.
+            let n = self.prefix_tokens_gate() as u64;
+            if self.try_official_compact(n).await {
+                return None;
+            }
             for _ in 0..2 {
                 if !self.apply_compact_pass() {
                     break;
@@ -63,15 +67,10 @@ impl<C: Completer> Agent<C> {
     /// Archive previous turns at the start of a follow-up user message so a
     /// finished long turn is not replayed as a cold prefill.
     ///
-    /// Do not Jinja+HF-tokenize the fat transcript first, and do not POST it
-    /// to `/v1/responses/compact` (120s). Both sit in front of the first hop
-    /// with no thinking tokens. Local archive first; official compact only
-    /// on the already-shrunk remainder.
+    /// Use the cheap meter. When official compaction is due, give it the
+    /// original transcript rather than an already-truncated archive.
     pub(crate) async fn compact_at_user_turn(&mut self) {
         if self.working_window == 0 {
-            return;
-        }
-        if !self.can_apply_compact() {
             return;
         }
         if !should_compact_follow_up(
@@ -84,8 +83,15 @@ impl<C: Completer> Agent<C> {
         ) {
             return;
         }
+        if !self.can_apply_compact() {
+            return;
+        }
         self.signal_preparing();
         tokio::task::yield_now().await;
+        let n = self.prefix_tokens_gate() as u64;
+        if self.try_official_compact(n).await {
+            return;
+        }
         if !self.apply_compact_pass() {
             return;
         }
@@ -131,9 +137,6 @@ impl<C: Completer> Agent<C> {
         let Some((base, key)) = self.xai_compact.clone() else {
             return false;
         };
-        if live_tool_count(&self.messages) >= super::TURN_START_COMPACT_TOOLS {
-            return false;
-        }
         if !crate::session::should_official_compact(
             prompt_tokens,
             self.working_window,
@@ -141,24 +144,35 @@ impl<C: Completer> Agent<C> {
         ) {
             return false;
         }
-        match crate::session::run_official_compact(&base, &key, &self.messages).await {
+        let input = self.official_compact_input();
+        let result = tokio::select! {
+            biased;
+            _ = self.cancel.cancelled() => return false,
+            result = crate::session::run_official_compact_input(&base, &key, input) => result,
+        };
+        match result {
             Ok(item) => {
                 self.note(&format!(
                     "[compact] official id={} blob={}",
                     item.id,
                     item.debug_blob()
                 ));
-                self.official_compaction = Some(item.clone());
+                // Rewriting local history invalidates any older blob/offset.
+                // Install the new snapshot only after that rewrite finishes.
+                let _ = self.apply_compact_pass();
+                self.official_compaction = Some(item);
                 self.completer
                     .set_official_compaction(self.official_compaction.clone());
-                let _ = self.apply_compact_pass();
+                self.official_compaction_skip =
+                    self.messages.iter().filter(|m| m.role != "system").count();
+                self.completer
+                    .set_compaction_skip(self.official_compaction_skip);
                 true
             }
             Err(_) => {
                 if prompt_tokens > crate::session::PRICE_CLIFF_TOKENS {
                     self.note("[compact] official failed; local archive");
-                    let _ = self.apply_compact_pass();
-                    true
+                    self.apply_compact_pass()
                 } else {
                     false
                 }
@@ -166,19 +180,27 @@ impl<C: Completer> Agent<C> {
         }
     }
 
+    pub(crate) fn official_compact_input(&self) -> Vec<Value> {
+        if let Some(prior) = &self.official_compaction {
+            let suffix: Vec<_> = self
+                .messages
+                .iter()
+                .filter(|m| m.role != "system")
+                .skip(self.official_compaction_skip)
+                .cloned()
+                .collect();
+            crate::session::responses_input_after(prior, &suffix)
+        } else {
+            crate::session::messages_to_responses_input(&self.messages)
+        }
+    }
+
     pub(crate) fn apply_compact_pass(&mut self) -> bool {
         if !self.try_compact() {
             return false;
         }
-        let skip = self.messages.iter().filter(|m| m.role != "system").count();
-        self.completer.set_compaction_skip(skip);
         self.after_compact();
-        let tools = strip_recall(&mut self.tools);
-        if tools {
-            self.note("[compact] cache_invalidated=compact,tools");
-        } else {
-            self.note("[compact] cache_invalidated=compact");
-        }
+        self.note("[compact] cache_invalidated=compact");
         true
     }
 
@@ -259,6 +281,12 @@ impl<C: Completer> Agent<C> {
             false
         };
         if compacted {
+            // A previous official blob does not contain the newly archived
+            // turns. Never keep it with an offset into a different transcript.
+            self.official_compaction = None;
+            self.official_compaction_skip = 0;
+            self.completer.set_official_compaction(None);
+            self.completer.set_compaction_skip(0);
             self.refresh_workset_cards();
             let user = self.last_real_user().to_string();
             self.refresh_history_cards(&user);

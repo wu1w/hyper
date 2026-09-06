@@ -17,9 +17,7 @@ mod tests {
     use crate::policy::{Effort, ThinkPolicy};
     use crate::session::{SessionLog, SessionMode};
     use crate::template::{is_hidden_user_text, wrap_tool_response, ChatMessage};
-    use crate::tools_schema::{
-        agent_tools, dynamic_mcp_tools, memory_search_tool, recall_tool, skill_tool,
-    };
+    use crate::tools_schema::{agent_tools, dynamic_mcp_tools, memory_search_tool, skill_tool};
 
     fn live_cfg() -> Config {
         let (mut cfg, _) = Config::load_or_init().unwrap();
@@ -307,7 +305,6 @@ mod tests {
     async fn live_recall_after_archive() {
         let (http, cfg, model) = client().await;
         let mut tools = agent_tools();
-        tools.push(recall_tool());
         let archive = wrap_tool_response(
             "[archived]\n## Active Task\nfix prefix cache\n\n## Index\nseq 3  tool bash blob=aa\n\
              Use recall to search archived turns or expand a blob by sha.\n",
@@ -415,7 +412,6 @@ mod tests {
         let mut tools = agent_tools();
         tools.push(memory_search_tool());
         tools.push(skill_tool());
-        tools.push(recall_tool());
         tools.extend(dynamic_mcp_tools());
         let system = format!(
             "{}{}",
@@ -801,8 +797,8 @@ mod tests {
         eprintln!("  compacted={compacted} answer={:?}", out.text);
         if compacted {
             assert!(
-                !crate::tools_schema::has_recall(agent.tools()),
-                "Cursor compact does not mount recall"
+                crate::tools_schema::has_recall(agent.tools()),
+                "compact preserves recall mounted from the start"
             );
             let archives: Vec<_> = agent
                 .messages()

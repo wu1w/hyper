@@ -416,9 +416,6 @@ impl<C: Completer> Agent<C> {
             self.start_code_index();
             self.settle_code_index().await;
         }
-        if let Some(h) = self.in_flight_diag.take() {
-            h.abort();
-        }
         for call in &calls {
             self.note(&format!("[{}] {}", call.name, preview_args(call)));
         }
@@ -509,11 +506,11 @@ impl<C: Completer> Agent<C> {
                 }
             }
         }
-        let diag = if let Some(h) = self.in_flight_diag.take() {
-            h.await.ok().flatten()
-        } else {
-            verify::run_diagnostics_async(self.workspace.root(), &edited, &self.cancel).await
-        };
+        // One check of the final batch state. Aborting an async wrapper does
+        // not stop its spawn_blocking compiler, so per-edit restarts leaked
+        // concurrent cargo checks and contended on the build lock.
+        let diag =
+            verify::run_diagnostics_async(self.workspace.root(), &edited, &self.cancel).await;
         if let Some(diag) = diag.as_ref() {
             if let Some(id) = last_edit_id.as_deref() {
                 if let Some(i) = calls.iter().position(|c| c.id == id) {
@@ -841,6 +838,9 @@ impl<C: Completer> Agent<C> {
 
     /// None = run Search. Some = Success nudge (paraphrase or turn cap).
     fn search_gate(&self, call: &ToolCall) -> Option<String> {
+        if self.completer.recasts_xai_product() {
+            return None;
+        }
         let query = crate::tools::arg_str(&call.arguments, "query").unwrap_or_default();
         if self.idle_named_write_search(&query) {
             return Some(search_nudge_reply(SEARCH_NAMED_WRITE_MSG, &self.messages));
@@ -864,6 +864,11 @@ impl<C: Completer> Agent<C> {
     fn grep_gate(&self, call: &ToolCall) -> Option<String> {
         if forbids_grep(self.last_real_user()) {
             return Some(search_nudge_reply(GREP_FORBIDDEN_MSG, &self.messages));
+        }
+        // Grok chooses its evidence. Similar regexes, different paths and
+        // pagination are not duplicates. The exact-call doom gate still runs.
+        if self.completer.recasts_xai_product() {
+            return None;
         }
         if let Some(pattern) = crate::tools::arg_str(&call.arguments, "pattern") {
             let covered = {
@@ -903,6 +908,9 @@ impl<C: Completer> Agent<C> {
     }
 
     fn read_gate(&self, call: &ToolCall) -> Option<String> {
+        if self.completer.recasts_xai_product() {
+            return None;
+        }
         if dispatch_name(&call.name) != "read" {
             return None;
         }
@@ -935,6 +943,9 @@ impl<C: Completer> Agent<C> {
         if forbids_glob(self.last_real_user()) {
             return Some(search_nudge_reply(GLOB_FORBIDDEN_MSG, &self.messages));
         }
+        if self.completer.recasts_xai_product() {
+            return None;
+        }
         let pat = crate::tools::arg_str(&call.arguments, "glob_pattern").unwrap_or_default();
         let dir = crate::tools::arg_str(&call.arguments, "target_directory").unwrap_or_default();
         if glob_covered_by_search(&pat, &self.messages) {
@@ -952,6 +963,9 @@ impl<C: Completer> Agent<C> {
     }
 
     fn bash_cat_gate(&self, call: &ToolCall) -> Option<String> {
+        if self.completer.recasts_xai_product() {
+            return None;
+        }
         if dispatch_name(&call.name) != "bash" {
             return None;
         }
@@ -1395,50 +1409,12 @@ impl<C: Completer> Agent<C> {
         }
     }
 
-    fn kick_diagnostics(&mut self, edited: &[String]) {
-        if edited.is_empty() {
-            return;
-        }
-        if let Some(h) = self.in_flight_diag.take() {
-            h.abort();
-        }
-        let root = self.workspace.root().to_path_buf();
-        let cancel = self.cancel.clone();
-        let edited = edited.to_vec();
-        self.in_flight_diag = Some(tokio::spawn(async move {
-            verify::run_diagnostics_async(&root, &edited, &cancel).await
-        }));
-    }
-
-    fn maybe_kick_diag(
-        &mut self,
-        call: &ToolCall,
-        response: &ToolResponse,
-        edited: &mut Vec<String>,
-    ) {
-        if response.state != ToolState::Success {
-            return;
-        }
-        if !matches!(dispatch_name(&call.name), "edit" | "write" | "editnotebook") {
-            return;
-        }
-        let Some(path) = fs_tool_path(&call.name, &call.arguments) else {
-            return;
-        };
-        if !verify::is_code_path(&path) {
-            return;
-        }
-        edited.push(path);
-        self.kick_diagnostics(edited);
-    }
-
     async fn dispatch_with_prefetch(
         &mut self,
         calls: &[ToolCall],
     ) -> (Vec<ToolResponse>, HashSet<String>) {
         let mut out: Vec<Option<ToolResponse>> = vec![None; calls.len()];
         let mut skipped = HashSet::new();
-        let mut diag_paths: Vec<String> = Vec::new();
         let slot = self.speculate.clone();
         if parallel_safe_batch(calls) {
             if let Some(slot) = &slot {
@@ -1450,7 +1426,7 @@ impl<C: Completer> Agent<C> {
                             Some(preview_args(call)),
                         );
                         let r = self.finish_prefetch(call, r).await;
-                        self.maybe_kick_diag(call, &r, &mut diag_paths);
+
                         out[i] = Some(r);
                     }
                 }
@@ -1504,7 +1480,7 @@ impl<C: Completer> Agent<C> {
                             Some(preview_args(call)),
                         );
                         let r = self.finish_prefetch(call, r).await;
-                        self.maybe_kick_diag(call, &r, &mut diag_paths);
+
                         out[i] = Some(r);
                         continue;
                     }
@@ -1519,7 +1495,7 @@ impl<C: Completer> Agent<C> {
                 } else {
                     self.dispatch_one(call).await
                 };
-                self.maybe_kick_diag(call, &r, &mut diag_paths);
+
                 out[i] = Some(r);
             }
         }
@@ -1599,6 +1575,9 @@ impl<C: Completer> Agent<C> {
     }
 
     fn fold_idle_search(&self, calls: &[ToolCall], responses: &mut [ToolResponse]) {
+        if self.completer.recasts_xai_product() {
+            return;
+        }
         let mut msgs = self.messages.clone();
         let mut hop_queries: Vec<String> = Vec::new();
         for (call, response) in calls.iter().zip(responses.iter_mut()) {
@@ -1627,6 +1606,9 @@ impl<C: Completer> Agent<C> {
     }
 
     fn fold_idle_grep(&self, calls: &[ToolCall], responses: &mut [ToolResponse]) {
+        if self.completer.recasts_xai_product() {
+            return;
+        }
         let queries = crate::lock_unpoison(&self.search_queries).clone();
         if queries.is_empty() {
             return;
@@ -1653,6 +1635,9 @@ impl<C: Completer> Agent<C> {
     }
 
     fn fold_idle_read(&self, calls: &[ToolCall], responses: &mut [ToolResponse]) {
+        if self.completer.recasts_xai_product() {
+            return;
+        }
         let mut msgs = self.messages.clone();
         for (call, response) in calls.iter().zip(responses.iter()) {
             if dispatch_name(&call.name) == "search" {
@@ -1701,6 +1686,9 @@ impl<C: Completer> Agent<C> {
     }
 
     fn fold_idle_glob(&self, calls: &[ToolCall], responses: &mut [ToolResponse]) {
+        if self.completer.recasts_xai_product() {
+            return;
+        }
         let mut msgs = self.messages.clone();
         for (call, response) in calls.iter().zip(responses.iter()) {
             if dispatch_name(&call.name) == "search" {

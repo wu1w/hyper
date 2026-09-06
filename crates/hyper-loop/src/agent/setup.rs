@@ -206,7 +206,6 @@ impl<C: Completer> Agent<C> {
             code_index,
             index_build: None,
             speculate: None,
-            in_flight_diag: None,
             model_hops: std::sync::atomic::AtomicU32::new(0),
             search_calls: std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0)),
             search_queries: std::sync::Mutex::new(Vec::new()),
@@ -228,6 +227,7 @@ impl<C: Completer> Agent<C> {
             parse_retries: 0,
             progress: super::progress::ProgressTracker::default(),
             official_compaction: None,
+            official_compaction_skip: 0,
             xai_compact: opts.xai_compact,
             config: opts.config,
             child: opts.child,
@@ -288,7 +288,7 @@ impl<C: Completer> Agent<C> {
     }
 
     pub(crate) fn speculate_ctx(&self) -> super::speculate::SpeculateCtx {
-        super::speculate::SpeculateCtx {
+        let mut ctx = super::speculate::SpeculateCtx {
             workspace: self.workspace.clone(),
             limits: self.limits,
             inherit_env: self.inherit_env,
@@ -311,7 +311,15 @@ impl<C: Completer> Agent<C> {
                 .collect(),
             search_shown_idents: super::dispatch::shown_dump_idents(&self.messages),
             view_mounted: crate::tools_schema::has_tool(&self.tools, "view"),
+        };
+        if self.completer.recasts_xai_product() {
+            ctx.search_queries.clear();
+            ctx.search_used = 0;
+            ctx.named_new.clear();
+            ctx.search_located.clear();
+            ctx.search_shown_idents.clear();
         }
+        ctx
     }
 }
 

@@ -96,19 +96,16 @@ pub fn scoped_test_cmd(root: &Path, edited: &[String]) -> Option<String> {
     python_unittest(root)
 }
 
-/// Compile/lint after a successful Write/StrReplace. `None` = clean or nothing
-/// to attach (timeouts stay off this path so a Write is not tagged `[diagnostics]`
-/// for a checker that never finished).
+/// Compile/lint once after a batch of successful edits. Completed checks attach
+/// either a clean verdict or findings. `None` means incomplete/unsupported or
+/// cancelled; never present a timeout as a successful check.
 /// Runs on a blocking thread so `cargo check` cannot stall the agent runtime.
 pub async fn run_diagnostics_async(
     root: &Path,
     edited: &[String],
     cancel: &CancelFlag,
 ) -> Option<String> {
-    match run_lints_async(root, edited, cancel).await {
-        LintReport::Findings(s) => Some(truncate_diag(format!("[diagnostics]\n{s}"))),
-        _ => None,
-    }
+    diagnostics_note(run_lints_async(root, edited, cancel).await)
 }
 
 pub async fn run_lints_async(root: &Path, edited: &[String], cancel: &CancelFlag) -> LintReport {
@@ -149,16 +146,24 @@ pub fn read_lints_reply(report: &LintReport, paths: &[String]) -> (String, ToolS
 
 fn truncate_diag(mut out: String) -> String {
     if out.len() > DIAG_MAX {
-        out.truncate(DIAG_MAX);
-        while !out.is_char_boundary(out.len()) {
-            out.pop();
+        let mut end = DIAG_MAX;
+        while !out.is_char_boundary(end) {
+            end -= 1;
         }
+        out.truncate(end);
     }
     out
 }
 
 pub fn run_diagnostics(root: &Path, edited: &[String], cancel: &CancelFlag) -> Option<String> {
-    match run_lints(root, edited, cancel) {
+    diagnostics_note(run_lints(root, edited, cancel))
+}
+
+fn diagnostics_note(report: LintReport) -> Option<String> {
+    match report {
+        LintReport::Clean => Some(
+            "[diagnostics]\nCompiler/linter check passed. This is not a test-suite result.".into(),
+        ),
         LintReport::Findings(s) => Some(truncate_diag(format!("[diagnostics]\n{s}"))),
         _ => None,
     }
@@ -222,8 +227,16 @@ pub fn run_lints(root: &Path, edited: &[String], cancel: &CancelFlag) -> LintRep
         return LintReport::Incomplete("no code files to check".into());
     }
     let mut checks = Vec::new();
-    if code.iter().any(|p| p.ends_with(".rs")) {
-        checks.push(cargo_check(root, &code, cancel));
+    let mut packages = std::collections::BTreeMap::<String, Vec<String>>::new();
+    for path in code.iter().filter(|p| p.ends_with(".rs")) {
+        if let Some((_, name)) = nearest_cargo_package(root, path) {
+            packages.entry(name).or_default().push(path.clone());
+        } else {
+            checks.push(Check::Skip(format!("no Cargo.toml package for {path}")));
+        }
+    }
+    for paths in packages.values() {
+        checks.push(cargo_check(root, paths, cancel));
     }
     if has_ts_path(&code) {
         checks.push(tsc_check(root, &code, cancel));
@@ -262,7 +275,10 @@ fn cargo_check(root: &Path, edited: &[String], cancel: &CancelFlag) -> Check {
         CmdFinish::Cancelled => Check::Cancelled,
         CmdFinish::Timeout => Check::Timeout("cargo check"),
         CmdFinish::Failed => Check::Skip("cargo check could not start".into()),
-        CmdFinish::Output(stdout) => {
+        CmdFinish::Output {
+            text: stdout,
+            success,
+        } => {
             let mut errors = Vec::new();
             for line in stdout.lines() {
                 let Ok(v) = serde_json::from_str::<Value>(line) else {
@@ -286,7 +302,12 @@ fn cargo_check(root: &Path, edited: &[String], cancel: &CancelFlag) -> Check {
                     }
                 }
             }
-            if errors.is_empty() {
+            if errors.is_empty() && !success {
+                Check::Skip(format!(
+                    "cargo check failed without a compiler verdict: {}",
+                    truncate_diag(stdout)
+                ))
+            } else if errors.is_empty() {
                 Check::Clean
             } else {
                 Check::Findings(errors.join("\n"))
@@ -397,7 +418,7 @@ fn tsc_check(root: &Path, edited: &[String], cancel: &CancelFlag) -> Check {
             CmdFinish::Failed => {
                 notes.push(format!("tsc could not start in {rel}"));
             }
-            CmdFinish::Output(out) => {
+            CmdFinish::Output { text: out, success } => {
                 ran = true;
                 let err: String = out
                     .lines()
@@ -407,6 +428,8 @@ fn tsc_check(root: &Path, edited: &[String], cancel: &CancelFlag) -> Check {
                     .join("\n");
                 if !err.trim().is_empty() {
                     findings.push(err);
+                } else if !success {
+                    notes.push(format!("tsc failed in {rel} without a compiler verdict: {}", truncate_diag(out)));
                 }
             }
         }
@@ -452,9 +475,11 @@ fn ruff_check(root: &Path, edited: &[String], cancel: &CancelFlag) -> Check {
         CmdFinish::Cancelled => Check::Cancelled,
         CmdFinish::Timeout => Check::Timeout("ruff"),
         CmdFinish::Failed => Check::Skip("ruff could not start".into()),
-        CmdFinish::Output(out) => {
+        CmdFinish::Output { text: out, success } => {
             let t = out.trim();
-            if t.is_empty() {
+            if t.is_empty() && !success {
+                Check::Skip("ruff failed without a linter verdict".into())
+            } else if t.is_empty() {
                 Check::Clean
             } else {
                 Check::Findings(t.to_string())
@@ -473,10 +498,19 @@ fn cmd_exists(name: &str) -> bool {
 }
 
 enum CmdFinish {
-    Output(String),
+    Output { text: String, success: bool },
     Timeout,
     Cancelled,
     Failed,
+}
+
+fn drain_pipe(mut pipe: impl Read + Send + 'static) -> std::thread::JoinHandle<Vec<u8>> {
+    std::thread::spawn(move || {
+        let mut buf = Vec::new();
+        let _ = (&mut pipe).take(1_048_576).read_to_end(&mut buf);
+        let _ = std::io::copy(&mut pipe, &mut std::io::sink());
+        buf
+    })
 }
 
 fn run_cmd(prog: &str, args: &[&str], cwd: &Path, cancel: &CancelFlag) -> CmdFinish {
@@ -495,6 +529,10 @@ fn run_cmd(prog: &str, args: &[&str], cwd: &Path, cancel: &CancelFlag) -> CmdFin
         Ok(c) => c,
         Err(_) => return CmdFinish::Failed,
     };
+    // Drain both pipes while the compiler runs. Waiting before reading can
+    // deadlock on a full pipe and turn a valid check into a 12-second timeout.
+    let stdout = drain_pipe(child.stdout.take().unwrap());
+    let stderr = drain_pipe(child.stderr.take().unwrap());
     let started = Instant::now();
     loop {
         if cancel.is_cancelled() {
@@ -503,17 +541,17 @@ fn run_cmd(prog: &str, args: &[&str], cwd: &Path, cancel: &CancelFlag) -> CmdFin
             return CmdFinish::Cancelled;
         }
         match child.try_wait() {
-            Ok(Some(_)) => {
-                let mut buf = Vec::new();
-                if let Some(out) = child.stdout.as_mut() {
-                    let _ = out.read_to_end(&mut buf);
+            Ok(Some(status)) => {
+                let mut buf = stdout.join().unwrap_or_default();
+                let err = stderr.join().unwrap_or_default();
+                if !err.is_empty() {
+                    buf.push(b'\n');
+                    buf.extend(err);
                 }
-                if buf.is_empty() {
-                    if let Some(err) = child.stderr.as_mut() {
-                        let _ = err.read_to_end(&mut buf);
-                    }
-                }
-                return CmdFinish::Output(String::from_utf8_lossy(&buf).into_owned());
+                return CmdFinish::Output {
+                    text: String::from_utf8_lossy(&buf).into_owned(),
+                    success: status.success(),
+                };
             }
             Ok(None) if started.elapsed() > DIAG_TIMEOUT => {
                 let _ = child.kill();
@@ -691,6 +729,34 @@ mod tests {
     use crate::tool_calls::{CancelFlag, ToolState};
 
     #[test]
+    fn diagnostic_truncation_handles_cjk_boundary() {
+        let text = truncate_diag("中".repeat(1000));
+        assert!(text.len() <= DIAG_MAX);
+        assert!(!text.is_empty());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn compiler_runner_drains_both_pipes_and_keeps_failure_status() {
+        let result = run_cmd(
+            "sh",
+            &[
+                "-c",
+                "head -c 131072 /dev/zero; head -c 131072 /dev/zero >&2; exit 7",
+            ],
+            &std::env::temp_dir(),
+            &CancelFlag::new(),
+        );
+        match result {
+            CmdFinish::Output { text, success } => {
+                assert!(!success);
+                assert!(text.len() >= 262144);
+            }
+            _ => panic!("large output must not deadlock into a timeout"),
+        }
+    }
+
+    #[test]
     fn code_path_skips_office_docs() {
         assert!(is_code_path("src/foo.rs"));
         assert!(is_code_path("pkg/a.py"));
@@ -785,7 +851,7 @@ mod tests {
     }
 
     #[test]
-    fn clean_rust_edit_appends_nothing() {
+    fn clean_rust_edit_reports_completed_check() {
         use std::process::{Command, Stdio};
         if Command::new("cargo")
             .arg("-V")
@@ -807,7 +873,9 @@ mod tests {
         .unwrap();
         std::fs::write(dir.join("src/lib.rs"), "pub fn f() -> i32 { 1 }\n").unwrap();
         let cancel = CancelFlag::new();
-        assert!(run_diagnostics(&dir, &["src/lib.rs".into()], &cancel).is_none());
+        assert!(run_diagnostics(&dir, &["src/lib.rs".into()], &cancel)
+            .unwrap()
+            .contains("check passed"));
         let _ = std::fs::remove_dir_all(dir);
     }
 

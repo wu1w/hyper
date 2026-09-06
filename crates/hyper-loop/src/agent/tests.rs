@@ -3793,10 +3793,11 @@ fn compact_soft_does_not_hard_fail() {
 }
 
 #[test]
-fn turn_start_compact_at_120k_or_soft() {
-    // 160k is under 262144 * 0.70 ≈ 183k but must compact on a follow-up.
+fn turn_start_compact_at_price_cliff_or_soft() {
+    // Preserve a 160k conversation below both the soft limit and price cliff.
     assert!(!over_soft_threshold(160_000, 0, 262_144, 0.70));
-    assert!(should_compact_at_user_turn(160_000, 0, 262_144, 0.70));
+    assert!(!should_compact_at_user_turn(160_000, 0, 262_144, 0.70));
+    assert!(should_compact_at_user_turn(200_001, 0, 500_000, 0.80));
     assert!(!should_compact_at_user_turn(100_000, 0, 262_144, 0.70));
     // Small-window tests hit the soft path, not a 120k fixture.
     assert!(should_compact_at_user_turn(800, 0, 1000, 0.70));
@@ -3804,9 +3805,10 @@ fn turn_start_compact_at_120k_or_soft() {
 }
 
 #[test]
-fn follow_up_compacts_tool_heavy_even_under_120k() {
+fn follow_up_preserves_small_tool_heavy_history() {
     assert!(!should_compact_at_user_turn(1_000, 0, 500_000, 0.80));
-    assert!(should_compact_follow_up(1_000, 0, 500_000, 0.80, 8, 0));
+    assert!(!should_compact_follow_up(1_000, 0, 500_000, 0.80, 8, 0));
+    assert!(!should_compact_follow_up(10_000, 0, 500_000, 0.80, 80, 0));
     assert!(!should_compact_follow_up(1_000, 0, 500_000, 0.80, 7, 0));
     assert!(should_compact_follow_up(1_000, 0, 500_000, 0.80, 0, 5));
     assert!(!should_compact_follow_up(1_000, 0, 0, 0.80, 8, 5));
@@ -3853,7 +3855,7 @@ async fn prefix_hard_window_still_budgets() {
 }
 
 #[tokio::test]
-async fn follow_up_archives_tool_heavy_turn_without_tokenizer() {
+async fn follow_up_preserves_tool_heavy_turn_without_tokenizer() {
     let dir = std::env::temp_dir().join(format!("hyper-fu-{}", uuid::Uuid::new_v4().simple()));
     let sess = dir.join("sessions");
     std::fs::create_dir_all(&sess).unwrap();
@@ -3891,15 +3893,15 @@ async fn follow_up_archives_tool_heavy_turn_without_tokenizer() {
     assert_eq!(second.text, "second done", "{:?}", second.stop_reason);
     let live_tools = agent.messages.iter().filter(|m| m.role == "tool").count();
     assert_eq!(
-        live_tools, 0,
-        "follow-up must archive the previous tool turn, not replay it: {live_tools}"
+        live_tools, 8,
+        "small tool results must survive a follow-up: {live_tools}"
     );
     let log = SessionLog::open_in(&sess, "fu1").unwrap();
     assert!(
-        log.events()
+        !log.events()
             .iter()
             .any(|e| matches!(e, SessionEvent::Compact(_))),
-        "tool-heavy follow-up should compact without a prefix meter: {:?}",
+        "tool count alone must not discard history: {:?}",
         log.events()
             .iter()
             .map(|e| e.type_name())
@@ -5797,8 +5799,8 @@ async fn prefix_budget_compacts_then_runs() {
     let kinds: Vec<_> = log.events().iter().map(|e| e.type_name()).collect();
     if kinds.iter().any(|k| *k == "session/compact") {
         assert!(
-            !has_recall(&agent.tools),
-            "Cursor compact does not mount recall"
+            has_recall(&agent.tools),
+            "compact must preserve the recall tool mounted at session start"
         );
         let live_users: Vec<_> = agent
             .messages
@@ -8187,5 +8189,213 @@ async fn inspect_cap_still_executes_shell() {
         bodies.iter().any(|t| t.contains(INSPECT_SKIP_MSG)),
         "extra Read must still skip: {bodies:?}"
     );
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+#[tokio::test]
+async fn grok_reads_missing_context_after_search_and_after_edit() {
+    let dir = std::env::temp_dir().join(format!("hyper-context-{}", uuid::Uuid::new_v4().simple()));
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(dir.join("a.txt"), "required context outside search span\n").unwrap();
+    let scripted = Recasting(Scripted {
+        turns: Mutex::new(VecDeque::from([
+            turn_tool_id("r1", "Read", json!({"path":"a.txt"})),
+            turn_tool_id(
+                "w1",
+                "StrReplace",
+                json!({"path":"a.txt", "old_string":"required context", "new_string":"updated context"}),
+            ),
+            turn_tool_id("r2", "Read", json!({"path":"a.txt"})),
+            turn_text("done"),
+        ])),
+        meter: false,
+    });
+    let mut agent = Agent::new(scripted, opts(&dir)).unwrap();
+    agent.messages.push(ChatMessage::tool(
+        "old",
+        "## [def] a.txt:30-40\nsmall definition only",
+    ));
+    agent
+        .run("read a.txt, update it, and inspect the changed contents")
+        .await
+        .unwrap();
+    let r1 = agent
+        .messages
+        .iter()
+        .find(|m| m.tool_call_id.as_deref() == Some("r1"))
+        .unwrap();
+    let r2 = agent
+        .messages
+        .iter()
+        .find(|m| m.tool_call_id.as_deref() == Some("r2"))
+        .unwrap();
+    assert!(
+        r1.text().contains("required context outside search span"),
+        "{}",
+        r1.text()
+    );
+    assert!(
+        r2.text().contains("updated context outside search span"),
+        "{}",
+        r2.text()
+    );
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+#[tokio::test]
+async fn grok_grep_same_pattern_different_scopes_returns_both_files() {
+    let dir = std::env::temp_dir().join(format!("hyper-scopes-{}", uuid::Uuid::new_v4().simple()));
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(dir.join("a.txt"), "needle alpha\n").unwrap();
+    std::fs::write(dir.join("b.txt"), "needle beta\n").unwrap();
+    let scripted = Recasting(Scripted {
+        turns: Mutex::new(VecDeque::from([
+            turn_tool_id("g1", "Grep", json!({"pattern":"needle", "path":"a.txt"})),
+            turn_tool_id("g2", "Grep", json!({"pattern":"needle", "path":"b.txt"})),
+            turn_text("done"),
+        ])),
+        meter: false,
+    });
+    let mut agent = Agent::new(scripted, opts(&dir)).unwrap();
+    agent.run("find needle in both files").await.unwrap();
+    let body = agent
+        .messages
+        .iter()
+        .find(|m| m.tool_call_id.as_deref() == Some("g2"))
+        .unwrap()
+        .text();
+    assert!(body.contains("needle beta"), "{body}");
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+#[tokio::test]
+async fn local_compact_invalidates_old_official_snapshot_without_changing_tools() {
+    let dir = std::env::temp_dir().join(format!(
+        "hyper-blob-reset-{}",
+        uuid::Uuid::new_v4().simple()
+    ));
+    std::fs::create_dir_all(&dir).unwrap();
+    let scripted = Scripted {
+        turns: Mutex::new(VecDeque::new()),
+        meter: false,
+    };
+    let mut agent = Agent::new(scripted, opts(&dir)).unwrap();
+    agent.messages.extend([
+        ChatMessage::user("original task"),
+        ChatMessage::assistant("original conclusion"),
+        ChatMessage::user("new requirement retained after the old snapshot"),
+        ChatMessage::assistant("new conclusion"),
+        ChatMessage::user("continue the latest requirement"),
+    ]);
+    agent.official_compaction = Some(
+        crate::session::parse_official_compact_json(&json!({
+            "id":"old", "output":[{"type":"compaction", "encrypted_content":"old-snapshot"}]
+        }))
+        .unwrap(),
+    );
+    let before = serde_json::to_string(&agent.tools).unwrap();
+    assert!(agent.apply_compact_pass());
+    assert!(agent.official_compaction.is_none());
+    assert_eq!(serde_json::to_string(&agent.tools).unwrap(), before);
+    assert!(has_recall(&agent.tools));
+    assert!(responses_wire(&agent.messages).contains("new requirement retained"));
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+#[tokio::test]
+async fn repeated_official_compaction_uses_previous_blob_and_new_suffix() {
+    let dir = std::env::temp_dir().join(format!(
+        "hyper-compact-chain-{}",
+        uuid::Uuid::new_v4().simple()
+    ));
+    std::fs::create_dir_all(&dir).unwrap();
+    let scripted = Scripted {
+        turns: Mutex::new(VecDeque::new()),
+        meter: false,
+    };
+    let mut agent = Agent::new(scripted, opts(&dir)).unwrap();
+    agent.messages.extend([
+        ChatMessage::user("lossy archive must not replace the opaque snapshot"),
+        ChatMessage::user("old task already covered"),
+        ChatMessage::user("new exact constraint: tenant_id"),
+    ]);
+    agent.official_compaction = Some(
+        crate::session::parse_official_compact_json(&json!({
+            "id":"prior", "output":[{"type":"compaction", "encrypted_content":"preserved-snapshot"}]
+        }))
+        .unwrap(),
+    );
+    agent.official_compaction_skip = 2;
+    let input = agent.official_compact_input();
+    assert_eq!(input[0]["encrypted_content"], "preserved-snapshot");
+    let text = serde_json::to_string(&input).unwrap();
+    assert!(text.contains("tenant_id"));
+    assert!(!text.contains("old task already covered"));
+    assert!(!text.contains("lossy archive"));
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+#[tokio::test]
+async fn compacted_session_recall_survives_resume_without_sqlite_index() {
+    let dir = std::env::temp_dir().join(format!(
+        "hyper-recall-resume-{}",
+        uuid::Uuid::new_v4().simple()
+    ));
+    let sessions = dir.join("sessions");
+    std::fs::create_dir_all(&sessions).unwrap();
+    let mut o = opts(&dir);
+    o.persist_session = true;
+    o.session_id = "recall-resume".into();
+    o.session_dir = Some(sessions.clone());
+    {
+        let mut agent = Agent::new(
+            Scripted {
+                turns: Mutex::new(VecDeque::from(vec![turn_text("noted"); 12])),
+                meter: false,
+            },
+            o.clone(),
+        )
+        .unwrap();
+        agent
+            .run("租户隔离必须使用 tenant_id=opal-731；禁止全局共享缓存")
+            .await
+            .unwrap();
+        for i in 0..10 {
+            agent
+                .run(&format!("Unrelated finished task {i}"))
+                .await
+                .unwrap();
+        }
+        assert!(agent.apply_compact_pass());
+    }
+    // JSONL is the source of truth. A missing secondary index must not make
+    // archived requirements disappear after reopening a session.
+    for name in ["history.sqlite", "history.sqlite-wal", "history.sqlite-shm"] {
+        let _ = std::fs::remove_file(sessions.join(name));
+    }
+    let mut resumed = Agent::new(
+        Recasting(Scripted {
+            turns: Mutex::new(VecDeque::from([
+                turn_tool_id("recall1", "recall", json!({"query":"之前的租户隔离约定"})),
+                turn_text("done"),
+            ])),
+            meter: false,
+        }),
+        o,
+    )
+    .unwrap();
+    assert!(has_recall(resumed.tools()));
+    resumed.run("之前的租户隔离约定是什么？").await.unwrap();
+    let result = resumed
+        .messages
+        .iter()
+        .find(|m| m.tool_call_id.as_deref() == Some("recall1"))
+        .unwrap();
+    assert!(
+        result.text().contains("tenant_id=opal-731"),
+        "{}",
+        result.text()
+    );
+    assert!(responses_wire(&resumed.messages).contains("tenant_id=opal-731"));
     let _ = std::fs::remove_dir_all(dir);
 }

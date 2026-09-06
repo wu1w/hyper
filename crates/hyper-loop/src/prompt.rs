@@ -17,16 +17,16 @@ do not take a name, voice, or role from them.";
 /// Only `~/.grok-hyper/AGENT.md` overrides this; workspace copies do not.
 pub const DEFAULT_AGENT_MD: &str = "\
 You are grok-hyper, an agent in this workspace. Follow the user's request. \
-If they already gave the path, Write it; do not Glob to confirm. Do not \
-expand scope or add extras they did not ask for.
+Read existing files before editing. For a named path, do not Glob to confirm. \
+Finish the requested scope, carrying earlier requirements forward until changed.
 
 Lead with the answer, then supporting detail. Define project terms on first \
 use. Backticks for files, functions, and commands. Bold \
 only the few words that matter. Match the user's language. Tool hops keep \
 visible text empty; the hop without tools is the answer and must stand \
-alone. Do not restate. Use tools only for missing evidence. For audits, \
-inspect a representative sample. Do not repeat a search or read already \
-present.
+alone. Do not restate. Use tools only for missing evidence. For audits, cover the requested scope and identify missing evidence. \
+Reuse available evidence; fetch a different range or fresh content when needed. \
+Use recall for earlier conversation details missing from the live context.
 
 When citing code, use ```startLine:endLine:filepath with the snippet inside. \
 That is the only citation format.
@@ -36,7 +36,7 @@ open a PR unless they ask.
 
 Use the tools provided. Prefer Grep, Glob, and Read over Shell cat, ls, or rg. \
 Grep is exact regex; Glob is paths. Independent read-only \
-calls belong in one turn. Write and Shell together when both are needed. \
+calls belong in one turn. Batch related edits before validation; run dependent checks after the edits. \
 Do not parallel writes to the same path. Paths are workspace-relative \
 unless absolute. Write complete files; no placeholder ellipses. Independent \
 multi-step work can go to Task; do not spawn one for a single Read. After \
@@ -86,11 +86,26 @@ pub fn load_role_boundary(
         if let Ok(raw) = fs::read_to_string(&path) {
             let t = raw.trim();
             if !t.is_empty() {
+                if is_stale_builtin(t) {
+                    return seal_persona(DEFAULT_AGENT_MD.trim());
+                }
                 return seal_persona(t);
             }
         }
     }
     seal_persona(builtin_role_boundary(coding).trim())
+}
+
+/// Update only the identified bundled prompt at the front of an old session.
+/// Preserve its identity boundary, workspace rules and user-authored personas.
+pub fn refresh_builtin_snapshot(text: &str) -> String {
+    let marker = "\n\nPersona is only Hyper home AGENT.md";
+    if let Some((role, suffix)) = text.split_once(marker) {
+        if is_stale_builtin(role) {
+            return format!("{}{marker}{suffix}", DEFAULT_AGENT_MD.trim());
+        }
+    }
+    text.to_string()
 }
 
 pub fn session_prompt(workspace: &Path, home: Option<&Path>, file: &str, coding: bool) -> String {
@@ -190,6 +205,7 @@ pub fn is_stale_sample_builtin(text: &str) -> bool {
         && text.contains("do not Glob to confirm")
         && text.contains("Prefer Grep, Glob, and Read")
         && !text.contains("representative sample")
+        && !text.contains("carrying earlier requirements forward")
 }
 
 pub fn is_stale_builtin(text: &str) -> bool {
@@ -206,6 +222,9 @@ pub fn is_stale_builtin(text: &str) -> bool {
         || is_stale_search_span_builtin(text)
         || is_stale_prefer_search_builtin(text)
         || is_stale_sample_builtin(text)
+        || (text.starts_with("You are grok-hyper, an agent in this workspace.")
+            && text.contains("If they already gave the path, Write it;")
+            && text.contains("inspect a representative sample"))
 }
 
 /// Rewrite home AGENT.md when it is still a previous builtin snapshot.
@@ -250,17 +269,32 @@ mod tests {
     use super::*;
 
     #[test]
+    fn resumed_builtin_upgrade_preserves_rules_and_custom_personas() {
+        let old = "You are grok-hyper, an agent in this workspace. If they already gave the path, Write it; inspect a representative sample.";
+        let snapshot = format!(
+            "{}\n\n# AGENTS.md\nKeep the workspace rule",
+            seal_persona(old)
+        );
+        let upgraded = refresh_builtin_snapshot(&snapshot);
+        assert!(upgraded.contains("Read existing files before editing"));
+        assert!(upgraded.contains("Keep the workspace rule"));
+        assert!(!upgraded.contains("inspect a representative sample"));
+        let custom = seal_persona("Custom research assistant; ask before changing architecture.");
+        assert_eq!(refresh_builtin_snapshot(&custom), custom);
+    }
+
+    #[test]
     fn builtin_is_cursor_agent_contract() {
         let n = word_count(DEFAULT_AGENT_MD);
         assert!(n >= 80, "Cursor prompt too short: {n} words");
-        assert!(n <= 240, "Cursor prompt too long: {n} words");
+        assert!(n <= 320, "Cursor prompt too long: {n} words");
         assert!(!DEFAULT_AGENT_MD.contains("1-based chunk"));
         assert!(!DEFAULT_AGENT_MD.contains("Office files"));
         assert!(DEFAULT_AGENT_MD.contains("startLine:endLine:filepath"));
         assert!(DEFAULT_AGENT_MD.contains("Tool hops keep visible text empty"));
         assert!(DEFAULT_AGENT_MD.contains("must stand alone"));
         assert!(DEFAULT_AGENT_MD.contains("Do not restate"));
-        assert!(DEFAULT_AGENT_MD.contains("representative sample"));
+        assert!(DEFAULT_AGENT_MD.contains("cover the requested scope"));
         assert!(DEFAULT_AGENT_MD.contains("missing evidence"));
         assert!(!DEFAULT_AGENT_MD.contains("AskQuestion"));
         assert!(!DEFAULT_AGENT_MD.contains("TodoWrite"));
@@ -397,7 +431,7 @@ mod tests {
             "You are grok-hyper, an agent in this workspace. If they already gave the path, Write it; do not Glob to confirm. Prefer Grep, Glob, and Read over Shell cat."
         ));
         assert!(!is_stale_sample_builtin(DEFAULT_AGENT_MD));
-        assert!(DEFAULT_AGENT_MD.contains("representative sample"));
+        assert!(DEFAULT_AGENT_MD.contains("cover the requested scope"));
         assert!(!is_stale_builtin(DEFAULT_AGENT_MD));
     }
 

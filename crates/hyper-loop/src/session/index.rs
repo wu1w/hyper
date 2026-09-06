@@ -213,13 +213,18 @@ fn index_body(
     event: &SessionEvent,
 ) -> Option<(&'static str, Option<String>, Option<String>, String)> {
     match event {
-        SessionEvent::User(u) if !u.text.trim().is_empty() => {
+        SessionEvent::User(u)
+            if !u.text.trim().is_empty() && !crate::template::is_hidden_user_text(&u.text) =>
+        {
             Some(("user", None, None, u.text.clone()))
         }
         SessionEvent::Assistant(a) => {
             let mut body = a.content.clone();
             if let Some(calls) = &a.tool_calls {
                 for c in calls {
+                    if SKIP_TOOL_NAMES.contains(&c.function.name.as_str()) {
+                        continue;
+                    }
                     body.push('\n');
                     body.push_str(&c.function.name);
                     body.push(' ');
@@ -242,6 +247,104 @@ fn index_body(
         }
         _ => None,
     }
+}
+
+/// Bounded lexical fallback over the source of truth. Also serves current-chat
+/// retrieval without opening/rebuilding SQLite on every follow-up. Chinese
+/// phrases use overlapping bigrams: unicode61 treats an unspaced sentence as
+/// one token, so ordinary MATCH cannot recall a differently phrased question.
+pub(crate) fn search_events(
+    session_id: &str,
+    events: &[SessionEvent],
+    query: &str,
+    limit: usize,
+    spoken_only: bool,
+) -> Vec<Hit> {
+    let query: String = query.chars().take(512).collect();
+    let mut terms = Vec::new();
+    for token in fts_tokens(&query.to_lowercase()) {
+        if token.chars().any(is_cjk) {
+            let chars: Vec<char> = token.chars().collect();
+            if chars.len() > 2 {
+                for pair in chars.windows(2) {
+                    terms.push(pair.iter().collect::<String>());
+                }
+            }
+        }
+        if token.len() > 1
+            && !["the", "what", "did", "we", "about", "please", "remember"]
+                .contains(&token.as_str())
+        {
+            terms.push(token);
+        }
+    }
+    terms.sort();
+    terms.dedup();
+    terms.truncate(64);
+    let undos: Vec<_> = events
+        .iter()
+        .filter_map(|e| match e {
+            SessionEvent::Undo(u) => Some((u.from_seq, u.until_seq)),
+            _ => None,
+        })
+        .collect();
+    let mut scored = Vec::new();
+    for (seq, event) in events.iter().enumerate() {
+        if undos
+            .iter()
+            .any(|(from, until)| seq as u64 >= *from && seq as u64 <= *until)
+        {
+            continue;
+        }
+        if spoken_only
+            && !matches!(
+                event,
+                SessionEvent::User(_)
+                    | SessionEvent::Assistant(crate::session::event::AssistantEvent {
+                        tool_calls: None,
+                        ..
+                    })
+            )
+        {
+            continue;
+        }
+        let Some((kind, name, blob, body)) = index_body(event) else {
+            continue;
+        };
+        let lower = body.to_lowercase();
+        let matches: Vec<_> = terms
+            .iter()
+            .filter(|t| lower.contains(t.as_str()))
+            .collect();
+        let score: usize = matches.iter().map(|t| t.chars().count().min(12)).sum();
+        if score == 0 {
+            continue;
+        }
+        // Return evidence around the match, not always the first 160 chars.
+        // Use character positions to avoid slicing through UTF-8 boundaries.
+        let needle = matches.iter().max_by_key(|t| t.chars().count()).unwrap();
+        let pos = lower.find(needle.as_str()).unwrap_or(0);
+        let start = lower[..pos].chars().count().saturating_sub(80);
+        let snippet = body.chars().skip(start).take(1200).collect();
+        scored.push((
+            score,
+            seq,
+            Hit {
+                session_id: session_id.into(),
+                seq: seq as i64,
+                kind: kind.into(),
+                name,
+                blob,
+                snippet,
+            },
+        ));
+    }
+    scored.sort_by(|a, b| b.0.cmp(&a.0).then(b.1.cmp(&a.1)));
+    scored
+        .into_iter()
+        .take(limit.clamp(1, 50))
+        .map(|(_, _, h)| h)
+        .collect()
 }
 
 fn fts_query(raw: &str) -> String {
@@ -299,6 +402,35 @@ fn like_escape(s: &str) -> String {
 mod tests {
     use super::*;
     use crate::session::event::SessionEvent;
+
+    #[test]
+    fn source_recall_matches_rephrased_chinese_and_ignores_hidden_cards() {
+        let events = vec![
+            SessionEvent::user("租户隔离必须通过 tenant_id 实现，禁止全局共享缓存"),
+            SessionEvent::assistant("已经记录这个约束", "hidden-secret", None),
+            SessionEvent::user(crate::template::wrap_tool_response(
+                "租户隔离 hidden-card-secret",
+            )),
+            SessionEvent::tool("r", "recall", "租户隔离 recursive-search-noise"),
+        ];
+        let hits = search_events("s", &events, "前面租户隔离是怎么约定的？", 4, true);
+        assert_eq!(hits.len(), 1, "{hits:?}");
+        assert_eq!(hits[0].seq, 0);
+        assert!(hits[0].snippet.contains("tenant_id"));
+        assert!(search_events("s", &events, "hidden-secret", 4, false).is_empty());
+    }
+
+    #[test]
+    fn source_recall_centers_long_event_on_matching_evidence() {
+        let events = vec![SessionEvent::user(format!(
+            "{} migration_key=opal-731 {}",
+            "padding ".repeat(300),
+            "tail ".repeat(300)
+        ))];
+        let hits = search_events("s", &events, "migration_key", 4, true);
+        assert!(hits[0].snippet.contains("opal-731"));
+        assert!(hits[0].snippet.chars().count() <= 1200);
+    }
 
     fn tmp() -> std::path::PathBuf {
         let dir = std::env::temp_dir().join(format!("hyper-idx-{}", uuid::Uuid::new_v4().simple()));

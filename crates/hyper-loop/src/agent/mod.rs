@@ -332,10 +332,7 @@ pub fn apply_unattended_policy(opts: &mut RunOpts, cfg: &crate::config::Config) 
 }
 
 const DEFAULT_COMPACT_RATIO: f64 = 0.80;
-const TURN_START_COMPACT_PREFIX: u32 = 120_000;
-/// A finished tool-heavy turn should not be replayed as a cold prefill, even
-/// when the cheap byte estimate sits under 120k (ComputerUse captions are short).
-const TURN_START_COMPACT_TOOLS: usize = 8;
+const TURN_START_COMPACT_PREFIX: u32 = crate::session::PRICE_CLIFF_TOKENS as u32;
 /// In-memory screenshots from the previous turn. Wire caps at 4; archive sooner.
 const TURN_START_COMPACT_IMAGES: usize = 4;
 /// Mid-turn ComputerUse: archive older closed groups so 60 screenshot hops
@@ -394,14 +391,13 @@ fn should_compact_follow_up(
     reserve: u32,
     working_window: u32,
     compact_ratio: f64,
-    tool_messages: usize,
+    _tool_messages: usize,
     image_parts: usize,
 ) -> bool {
     if working_window == 0 {
         return false;
     }
-    tool_messages >= TURN_START_COMPACT_TOOLS
-        || image_parts > TURN_START_COMPACT_IMAGES
+    image_parts > TURN_START_COMPACT_IMAGES
         || should_compact_at_user_turn(prefix, reserve, working_window, compact_ratio)
 }
 
@@ -492,10 +488,6 @@ pub struct Agent<C> {
     index_build: Option<tokio::task::JoinHandle<std::sync::Arc<CodeIndex>>>,
     /// Prefetch handles for the in-flight model hop.
     speculate: Option<SpeculativeSlot>,
-    /// Cargo/tsc/ruff started as soon as a code Write lands, overlapping later
-    /// tools in the same batch. Awaited before `commit_tool` so `[diagnostics]`
-    /// still rides on the last edit output.
-    in_flight_diag: Option<tokio::task::JoinHandle<Option<String>>>,
     /// `complete_resilient` calls this turn. Hop 0 keeps PREPARE_HINT; later
     /// hops only `reset()` so the console does not flash「正在连接模型」.
     model_hops: AtomicU32,
@@ -540,6 +532,8 @@ pub struct Agent<C> {
     /// Last official xAI compaction item (opaque). Next Responses `input` should
     /// be `[compaction] + new turns`. Never log `encrypted_content` in full.
     official_compaction: Option<crate::session::OfficialCompaction>,
+    /// Number of non-system local messages represented by the current blob.
+    official_compaction_skip: usize,
     xai_compact: Option<(String, String)>,
     config: Config,
     child: Option<crate::subagent::ChildCtx>,

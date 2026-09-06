@@ -12,7 +12,7 @@ pub fn derive_messages(events: &[SessionEvent]) -> Vec<ChatMessage> {
     let mut out = Vec::new();
     if let Some(SessionEvent::Start(start)) = events.first() {
         out.push(ChatMessage::system(crate::prompt::seal_persona(
-            &start.system,
+            &crate::prompt::refresh_builtin_snapshot(&start.system),
         )));
     }
     let compact = events.iter().rev().find_map(|e| match e {

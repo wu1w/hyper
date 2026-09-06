@@ -3,11 +3,10 @@
 //! Soft trigger: `n + reserve > working_window * compact_ratio` (ratio clamped
 //! 0.10..=1.0) — try compact. Hard trigger: `n + reserve > working_window` —
 //! `budget:context` after compact cannot shrink enough. A new user turn also
-//! tries PreviousTurns compact when prefix is over soft **or** above 120k **or**
-//! the previous turn had ≥8 tool results / extra screenshots, so a finished
-//! 60-tool ComputerUse round is not replayed as a multi-minute cold prefill.
-//! That follow-up gate uses a byte estimate, not Jinja+HF tokenize, and local
-//! archive runs before `POST /v1/responses/compact` (120s timeout).
+//! tries PreviousTurns compact when prefix is over soft, above the 200k price
+//! cliff, or carrying extra screenshots. Tool count alone never evicts history.
+//! The gate uses a byte estimate. Official compaction sees the full transcript
+//! before local archival; repeated official compaction retains its prior blob.
 //! Mid-turn ComputerUse (images > 4 or ≥16 CU calls) also KeepLastGroup-compacts
 //! so grok-4.6 sees the `[archived]` card on the Responses wire.
 //!
@@ -16,8 +15,8 @@
 //! compact (`plan_compact` / `apply_compact`) remains the openai_compat fallback.
 //!
 //! Compaction rewrites the *shape* of the live prefix (one cache miss,
-//! `cache_invalidated=compact`) while normal turns preserve historical think.
-//! Appending `recall` after that miss is `cache_invalidated=tools` on the same hop.
+//! `cache_invalidated=compact`). `recall` is mounted at session start and is
+//! never added or removed by compaction.
 //!
 //! Official Qwen3.8 Jinja (and the Unsloth copy on the reference box):
 //! - `last_query_index` = last user whose trimmed content is **not** a
@@ -37,8 +36,9 @@ mod xai_compact;
 pub use xai_compact::{
     chat_to_input_items, compact_for_transport, compact_url, hoist_hidden_notes_before_query,
     is_xai_transport, messages_to_responses_input, parse_official_compact_json,
-    responses_input_after, run_official_compact, should_official_compact, unwrap_qwen_hidden,
-    OfficialCompaction, TransportCompact, PRICE_CLIFF_TOKENS,
+    responses_input_after, run_official_compact, run_official_compact_input,
+    should_official_compact, unwrap_qwen_hidden, OfficialCompaction, TransportCompact,
+    PRICE_CLIFF_TOKENS,
 };
 
 const INDEX_LINES: usize = 80;
@@ -134,7 +134,7 @@ impl CompactEvent {
     }
 
     pub fn archive_body(&self) -> String {
-        let mut head = String::from("[archived]\n");
+        let mut head = String::from("[archived]\nLossy summary; use recall(query) for missing earlier details, recall(seq) for an original event, or recall(blob) for a full tool result.\n");
         if !self.summary.is_empty() {
             head.push_str(self.summary.trim());
             head.push('\n');

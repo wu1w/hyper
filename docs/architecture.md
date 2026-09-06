@@ -55,7 +55,7 @@ Cron / 心跳 / 频道入站也是 **主机定时器或适配器** 去调 `turn.
 
 **日常冻结套件（Cursor 名，顺序固定）：**
 
-`Read` · `Write` · `StrReplace` · `Delete` · `Glob` · `Grep` · `ReadLints` · `EditNotebook` · `Shell` · `WebSearch` · `WebFetch` · `GenerateImage` · `TodoWrite` · `AskQuestion` · `SwitchMode` · `Task` · `AwaitShell`
+`Read` · `Write` · `StrReplace` · `Delete` · `Glob` · `Grep` · `ReadLints` · `EditNotebook` · `Shell` · `WebSearch` · `WebFetch` · `GenerateImage` · `TodoWrite` · `AskQuestion` · `SwitchMode` · `Task` · `AwaitShell` · `recall`
 
 执行层仍接受 Qwen 四件套别名（`read` / `write` / `edit` / `bash`），发给模型的 `function.name` 必须是上表。`Read` 一个目录时先收集名称、排序，再截到 200 条（readdir 顺序下先截断会给出任意子集）。`ToolLimits::default()` 与 `[tools] read_default_lines = 600` 一致。
 
@@ -68,7 +68,8 @@ Cron / 心跳 / 频道入站也是 **主机定时器或适配器** 去调 `turn.
 | `skill` | 技能目录存在时 |
 | `view` | 打开图片 / 音视频 |
 | `search` | 代码搜索 |
-| `recall` / `memory_search` | compact 之后再挂上，避免改冻结四工具的 JSON |
+| `recall` | 从 agent 会话开始固定挂载；关键词检索、seq 原文展开、blob 完整工具结果 |
+| `memory_search` | 独立的笔记搜索接口，默认 agent 工具面不挂载 |
 
 `code` 模式是另一组：`run_code`、`read`、`bash`。
 
@@ -100,7 +101,7 @@ Cron / 心跳 / 频道入站也是 **主机定时器或适配器** 去调 `turn.
 
 轨迹控制：测试转红、修改测试期望和编辑摇摆只作为隐藏事实反馈，不替模型决定停止或回退。思考触及上限时保留模型选择的思考模式；grok 不再追加“collapse to one conclusion”讲义。只有再次触顶、时间、步数或上下文硬上限才终止。控制台/TUI 默认 **500 步**、30 分钟硬墙钟（与 IM / Hermes `max_turns` 对齐）。IM 默认 500 步、**30 分钟墙钟**（`max_wall_unattended_seconds = 1800`）；Shell 未带 `block_until_ms` 时由 coordinator（默认 `code_mode.timeout_s = 60`）offload/取消，bash 内层不再套 120 秒硬杀。出站空正文不发占位句；连接失败会重试，读超时不重试以免 QQ 重复消息。微信 iLink 长轮询独占 cursor，不能和 Hermes weixin 共用同一个 bot。子代理 `Task` 的 registry 写 `{id}.task.json`：进程重启后 `resume` / AwaitShell 能找到孩子；当时还在跑的记成 `interrupted: process restarted`，不自动重跑。
 
-上下文窗口默认 **500000**。超过 `working_window * 0.80` 或 200k 价格悬崖时，session/api_key 走官方 `POST /v1/responses/compact`；openai_compat 仍用本地 archive compact。
+上下文窗口默认 **500000**。超过 soft threshold 或 200k 输入阈值时，session/api_key 先对实际上下文调用 `POST /v1/responses/compact`，失败再本地归档；openai_compat 用本地 archive compact。普通工具数量不再触发新一轮压缩，截图仍保留独立阈值。`recall` 从会话开始固定挂载；历史卡按当前问题检索本场旧的用户要求和结论，中文用片段匹配补足 unicode61 的局限。
 
 ## 会话与状态
 
@@ -148,3 +149,7 @@ Web 与 CLI 共用一个 `SessionRouter` + `ChannelManager`：同一会话不会
 - 我平时习惯用Hermes接本地模型，这次qwen3.8 27B的体验很不好， 超长 system + 全量 tool 动物园扣在 27B 上，加上模型爱思考，难用的一匹。
 - dsh和pi agent的思路我很喜欢，但pi太简陋了，dsh折腾，原版agent给DS优化的。
 - 阿里的几个agent难用，尤其是qoder，是史。我还试了qwenpaw接qwen3.8 27B，超过80轮工具的大会话harness会挂掉，再起不能，明显没对他家自己的本地模型做过优化适配。
+
+## 长会话与工具效率修复
+
+详见 [2026-09-06 设计检查与修复记录](harness-efficiency-review.md)。Grok 路径不再用相似搜索、文件名命中、单轮 Search/Grep 配额替代真实工具结果；用户限制、审批和同参循环保护仍然执行。自动编译诊断在一批修改结束后执行一次，并明确回传成功状态。

@@ -8,7 +8,7 @@ grok-4.6 的 Cursor 形 agent harness。CLI 二进制是 `hyper`，配置在 `~/
 
 控制台侧栏仍按「办公 / 工作区」分组（频道、定时、文稿快捷方式），那是入口信息架构，不是「这不是 coding agent」。
 
-更细的内部结构见 [技术说明](docs/architecture.md)。
+更细的内部结构见 [技术说明](docs/architecture.md)。长会话召回和工具效率的检查、实测证据与修复见 [设计检查记录](docs/harness-efficiency-review.md)。
 
 ## 需要什么
 
