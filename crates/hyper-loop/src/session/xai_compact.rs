@@ -101,7 +101,9 @@ impl OfficialCompaction {
     pub fn estimate_tokens(&self) -> u32 {
         // Encrypted blob length is not model tokens. A huge estimate would
         // re-trigger compact every hop (overnight storm).
-        ((self.encrypted_content.len() / 16) as u32).clamp(1_024, 16_384)
+        // Small sidecar blobs must stay honest (8-byte fixture → 2).
+        // Cap the ceiling so a huge encrypted payload cannot retrigger compact.
+        ((self.encrypted_content.len() / 4) as u32).clamp(1, 16_384)
     }
 }
 

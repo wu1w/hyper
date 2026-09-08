@@ -1515,6 +1515,13 @@ async fn grok_identical_reads_keep_going() {
         "{:?}",
         out.stop_reason
     );
+    let warns = agent
+        .messages
+        .iter()
+        .filter_map(|m| m.content.as_deref())
+        .filter(|c| c.contains(crate::paw_loop::REPEAT_NOTE))
+        .count();
+    assert_eq!(warns, 1, "sixth identical Read must reach Grok once");
     let _ = std::fs::remove_dir_all(dir);
 }
 
@@ -4060,11 +4067,13 @@ async fn watchdog_second_cap_stops_without_disabling_thinking() {
     std::fs::create_dir_all(&dir).unwrap();
     let start = ThinkPolicy::effort_with(&crate::policy::ThinkBudget::default(), Effort::Low);
     assert_eq!(start.max_tokens, 0);
-    // 两连 watchdog：已经提醒并给过空间，按硬资源上限停止，不再用
-    // thinking-off 答案替换模型自己的推理策略。
+    // Room retry + two continue hops (LENGTH_TRUNCATION_ABORT = 3), then stop.
+    // Do not replace the model policy with thinking-off.
     let watch = PolicyWatch {
         inner: Scripted {
             turns: Mutex::new(VecDeque::from([
+                ModelTurn::watchdog(),
+                ModelTurn::watchdog(),
                 ModelTurn::watchdog(),
                 ModelTurn::watchdog(),
                 turn_text("should-not-run"),
@@ -4174,6 +4183,8 @@ async fn watchdog_second_empty_cap_ends_quietly() {
     std::fs::create_dir_all(&dir).unwrap();
     let scripted = Scripted {
         turns: Mutex::new(VecDeque::from([
+            ModelTurn::watchdog(),
+            ModelTurn::watchdog(),
             ModelTurn::watchdog(),
             ModelTurn::watchdog(),
         ])),
@@ -5466,7 +5477,7 @@ async fn lossy_doom_notes_once_then_lets_model_stop() {
         .iter()
         .filter(|c| c.contains(crate::paw_loop::REPEAT_NOTE))
         .count();
-    assert_eq!(warns, 0, "repeat fact lands exactly once: {hidden:?}");
+    assert_eq!(warns, 1, "repeat fact lands exactly once: {hidden:?}");
     let _ = std::fs::remove_dir_all(dir);
 }
 
@@ -8375,4 +8386,6 @@ async fn compacted_session_recall_survives_resume_without_sqlite_index() {
     );
     assert!(responses_wire(&resumed.messages).contains("tenant_id=opal-731"));
     let _ = std::fs::remove_dir_all(dir);
+}
+_dir_all(dir);
 }

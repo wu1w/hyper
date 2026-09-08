@@ -337,10 +337,14 @@ impl AppState {
                 if !g.cron.heartbeat_due(now) {
                     continue;
                 }
-                let custom = custom_prompt || pulse.scripted;
+                // HEARTBEAT.md only changes the fingerprint. A standing file
+                // must not fire every interval on an unchanged tree.
+                let custom = custom_prompt;
                 let primed = !last_fp.is_empty();
                 let same = primed && pulse.fingerprint == last_fp;
-                if same && !custom {
+                if same {
+                    // Fingerprint includes HEARTBEAT.md. Unchanged tree
+                    // must not spend a model hop just because /loop exists.
                     g.cron.heartbeat.last_run = Some(now);
                     let _ = g.cron.save();
                     continue;

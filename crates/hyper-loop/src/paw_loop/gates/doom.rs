@@ -8,7 +8,7 @@ use crate::paw_loop::{GateCtx, GateDecision, ToolFingerprint};
 /// A low-information trajectory observation, not an order. It is intentionally
 /// delayed: polling, flaky processes and changing files can make identical
 /// calls useful for a few rounds.
-pub const REPEAT_NOTE: &str = "[trajectory] The same tool and arguments appeared three times in a row; new information may be low. Check the last result; change the target or arguments if you need new evidence, else continue or finish from what you have.";
+pub const REPEAT_NOTE: &str = "[channel] The same tool and arguments keep repeating; new information may be low. Check the last result; change the target or arguments if you need new evidence, else continue or finish from what you have.";
 
 /// Quiet Cursor halt. Injected as `stop_reason`, not as a hidden lecture.
 pub const REPEAT_STOP: &str = "budget:repeat";

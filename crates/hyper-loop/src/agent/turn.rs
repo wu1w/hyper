@@ -383,6 +383,9 @@ impl<C: Completer> Agent<C> {
         if !turn.tool_calls.is_empty() {
             let mut notes: Vec<String> = Vec::new();
             match &decision {
+                GateDecision::Continue { continuation, .. } if !continuation.is_empty() => {
+                    notes.push(continuation.clone());
+                }
                 GateDecision::Stop { reason } if is_physics_stop(reason) => {
                     if !self.physics_nudged {
                         self.physics_nudged = true;
