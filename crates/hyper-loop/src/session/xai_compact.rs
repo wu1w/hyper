@@ -99,11 +99,10 @@ impl OfficialCompaction {
     }
 
     pub fn estimate_tokens(&self) -> u32 {
-        // Encrypted blob length is not model tokens. A huge estimate would
-        // re-trigger compact every hop (overnight storm).
-        // Small sidecar blobs must stay honest (8-byte fixture → 2).
-        // Cap the ceiling so a huge encrypted payload cannot retrigger compact.
-        ((self.encrypted_content.len() / 4) as u32).clamp(1, 16_384)
+        // Encrypted blob length is not model tokens. Floor so a tiny/corrupt
+        // sidecar cannot hide a full overnight transcript from the compact
+        // gate. Cap so a huge payload cannot retrigger compact every hop.
+        ((self.encrypted_content.len() / 4) as u32).clamp(1_024, 16_384)
     }
 }
 
@@ -672,7 +671,14 @@ mod tests {
         let again = OfficialCompaction::from_persist(p);
         assert_eq!(again.id, "cmp_1");
         assert_eq!(again.encrypted_content(), "BLOBDATA");
-        assert_eq!(again.estimate_tokens(), 2);
+        assert_eq!(again.estimate_tokens(), 1_024);
+        let huge = OfficialCompaction::from_persist(OfficialPersist {
+            id: "cmp_big".into(),
+            model: "grok-4.6".into(),
+            encrypted_content: "x".repeat(80_000),
+            skip: 1,
+        });
+        assert_eq!(huge.estimate_tokens(), 16_384);
     }
 
     #[test]

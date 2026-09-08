@@ -259,9 +259,38 @@ fn slug(name: &str) -> String {
 pub struct WorkspacePulse {
     pub fingerprint: String,
     pub dirty: bool,
-    /// HEARTBEAT.md exists — treat like a user-written /loop prompt.
+    /// HEARTBEAT.md has body. Prompt material only — a standing file must not
+    /// wake the model every interval ([`heartbeat_tick`] uses the fingerprint).
     pub scripted: bool,
     pub summary: String,
+}
+
+/// Host heartbeat after a due timer. Keep overnight jobs from empty-spinning
+/// on a standing HEARTBEAT.md, without silencing an explicit `/loop` prompt.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum HeartbeatTick {
+    /// First fingerprint only. No model call.
+    Prime,
+    /// Tree unchanged and no standing `/loop` prompt.
+    SkipQuiet,
+    /// Fire a heartbeat turn (tree changed, or the user set a `/loop` prompt).
+    Fire,
+}
+
+pub fn heartbeat_tick(last_fp: &str, pulse_fp: &str, custom_prompt: bool) -> HeartbeatTick {
+    let primed = !last_fp.is_empty();
+    let same = primed && last_fp == pulse_fp;
+    if !primed {
+        if custom_prompt {
+            HeartbeatTick::Fire
+        } else {
+            HeartbeatTick::Prime
+        }
+    } else if same && !custom_prompt {
+        HeartbeatTick::SkipQuiet
+    } else {
+        HeartbeatTick::Fire
+    }
 }
 
 fn git_out(root: &Path, args: &[&str]) -> String {
@@ -455,6 +484,37 @@ mod tests {
         assert!(wants_cron_card("帮我写个 cron"));
         assert!(wants_cron_card("加一个定时任务"));
         assert!(!wants_cron_card("修一下编译错误"));
+    }
+
+    #[test]
+    fn heartbeat_tick_primes_then_skips_quiet_tree() {
+        let fp = "abc";
+        assert_eq!(
+            heartbeat_tick("", fp, false),
+            HeartbeatTick::Prime,
+            "first sample must not spend a model hop"
+        );
+        assert_eq!(
+            heartbeat_tick(fp, fp, false),
+            HeartbeatTick::SkipQuiet,
+            "standing HEARTBEAT.md must not empty-spin"
+        );
+        assert_eq!(
+            heartbeat_tick(fp, "def", false),
+            HeartbeatTick::Fire,
+            "tree change must wake"
+        );
+    }
+
+    #[test]
+    fn heartbeat_tick_custom_loop_fires_on_quiet_tree() {
+        let fp = "abc";
+        assert_eq!(heartbeat_tick("", fp, true), HeartbeatTick::Fire);
+        assert_eq!(
+            heartbeat_tick(fp, fp, true),
+            HeartbeatTick::Fire,
+            "/loop prompt is a standing overnight job, not an empty wake"
+        );
     }
 
     #[test]

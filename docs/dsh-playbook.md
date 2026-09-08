@@ -29,7 +29,7 @@ hyper web
 | 门 | `crates/hyper-loop/src/paw_loop/gates/` | 只挂 Doom / Iteration / Timeout。0 = 不限 |
 | 会话 | `crates/hyper-loop/src/session/` | JSONL、compact、官方 blob |
 | 传输 | `crates/hyper-loop/src/llm_http.rs` `agent/responses.rs` | 流式、keepalive、官方 compact skip |
-| 心跳 | `crates/hyper-loop/src/cron.rs` `crates/hyper-web/src/hub.rs` | pulse 不持锁；git 干净且无 HEARTBEAT.md 不叫醒 |
+| 心跳 | `crates/hyper-loop/src/cron.rs` `crates/hyper-web/src/hub.rs` | pulse 不持锁；树没变且无 `/loop` prompt 不叫醒。HEARTBEAT.md 只进指纹与文案 |
 | 壳 | `crates/hyper-web/` `web/console/` `crates/hyper-cli/` | 控制台 / 静态页 / 可执行文件 |
 | 可选壳 | `plugins/dsh-plugin-hyper/` | 只翻译 UI，禁止第二套工具循环 |
 | 架构 | `docs/architecture.md` | 单一裁决、冻结 tools[] |

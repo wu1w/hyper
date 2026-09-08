@@ -2,7 +2,7 @@
 
 未发版之前以 git log 为准。下面记用户能看见的行为变化。
 
-- 同参工具第 6 次把 `[channel]` 提醒塞进工具 hop，Grok 看得到；官方 blob 只写 sidecar，不进 JSONL。HEARTBEAT.md 不再在树没变时按间隔叫醒。空闲读超时样例为 0。
+- 同参工具第 6 次把 `[channel]` 提醒塞进工具 hop，Grok 看得到；低精度第 2 次提醒、仍不 halt。官方 blob 只写 sidecar，不进 JSONL，重启按 skip 接上。HEARTBEAT.md 站桩不空转；显式 `/loop` prompt 仍按间隔跑。空闲读超时样例为 0。过夜迁墙写回前备份带注释的 `config.toml.orig`。
 - 自改：`docs/dsh-playbook.md` + 仓库短 `AGENTS.md`。`./scripts/self-snap.sh` 打 tag；`hyper-self-snapshot.sh` / `hyper-self-rollback.sh` 备份家目录配置。`/undo` 只回会话。
 - 过夜：加载配置时把旧默认 500 步 / 1800 秒墙改成 0 并写回。HTTP 不再用整段请求 30 分钟墙，只对空闲读超时。思考截断最多续 3 跳，不立刻 Exhausted。心跳不认目录 mtime。子 agent general/office 不限步。AwaitShell 默认 120 秒。
 - 过夜 compact：官方 blob 按 blob+后缀计价；含 Write 的最后一轮工具不归档；本地卡片 12000 字；TodoWrite 进 Current State；官方 blob 落到会话旁 `*.official.json`，重启可接上。

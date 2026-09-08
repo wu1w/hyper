@@ -9,7 +9,7 @@ use super::{Agent, AgentOutcome, Completer, ModelTurn};
 use crate::channel::take_steer;
 use crate::error::Result;
 use crate::paw_loop::{fs_tool_path, GateCtx, GateDecision, ToolFingerprint};
-use crate::session::{PolicyReason, RunPhase, SessionEvent, StepPhase, ToolLifecyclePhase};
+use crate::session::{PolicyReason, RunPhase, SessionEvent, StepPhase};
 use crate::sticky;
 use crate::template::{is_hidden_user_text, wrap_tool_response, ChatMessage};
 use crate::tool_calls::{ToolCall, ToolResponse, ToolState};

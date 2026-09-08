@@ -610,6 +610,7 @@ impl Config {
             let raw = fs::read_to_string(&path)?;
             let mut cfg: Self = toml::from_str(&raw)?;
             if cfg.migrate_overnight_defaults() {
+                backup_commented_original(&path);
                 let _ = cfg.save_to(&path);
             }
             cfg
@@ -825,6 +826,30 @@ mod tests {
         assert_eq!(c.policy.max_steps, 80);
         assert_eq!(c.policy.max_wall_seconds, 3600);
         assert_eq!(c.server.read_timeout_s, 600);
+    }
+
+    #[test]
+    fn overnight_migrate_save_backs_up_commented_config() {
+        let dir = std::env::temp_dir().join(format!(
+            "hyper-migrate-{}",
+            crate::session::new_session_id()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("config.toml");
+        let mut c = Config::default();
+        c.policy.max_steps = 500;
+        c.policy.max_wall_seconds = 1800;
+        let raw = format!("# keep this comment\n{}", c.to_toml());
+        std::fs::write(&path, raw).unwrap();
+        let mut loaded: Config = toml::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        assert!(loaded.migrate_overnight_defaults());
+        backup_commented_original(&path);
+        loaded.save_to(&path).unwrap();
+        let orig = std::fs::read_to_string(path.with_extension("toml.orig")).unwrap();
+        assert!(orig.contains("# keep this comment"), "{orig}");
+        assert!(orig.contains("500"), "{orig}");
+        assert_eq!(loaded.policy.max_steps, 0);
+        let _ = std::fs::remove_dir_all(dir);
     }
 
     #[test]

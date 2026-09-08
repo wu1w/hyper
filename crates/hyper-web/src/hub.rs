@@ -337,30 +337,29 @@ impl AppState {
                 if !g.cron.heartbeat_due(now) {
                     continue;
                 }
-                // HEARTBEAT.md only changes the fingerprint. A standing file
-                // must not fire every interval on an unchanged tree.
-                let custom = custom_prompt;
-                let primed = !last_fp.is_empty();
-                let same = primed && pulse.fingerprint == last_fp;
-                if same {
-                    // Fingerprint includes HEARTBEAT.md. Unchanged tree
-                    // must not spend a model hop just because /loop exists.
-                    g.cron.heartbeat.last_run = Some(now);
-                    let _ = g.cron.save();
-                    continue;
+                match hyper_loop::cron::heartbeat_tick(
+                    &last_fp,
+                    &pulse.fingerprint,
+                    custom_prompt,
+                ) {
+                    hyper_loop::cron::HeartbeatTick::SkipQuiet => {
+                        g.cron.heartbeat.last_run = Some(now);
+                        let _ = g.cron.save();
+                        continue;
+                    }
+                    hyper_loop::cron::HeartbeatTick::Prime => {
+                        g.cron.heartbeat.last_fp = pulse.fingerprint.clone();
+                        g.cron.heartbeat.last_run = Some(now);
+                        let _ = g.cron.save();
+                        continue;
+                    }
+                    hyper_loop::cron::HeartbeatTick::Fire => {}
                 }
                 g.cron.heartbeat.last_fp = pulse.fingerprint.clone();
                 g.cron.heartbeat.last_run = Some(now);
                 let _ = g.cron.save();
-                // First sample only primes the sensor. Custom /loop still fires.
-                if !custom && !primed {
-                    continue;
-                }
-                if !custom && same {
-                    continue;
-                }
                 let mut prompt = heartbeat_prompt(&g.cron, g.session.workspace());
-                if pulse.dirty || (primed && !same) {
+                if pulse.dirty || (!last_fp.is_empty() && pulse.fingerprint != last_fp) {
                     prompt = format!("{prompt}\n{}", pulse.summary);
                 }
                 start_turn(

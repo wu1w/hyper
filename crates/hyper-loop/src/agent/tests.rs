@@ -8387,5 +8387,63 @@ async fn compacted_session_recall_survives_resume_without_sqlite_index() {
     assert!(responses_wire(&resumed.messages).contains("tenant_id=opal-731"));
     let _ = std::fs::remove_dir_all(dir);
 }
-_dir_all(dir);
+
+#[tokio::test]
+async fn official_sidecar_restores_blob_and_skip_without_jsonl_blob() {
+    let dir = std::env::temp_dir().join(format!(
+        "hyper-official-resume-{}",
+        uuid::Uuid::new_v4().simple()
+    ));
+    let sessions = dir.join("sessions");
+    std::fs::create_dir_all(&sessions).unwrap();
+    let mut o = opts(&dir);
+    o.persist_session = true;
+    o.session_id = "official-resume".into();
+    o.session_dir = Some(sessions.clone());
+    let item = crate::session::parse_official_compact_json(&json!({
+        "id":"cmp_live",
+        "output":[{"type":"compaction", "encrypted_content":"SIDECAR-BLOB"}]
+    }))
+    .unwrap();
+    {
+        let mut agent = Agent::new(
+            Scripted {
+                turns: Mutex::new(VecDeque::from([turn_text("noted")])),
+                meter: false,
+            },
+            o.clone(),
+        )
+        .unwrap();
+        agent.run("keep this live user").await.unwrap();
+        agent
+            .log
+            .as_ref()
+            .unwrap()
+            .save_official(&item, 1)
+            .unwrap();
+        assert!(
+            agent.log.as_ref().unwrap().events().iter().all(|e| match e {
+                crate::session::SessionEvent::Compact(c) => c.official_blob.is_none(),
+                _ => true,
+            }),
+            "overnight blob must stay on the sidecar, not JSONL"
+        );
+        assert!(has_recall(agent.tools()));
+    }
+    let resumed = Agent::new(
+        Scripted {
+            turns: Mutex::new(VecDeque::new()),
+            meter: false,
+        },
+        o,
+    )
+    .unwrap();
+    let blob = resumed
+        .official_compaction
+        .as_ref()
+        .expect("sidecar must restore official compact");
+    assert_eq!(blob.encrypted_content(), "SIDECAR-BLOB");
+    assert_eq!(resumed.official_compaction_skip, 1);
+    assert!(has_recall(resumed.tools()));
+    let _ = std::fs::remove_dir_all(dir);
 }

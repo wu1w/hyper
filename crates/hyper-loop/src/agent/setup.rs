@@ -27,7 +27,7 @@ use crate::tools_schema::{
 };
 
 impl<C: Completer> Agent<C> {
-    pub fn new(completer: C, opts: RunOpts) -> Result<Self> {
+    pub fn new(mut completer: C, opts: RunOpts) -> Result<Self> {
         crate::subagent::ensure_live_runner();
         if opts.persist_session {
             if let Some(dir) = &opts.session_dir {
@@ -71,8 +71,14 @@ impl<C: Completer> Agent<C> {
             sticky::ensure_im_system_lock(&mut system);
         }
 
+        completer.set_low_precision(opts.low_precision);
+        let doom = if opts.low_precision {
+            DoomLoopGate::lossy()
+        } else {
+            DoomLoopGate::grok_default()
+        };
         let gates = vec![
-            Gate::from(DoomLoopGate::grok_default()),
+            Gate::from(doom),
             Gate::from(IterationGate::new(opts.max_steps)),
             Gate::from(TimeoutGate::new(opts.max_wall)),
         ];
