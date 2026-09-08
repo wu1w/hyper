@@ -102,9 +102,8 @@ pub fn build_client_for(connect_s: u64, timeout_s: u64, base_url: &str) -> Resul
         .connect_timeout(Duration::from_secs(connect_s.max(1)))
         .tcp_nodelay(true)
         .tcp_keepalive(Duration::from_secs(TCP_KEEPALIVE_S));
-    // Overnight hops stream for hours. Never cap the whole request.
-    // `read_timeout` only fires if the socket goes silent that long.
-    b = b.timeout(None);
+    // Overnight hops stream for hours. Omit total `.timeout()` (default =
+    // none). `read_timeout` only fires if the socket goes silent that long.
     // 0 = no idle cap either. TCP/H2 keepalive still drops a dead socket.
     if timeout_s > 0 {
         b = b.read_timeout(Duration::from_secs(timeout_s.max(5)));

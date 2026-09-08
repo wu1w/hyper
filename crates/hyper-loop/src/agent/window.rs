@@ -200,20 +200,18 @@ impl<C: Completer> Agent<C> {
                 };
                 self.completer
                     .set_compaction_skip(self.official_compaction_skip);
-                if let Some(log) = &self.log {
-                    let _ = log.save_official(
-                        self.official_compaction.as_ref().unwrap(),
-                        self.official_compaction_skip,
-                    );
-                    if let Some(prev) = log.events().iter().rev().find_map(|e| match e {
-                        crate::session::SessionEvent::Compact(c) => Some(c.clone()),
-                        _ => None,
-                    }) {
-                        if let Some(item) = &self.official_compaction {
-                            self.log_event(crate::session::SessionEvent::compact(
-                                prev.with_official(item),
-                            ));
-                        }
+                if let Some(item) = self.official_compaction.clone() {
+                    let prev = self.log.as_ref().and_then(|log| {
+                        let _ = log.save_official(&item, self.official_compaction_skip);
+                        log.events().iter().rev().find_map(|e| match e {
+                            crate::session::SessionEvent::Compact(c) => Some(c.clone()),
+                            _ => None,
+                        })
+                    });
+                    if let Some(prev) = prev {
+                        self.log_event(crate::session::SessionEvent::compact(
+                            prev.with_official(&item),
+                        ));
                     }
                 }
                 true

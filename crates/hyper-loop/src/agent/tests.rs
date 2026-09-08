@@ -8271,7 +8271,7 @@ async fn local_compact_invalidates_old_official_snapshot_without_changing_tools(
         .unwrap(),
     );
     let before = serde_json::to_string(&agent.tools).unwrap();
-    assert!(agent.apply_compact_pass());
+    assert!(agent.apply_compact_pass(false));
     assert!(agent.official_compaction.is_none());
     assert_eq!(serde_json::to_string(&agent.tools).unwrap(), before);
     assert!(has_recall(&agent.tools));
@@ -8343,7 +8343,7 @@ async fn compacted_session_recall_survives_resume_without_sqlite_index() {
                 .await
                 .unwrap();
         }
-        assert!(agent.apply_compact_pass());
+        assert!(agent.apply_compact_pass(false));
     }
     // JSONL is the source of truth. A missing secondary index must not make
     // archived requirements disappear after reopening a session.
