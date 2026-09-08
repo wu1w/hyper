@@ -14,7 +14,7 @@ pub use compact::{
     hoist_hidden_notes_before_query, is_xai_transport, messages_to_responses_input,
     parse_official_compact_json, plan_compact, responses_input_after, run_official_compact,
     run_official_compact_input, should_official_compact, unwrap_qwen_hidden, OfficialCompaction,
-    TransportCompact, PRICE_CLIFF_TOKENS,
+    OfficialPersist, TransportCompact, PRICE_CLIFF_TOKENS,
 };
 pub use derive::{derive_messages, live_policy};
 pub use event::{

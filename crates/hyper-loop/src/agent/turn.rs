@@ -75,9 +75,7 @@ impl<C: Completer> Agent<C> {
         self.handler.reset_turn(&self.session_id);
         self.physics_nudged = false;
         self.channel_nudged = false;
-        self.force_synthesis = false;
         self.write_nudge_count = 0;
-        self.write_hold = false;
         self.watchdog_roomy_tried = false;
         self.wrap_up_after_tools = false;
         self.stub_nudged = false;
@@ -159,18 +157,9 @@ impl<C: Completer> Agent<C> {
                     self.drop_speculate();
                 }
                 Verdict::Tools { calls, notes } => {
-                    if self.write_hold && hop_is_inspect_only(&calls) {
-                        self.skip_held_inspect(&calls);
-                    } else {
-                        if !hop_is_inspect_only(&calls) {
-                            self.write_hold = false;
-                        }
-                        self.settle_code_index().await;
-                        let should_synth = self.execute_tools(calls).await;
-                        if should_synth {
-                            self.arm_write_nudge("inspect cap");
-                        }
-                    }
+                    // Cursor / grok CLI: every scheduled call gets a real result.
+                    self.settle_code_index().await;
+                    self.execute_tools(calls).await;
                     for note in notes {
                         self.push_hidden_user(note);
                     }
@@ -189,7 +178,10 @@ impl<C: Completer> Agent<C> {
         let (text, stop_reason) = match cause {
             StopCause::Aborted => (String::new(), Some("aborted".into())),
             StopCause::Deliver { text, reason } => (text, reason),
-            StopCause::Exhausted => (String::new(), None),
+            StopCause::Exhausted => (
+                self.last_spoken.clone().unwrap_or_default(),
+                None,
+            ),
         };
         self.finish(text, stop_reason, self.turn_steps)
     }
@@ -305,9 +297,16 @@ impl<C: Completer> Agent<C> {
             if !hop_recorded {
                 self.push_failed_hop(turn);
             }
-            // Roomy retry already spent, or wrap hop. Thinking stays on;
-            // truncated think is not the user-visible answer (Cursor).
-            return Ok(Verdict::Stop(StopCause::Exhausted));
+            // Truncated think is not the answer. Keep the turn alive so an
+            // overnight hop can call tools or write the reply on the next
+            // completion. Three consecutive empty-length hops then stop.
+            self.length_truncations = self.length_truncations.saturating_add(1);
+            if self.length_truncations >= LENGTH_TRUNCATION_ABORT {
+                return Ok(Verdict::Stop(StopCause::Exhausted));
+            }
+            self.note("[watchdog] truncated think; continue");
+            self.push_hidden_user(WATCHDOG_CONTINUE_NOTE);
+            return Ok(Verdict::Continue);
         }
 
         // A clean hop (answer or executed tools) is not consecutive with a
@@ -409,14 +408,13 @@ impl<C: Completer> Agent<C> {
         self.mark_clean();
         match decision {
             GateDecision::Continue { continuation, .. } => {
-                let reason = if continuation.is_empty() {
-                    None
-                } else {
-                    Some(continuation)
-                };
+                if !continuation.is_empty() {
+                    self.push_hidden_user(continuation);
+                    return Ok(Verdict::Continue);
+                }
                 Ok(Verdict::Stop(StopCause::Deliver {
                     text: std::mem::take(&mut turn.content),
-                    reason,
+                    reason: None,
                 }))
             }
             GateDecision::Stop { reason } => {
@@ -483,14 +481,14 @@ impl<C: Completer> Agent<C> {
             return Verdict::Stop(StopCause::Exhausted);
         }
         if turn.content.trim().is_empty() {
-            if self
+            if let Some(prev) = self
                 .last_spoken
                 .as_deref()
                 .map(str::trim)
-                .is_some_and(|s| !s.is_empty())
+                .filter(|s| !s.is_empty())
             {
                 return Verdict::Stop(StopCause::Deliver {
-                    text: String::new(),
+                    text: prev.to_string(),
                     reason: None,
                 });
             }
@@ -730,32 +728,13 @@ impl<C: Completer> Agent<C> {
 
     /// Cursor keeps the frozen `tools[]` mounted. Inspect-cap / leaked
     /// Write-as-prose is a trajectory nudge, never `tools=None`.
+    /// Leaked Write-as-prose: recover the next hop. Do not skip tools.
     fn arm_write_nudge(&mut self, why: &str) {
-        self.write_hold = true;
-        self.force_synthesis = false;
         self.progress.clear_synthesis();
         self.write_nudge_count = self.write_nudge_count.saturating_add(1);
         if self.write_nudge_count == 1 {
             self.note(&format!("[trajectory] {why}; tools stay mounted"));
             self.push_hidden_user(super::progress::WRITE_NOW_NOTE);
-        } else {
-            self.note(&format!("[trajectory] {why}; inspect skipped, tools stay"));
-        }
-    }
-
-    fn skip_held_inspect(&mut self, calls: &[ToolCall]) {
-        for call in calls {
-            let response = ToolResponse::text(
-                call.id.clone(),
-                super::progress::INSPECT_SKIP_MSG,
-                ToolState::Success,
-            );
-            self.commit_tool(&call.name, response);
-            self.emit_tool_lifecycle(
-                call,
-                ToolLifecyclePhase::Skipped,
-                Some("inspection skipped; write or answer".into()),
-            );
         }
     }
 
@@ -1064,6 +1043,12 @@ pub(crate) const PHYSICS_WRAP_NOTE: &str =
     "[channel] No user-visible reply yet. Summarize what you found and accomplished; \
 do not call any more tools.";
 
+/// Length-truncated think hop: one more completion, not a tombstone.
+const WATCHDOG_CONTINUE_NOTE: &str = "\
+[channel] The last hop hit the think/output length limit with no visible answer. \
+Continue from what you already have: call a tool, or write the conclusion. \
+Do not restart the task.";
+
 /// One wrap-up hop after a toolless hop with empty visible content.
 /// Thinking is not the answer (Cursor hop geometry).
 ///
@@ -1121,14 +1106,6 @@ pub(crate) fn is_physics_stop(reason: &str) -> bool {
 /// Cursor identical-call halt. Ends the turn without a `[trajectory]` lecture.
 pub(crate) fn is_quiet_repeat_stop(reason: &str) -> bool {
     reason.starts_with(crate::paw_loop::REPEAT_STOP)
-}
-
-/// Write-hold skips extra Read/Grep/Glob/Search, not Shell / TodoWrite / web.
-fn hop_is_inspect_only(calls: &[ToolCall]) -> bool {
-    !calls.is_empty()
-        && calls
-            .iter()
-            .all(|c| super::progress::is_held_inspect(&c.name))
 }
 
 /// Grok sometimes paints a Write/StrReplace as a JSON fence instead of a

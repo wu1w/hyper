@@ -26,6 +26,8 @@ pub struct Heartbeat {
     pub prompt: String,
     #[serde(default)]
     pub last_run: Option<u64>,
+    #[serde(default)]
+    pub last_fp: String,
 }
 
 impl Default for Heartbeat {
@@ -35,6 +37,7 @@ impl Default for Heartbeat {
             interval_s: 3600,
             prompt: String::new(),
             last_run: None,
+            last_fp: String::new(),
         }
     }
 }
@@ -132,6 +135,9 @@ impl CronStore {
             }
         }
         self.heartbeat.last_run = later_ts(self.heartbeat.last_run, mem.heartbeat.last_run);
+        if !mem.heartbeat.last_fp.is_empty() {
+            self.heartbeat.last_fp = mem.heartbeat.last_fp.clone();
+        }
     }
 
     pub fn ingest_workspace(&mut self, workspace: &std::path::Path) {
@@ -364,6 +370,7 @@ mod tests {
                 interval_s: 60,
                 prompt: "pulse".into(),
                 last_run: Some(100),
+                last_fp: String::new(),
             },
             ..Default::default()
         };
@@ -416,6 +423,7 @@ mod tests {
                 interval_s: 60,
                 prompt: "pulse".into(),
                 last_run: Some(100),
+                last_fp: String::new(),
             },
             ..Default::default()
         };

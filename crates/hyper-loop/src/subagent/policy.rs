@@ -42,7 +42,7 @@ impl SubagentType {
         match self {
             Self::Explore => 12,
             Self::Plan => 16,
-            Self::Office | Self::GeneralPurpose => 24,
+            Self::Office | Self::GeneralPurpose => 0,
         }
     }
 
@@ -383,7 +383,7 @@ mod tests {
         );
         assert_eq!(SubagentType::Explore.default_max_steps(), 12);
         assert_eq!(SubagentType::Plan.default_max_steps(), 16);
-        assert_eq!(SubagentType::GeneralPurpose.default_max_steps(), 24);
+        assert_eq!(SubagentType::GeneralPurpose.default_max_steps(), 0);
         let _ = ThinkPolicy::effort_with(&b, Effort::Low);
     }
 }

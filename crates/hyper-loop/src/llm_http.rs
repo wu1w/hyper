@@ -62,7 +62,7 @@ pub fn is_loopback_base(base_url: &str) -> bool {
 pub fn stream_client(cfg: &Config) -> Result<Client> {
     build_client_for(
         effective_connect_timeout_s(cfg),
-        cfg.server.read_timeout_s.max(5),
+        cfg.server.read_timeout_s,
         &cfg.server.base_url,
     )
 }
@@ -100,9 +100,15 @@ pub fn build_client(connect_s: u64, timeout_s: u64) -> Result<Client> {
 pub fn build_client_for(connect_s: u64, timeout_s: u64, base_url: &str) -> Result<Client> {
     let mut b = Client::builder()
         .connect_timeout(Duration::from_secs(connect_s.max(1)))
-        .timeout(Duration::from_secs(timeout_s.max(5)))
         .tcp_nodelay(true)
         .tcp_keepalive(Duration::from_secs(TCP_KEEPALIVE_S));
+    // Overnight hops stream for hours. Never cap the whole request.
+    // `read_timeout` only fires if the socket goes silent that long.
+    b = b.timeout(None);
+    // 0 = no idle cap either. TCP/H2 keepalive still drops a dead socket.
+    if timeout_s > 0 {
+        b = b.read_timeout(Duration::from_secs(timeout_s.max(5)));
+    }
     // rustls + HTTP/2 on Windows can sit on an established socket with no
     // headers until read_timeout (default 30 min). Custom forwarding proxies
     // often buffer H2 SSE ("taking longer than expected"). HTTP/1.1 fails

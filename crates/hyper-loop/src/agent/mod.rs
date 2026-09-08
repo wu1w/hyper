@@ -320,19 +320,16 @@ pub(crate) fn im_bridge_channel(channel: &str) -> bool {
     )
 }
 
-/// Hermes-shaped unattended caps: gateway `max_turns` 500, plus a wall so IM cannot stall forever.
+/// IM inherits the unattended caps. 0 = no cap, same as the console default.
 pub fn apply_unattended_policy(opts: &mut RunOpts, cfg: &crate::config::Config) {
     if interactive_channel(&opts.channel) {
         return;
     }
-    if cfg.policy.max_steps_unattended > 0 {
-        opts.max_steps = cfg.policy.max_steps_unattended;
-    }
+    opts.max_steps = cfg.policy.max_steps_unattended;
     opts.max_wall = Duration::from_secs(cfg.policy.max_wall_unattended_seconds);
 }
 
 const DEFAULT_COMPACT_RATIO: f64 = 0.80;
-const TURN_START_COMPACT_PREFIX: u32 = crate::session::PRICE_CLIFF_TOKENS as u32;
 /// In-memory screenshots from the previous turn. Wire caps at 4; archive sooner.
 const TURN_START_COMPACT_IMAGES: usize = 4;
 /// Mid-turn ComputerUse: archive older closed groups so 60 screenshot hops
@@ -383,7 +380,6 @@ fn should_compact_at_user_turn(
         return false;
     }
     over_soft_threshold(prefix, reserve, working_window, compact_ratio)
-        || prefix > TURN_START_COMPACT_PREFIX
 }
 
 fn should_compact_follow_up(
@@ -508,12 +504,8 @@ pub struct Agent<C> {
     physics_nudged: bool,
     /// Empty / stub toolless hop already got one wrap-up. Second blank → fallback text.
     channel_nudged: bool,
-    /// Dead: inspect-cap uses `write_hold` and keeps `tools[]` mounted. Always false.
-    force_synthesis: bool,
-    /// Write-nudges used this user turn. Inspect-cap never unmounts `tools[]`.
+    /// Write-nudges used this user turn (leaked Write-as-prose recovery).
     write_nudge_count: u32,
-    /// Last hop was a write-nudge; inspect-only calls are not executed.
-    write_hold: bool,
     /// First think-cap of this user turn already got the roomy retry.
     watchdog_roomy_tried: bool,
     /// Physics / follow-up wrap hop: leaked tool calls are dropped, not executed.

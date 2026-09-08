@@ -411,7 +411,7 @@ impl<C: Completer> Agent<C> {
         }
     }
 
-    pub(crate) async fn execute_tools(&mut self, calls: Vec<ToolCall>) -> bool {
+    pub(crate) async fn execute_tools(&mut self, calls: Vec<ToolCall>) {
         if self.code_index.is_none() && calls.iter().any(needs_search_index) {
             self.start_code_index();
             self.settle_code_index().await;
@@ -564,7 +564,6 @@ impl<C: Completer> Agent<C> {
         if thrash && self.effort.note_thrash() {
             self.sync_effort(PolicyReason::Upgrade);
         }
-        self.progress.should_synthesize()
     }
 
     pub(crate) fn apply_guard_note(&mut self, note: guard::GuardNote) {
@@ -749,11 +748,6 @@ impl<C: Completer> Agent<C> {
     /// completion only; restore afterwards so a later coding hop keeps the
     /// session policy. `--think` lock is honored (left alone).
     pub(crate) fn widen_no_tool_think(&self) -> Option<ThinkPolicy> {
-        if self.force_synthesis {
-            // Wrap hops use a tight max_output_tokens / think cap. Raising to
-            // the generic 8k floor is what let Grok think for 14 minutes.
-            return None;
-        }
         if self.effort.user_locked {
             return None;
         }
@@ -807,13 +801,7 @@ impl<C: Completer> Agent<C> {
     }
 
     pub(crate) fn arm_sink(&self) {
-        let sink = self.live_sink().map(|sink| {
-            if self.force_synthesis {
-                sink.content_only()
-            } else {
-                sink
-            }
-        });
+        let sink = self.live_sink();
         self.completer.set_token_sink(sink);
     }
 
@@ -1485,6 +1473,41 @@ impl<C: Completer> Agent<C> {
                         continue;
                     }
                 }
+                continue;
+            }
+            let safe: Vec<(usize, ToolCall)> = calls
+                .iter()
+                .enumerate()
+                .filter(|(i, c)| out[*i].is_none() && is_parallel_safe(&c.name))
+                .map(|(i, c)| (i, c.clone()))
+                .collect();
+            if safe.len() > 1 {
+                let batch: Vec<ToolCall> = safe.iter().map(|(_, c)| c.clone()).collect();
+                for call in &batch {
+                    self.emit_tool_lifecycle(
+                        call,
+                        ToolLifecyclePhase::Started,
+                        Some(preview_args(call)),
+                    );
+                }
+                let rest = self.dispatch_parallel(&batch).await;
+                for ((i, _), r) in safe.into_iter().zip(rest) {
+                    out[i] = Some(r);
+                }
+            }
+            for (i, call) in calls.iter().enumerate() {
+                if out[i].is_some() {
+                    continue;
+                }
+                if crate::channel::has_steer(&self.steer) {
+                    skipped.insert(call.id.clone());
+                    out[i] = Some(ToolResponse::text(
+                        &call.id,
+                        STEER_SKIPPED_MSG,
+                        ToolState::Interrupted,
+                    ));
+                    continue;
+                }
                 self.emit_tool_lifecycle(
                     call,
                     ToolLifecyclePhase::Started,
@@ -1495,7 +1518,6 @@ impl<C: Completer> Agent<C> {
                 } else {
                     self.dispatch_one(call).await
                 };
-
                 out[i] = Some(r);
             }
         }
@@ -1504,7 +1526,16 @@ impl<C: Completer> Agent<C> {
         }
         let mut responses: Vec<ToolResponse> = out
             .into_iter()
-            .map(|r| r.expect("every tool call has a response"))
+            .enumerate()
+            .map(|(i, r)| {
+                r.unwrap_or_else(|| {
+                    ToolResponse::text(
+                        calls.get(i).map(|c| c.id.as_str()).unwrap_or(""),
+                        "tool dispatch missed a paired result",
+                        ToolState::Interrupted,
+                    )
+                })
+            })
             .collect();
         self.fold_idle_search(calls, &mut responses);
         self.fold_idle_grep(calls, &mut responses);
@@ -1713,6 +1744,9 @@ impl<C: Completer> Agent<C> {
     }
 
     fn fold_idle_cat(&self, calls: &[ToolCall], responses: &mut [ToolResponse]) {
+        if self.completer.recasts_xai_product() {
+            return;
+        }
         let mut msgs = self.messages.clone();
         for (call, response) in calls.iter().zip(responses.iter()) {
             if dispatch_name(&call.name) == "search" {

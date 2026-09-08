@@ -65,6 +65,54 @@ impl OfficialCompaction {
     pub fn debug_blob(&self) -> String {
         truncate_blob(&self.encrypted_content)
     }
+
+    pub fn persist_skip(&self, skip: usize) -> OfficialPersist {
+        OfficialPersist {
+            id: self.id.clone(),
+            model: self.model.clone(),
+            encrypted_content: self.encrypted_content.clone(),
+            skip,
+        }
+    }
+
+    pub fn from_persist(p: OfficialPersist) -> Self {
+        let output = vec![json!({
+            "type": "compaction",
+            "id": p.id,
+            "encrypted_content": p.encrypted_content,
+        })];
+        Self {
+            id: p.id,
+            model: p.model,
+            output,
+            encrypted_content: p.encrypted_content,
+        }
+    }
+
+    pub fn from_persisted(id: impl Into<String>, model: impl Into<String>, blob: impl Into<String>) -> Self {
+        Self::from_persist(OfficialPersist {
+            id: id.into(),
+            model: model.into(),
+            encrypted_content: blob.into(),
+            skip: 1,
+        })
+    }
+
+    pub fn estimate_tokens(&self) -> u32 {
+        // Encrypted blob length is not model tokens. A huge estimate would
+        // re-trigger compact every hop (overnight storm).
+        ((self.encrypted_content.len() / 16) as u32).clamp(1_024, 16_384)
+    }
+}
+
+/// Sidecar payload next to the session JSONL. Do not print `encrypted_content`.
+#[derive(Clone, serde::Serialize, serde::Deserialize)]
+pub struct OfficialPersist {
+    pub id: String,
+    pub model: String,
+    pub encrypted_content: String,
+    #[serde(default)]
+    pub skip: usize,
 }
 
 /// Result of [`compact_for_transport`]: official blob or local archive rewrite.
@@ -82,11 +130,8 @@ pub fn clamp_compact_ratio(ratio: f64) -> f64 {
     }
 }
 
-/// Soft window (`prompt_tokens > working_window * ratio`) or the 200k price cliff.
+/// Soft window only. The 200k price cliff is billing, not a compact trigger.
 pub fn should_official_compact(prompt_tokens: u64, window: u32, ratio: f64) -> bool {
-    if prompt_tokens > PRICE_CLIFF_TOKENS {
-        return true;
-    }
     if window == 0 {
         return false;
     }
@@ -611,14 +656,31 @@ mod tests {
     use super::*;
 
     #[test]
+    fn persist_roundtrip_keeps_blob_and_skip() {
+        let item = OfficialCompaction::from_persist(OfficialPersist {
+            id: "cmp_1".into(),
+            model: "grok-4.6".into(),
+            encrypted_content: "BLOBDATA".into(),
+            skip: 1,
+        });
+        let p = item.persist_skip(1);
+        assert_eq!(p.id, "cmp_1");
+        assert_eq!(p.encrypted_content, "BLOBDATA");
+        assert_eq!(p.skip, 1);
+        let again = OfficialCompaction::from_persist(p);
+        assert_eq!(again.id, "cmp_1");
+        assert_eq!(again.encrypted_content(), "BLOBDATA");
+        assert_eq!(again.estimate_tokens(), 2);
+    }
+
+    #[test]
     fn should_official_compact_math() {
-        // 262144 * 0.80 = 209715.2 — 210k is over ratio, 200k is not (but cliff is >200k).
+        // 262144 * 0.80 = 209715.2 — 210k is over ratio, 200k is not.
         assert!(!should_official_compact(100_000, 262_144, 0.80));
         assert!(should_official_compact(210_000, 262_144, 0.80));
         assert!(!should_official_compact(200_000, 262_144, 0.80));
-        assert!(should_official_compact(200_001, 262_144, 0.80));
-        // Price cliff independent of window.
-        assert!(should_official_compact(200_001, 0, 0.80));
+        assert!(!should_official_compact(200_001, 262_144, 0.80));
+        assert!(!should_official_compact(200_001, 0, 0.80));
         assert!(!should_official_compact(50_000, 0, 0.80));
         // Small window: 800 > 1000 * 0.70.
         assert!(should_official_compact(800, 1000, 0.70));

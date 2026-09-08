@@ -28,6 +28,8 @@ pub use registry::{
     get, list_for_parent, reap_orphans, running_count, snapshot_json, ChildRecord, MAX_CONCURRENT,
 };
 pub use spawn::{register_live_runner, ChildOutcome, SpawnReq};
+
+const DEFAULT_AWAIT_TIMEOUT: Duration = Duration::from_secs(120);
 pub use worktree::Isolation;
 
 #[derive(Clone, Copy, Debug)]
@@ -406,9 +408,12 @@ async fn dispatch_await(call: &ToolCall, ctx: &DispatchCtx) -> ToolResponse {
             ToolState::Error,
         );
     }
-    let timeout = arg_u64(&call.arguments, "timeout_ms")
-        .or_else(|| arg_u64(&call.arguments, "block_until_ms"))
-        .map(Duration::from_millis);
+    let timeout = Some(
+        arg_u64(&call.arguments, "timeout_ms")
+            .or_else(|| arg_u64(&call.arguments, "block_until_ms"))
+            .map(Duration::from_millis)
+            .unwrap_or(DEFAULT_AWAIT_TIMEOUT),
+    );
     if registry::get(&id).is_none() {
         let dir = ctx.session_dir.clone().or_else(|| {
             crate::config::Config::home_dir()
@@ -418,8 +423,15 @@ async fn dispatch_await(call: &ToolCall, ctx: &DispatchCtx) -> ToolResponse {
         let _ = registry::get_or_load(&id, dir.as_deref());
     }
     let rec = registry::wait(&id, timeout).await;
-    if rec.is_some() {
-        return format_record(&call.id, rec);
+    if let Some(rec) = rec {
+        if rec.status == registry::ChildStatus::Running {
+            return ToolResponse::text(
+                &call.id,
+                format!("timed out waiting for `{id}` (still running)."),
+                ToolState::Interrupted,
+            );
+        }
+        return format_record(&call.id, Some(rec));
     }
     if crate::tool_calls::bgwait::exists(&id) {
         return match crate::tool_calls::bgwait::wait(&id, timeout).await {
@@ -431,7 +443,7 @@ async fn dispatch_await(call: &ToolCall, ctx: &DispatchCtx) -> ToolResponse {
             None => ToolResponse::text(
                 &call.id,
                 format!("timed out waiting for background tool `{id}` (still running)."),
-                ToolState::Success,
+                ToolState::Interrupted,
             ),
         };
     }
@@ -447,16 +459,27 @@ async fn dispatch_wait_many(call: &ToolCall) -> ToolResponse {
             ToolState::Error,
         );
     }
-    let timeout = arg_u64(&call.arguments, "timeout_ms")
-        .or_else(|| arg_u64(&call.arguments, "block_until_ms"))
-        .map(Duration::from_millis);
+    let timeout = Some(
+        arg_u64(&call.arguments, "timeout_ms")
+            .or_else(|| arg_u64(&call.arguments, "block_until_ms"))
+            .map(Duration::from_millis)
+            .unwrap_or(DEFAULT_AWAIT_TIMEOUT),
+    );
     let recs = registry::wait_many(&ids, timeout).await;
     let body = recs
         .iter()
         .map(record_text)
         .collect::<Vec<_>>()
         .join("\n\n---\n\n");
-    ToolResponse::text(&call.id, body, ToolState::Success)
+    let state = if recs
+        .iter()
+        .any(|r| r.status == registry::ChildStatus::Running)
+    {
+        ToolState::Interrupted
+    } else {
+        ToolState::Success
+    };
+    ToolResponse::text(&call.id, body, state)
 }
 
 fn dispatch_kill(call: &ToolCall) -> ToolResponse {
@@ -563,10 +586,10 @@ pub(crate) fn effective_model(raw: Option<&str>) -> Option<String> {
 fn format_record(call_id: &str, rec: Option<registry::ChildRecord>) -> ToolResponse {
     match rec {
         Some(r) => {
-            let state = if r.status == registry::ChildStatus::Failed {
-                ToolState::Error
-            } else {
-                ToolState::Success
+            let state = match r.status {
+                registry::ChildStatus::Failed => ToolState::Error,
+                registry::ChildStatus::Running => ToolState::Interrupted,
+                _ => ToolState::Success,
             };
             ToolResponse::text(call_id, record_text(&r), state)
         }

@@ -1,9 +1,5 @@
-//! Result-novelty after tools run. Permuted inspection loops are not
-//! consecutive identical fingerprints, so DoomLoopGate never sees them.
-//!
-//! Hyper does not decide "is the task done?". It decides whether another
-//! inspect hop would add evidence. If not, keep the frozen Cursor `tools[]`
-//! mounted and nudge toward native Write / StrReplace / Task.
+//! Result-novelty after tools run. Observation only — never rewrite a
+//! successful tool body. DoomLoopGate owns exact-call repeats.
 
 use std::collections::{BTreeSet, HashMap, HashSet, VecDeque};
 
@@ -36,20 +32,9 @@ State remaining uncertainty explicitly.";
 /// this as tools=None. The next hop must be native Write / StrReplace / Task,
 /// or a finished answer with no tools.
 pub const WRITE_NOW_NOTE: &str = "\
-[channel] Further inspection is not adding enough new evidence. \
-Do not Read, Grep, or Glob again. Emit native Write / StrReplace / Task \
-tool calls now — not JSON, HTML fences, or narration. \
+[channel] The last hop described a write instead of calling the tool. \
+Emit a native Write / StrReplace / Task call — not JSON, HTML fences, or narration. \
 If the work is done, answer without tools.";
-
-pub const ALREADY_OBSERVED_MSG: &str = "\
-[already observed]\nThis exact content was returned earlier this turn.\n\
-No new evidence was added.\nUse the existing result or answer now.";
-
-/// Skip result for inspect-only hops after the write-nudge. Cursor keeps
-/// `tools[]` mounted; the model still sees a paired tool result.
-pub const INSPECT_SKIP_MSG: &str = "\
-[already observed]\nInspection is not adding enough new evidence this turn.\n\
-Do not Read, Grep, or Glob again. Call Write, StrReplace, or Task, or answer now.";
 
 #[derive(Clone, Debug, Default)]
 pub struct ProgressDelta {
@@ -95,7 +80,6 @@ pub struct ProgressTracker {
     hop_index: u32,
     last_test_fail: Option<bool>,
     last_diag_hash: Option<String>,
-    synthesize: bool,
 }
 
 impl ProgressTracker {
@@ -103,20 +87,13 @@ impl ProgressTracker {
         *self = Self::default();
     }
 
-    pub fn should_synthesize(&self) -> bool {
-        self.synthesize
-    }
-
-    /// A recovered Write / Task is progress. Do not keep the inspect-skip hold
-    /// for the rest of the turn after the model finally mutates the workspace.
+    /// A recovered Write / Task is progress. Reset inspect-streak bookkeeping.
     pub fn clear_synthesis(&mut self) {
-        self.synthesize = false;
         self.inspect_streak = 0;
         self.low_streak = 0;
     }
 
-    /// Fold repeated blobs, count novelty, then decide whether the next hop
-    /// should skip further inspection (tools stay mounted).
+    /// Count novelty. Do not rewrite successful tool bodies.
     pub fn fold_and_observe(
         &mut self,
         ws: &Workspace,
@@ -159,7 +136,6 @@ impl ProgressTracker {
             let blob_hash = evidence_hash(&canon);
             // Capture before count_evidence / remember_hash, or the first
             // dump of a blob is folded away as "already observed".
-            let already = self.seen_hashes.contains(&blob_hash);
             if is_gate_or_nudge(&body) {
                 delta.total_results += 1;
                 delta.repeated_results += 1;
@@ -187,14 +163,6 @@ impl ProgressTracker {
                 sig.result_hashes.insert(blob_hash.clone());
             }
 
-            if already && self.should_fold_blob(name, &body) {
-                let hop = self.seen_at.get(&blob_hash).copied().unwrap_or(0);
-                *response = ToolResponse::text(
-                    response.id.clone(),
-                    already_observed_text(hop),
-                    ToolState::Success,
-                );
-            }
             self.remember_hash(&blob_hash);
         }
 
@@ -226,10 +194,6 @@ impl ProgressTracker {
         } else if !inspect {
             self.inspect_streak = 0;
             self.low_streak = 0;
-            self.synthesize = false;
-        }
-        if self.low_streak >= LOW_STREAK || self.inspect_streak >= INSPECT_STREAK {
-            self.synthesize = true;
         }
         self.hops.push_back(sig);
         while self.hops.len() > HOP_HISTORY {
@@ -252,19 +216,6 @@ impl ProgressTracker {
         if self.seen_hashes.insert(h.to_string()) {
             self.seen_at.insert(h.to_string(), self.hop_index);
         }
-    }
-
-    fn should_fold_blob(&self, name: &str, body: &str) -> bool {
-        if !matches!(name, "read" | "view" | "grep" | "glob" | "search" | "bash") {
-            return false;
-        }
-        if body.chars().count() < 80 {
-            return false;
-        }
-        if is_gate_or_nudge(body) {
-            return false;
-        }
-        true
     }
 
     fn note_listing(
@@ -297,13 +248,7 @@ impl ProgressTracker {
                 self.count_evidence(id, delta);
             }
         }
-        if old_matches > 0 {
-            let extra =
-                format!("\nnew_matches: {new_matches}\npreviously_seen_matches: {old_matches}");
-            response
-                .content
-                .push(crate::tool_calls::TextBlock { text: extra });
-        }
+        let _ = (old_matches, new_matches, response);
     }
 }
 
@@ -343,8 +288,7 @@ pub fn is_mutating_dispatch(name: &str) -> bool {
     )
 }
 
-/// Inspect tools skipped after write-nudge. Matches `WRITE_NOW_NOTE`.
-/// Shell / TodoWrite / Web* are work, not a re-read.
+/// Read-family tools. Shell / TodoWrite / Web* are work, not a re-read.
 pub fn is_held_inspect(name: &str) -> bool {
     matches!(
         dispatch_name(name),
@@ -353,18 +297,7 @@ pub fn is_held_inspect(name: &str) -> bool {
 }
 
 fn hop_is_inspect(calls: &[ToolCall]) -> bool {
-    !calls.is_empty() && calls.iter().all(|c| !is_mutating_dispatch(&c.name))
-}
-
-fn already_observed_text(hop: u32) -> String {
-    if hop == 0 {
-        ALREADY_OBSERVED_MSG.to_string()
-    } else {
-        format!(
-            "[already observed]\nThis exact content was returned at hop {hop}.\n\
-No new evidence was added.\nUse the existing result or answer now."
-        )
-    }
+    !calls.is_empty() && calls.iter().all(|c| is_held_inspect(&c.name))
 }
 
 fn hop_fingerprints(calls: &[ToolCall]) -> BTreeSet<String> {
@@ -565,8 +498,6 @@ mod tests {
         let ws = Workspace::open(&dir, true).unwrap();
         let mut t = ProgressTracker::default();
         t.inspect_streak = INSPECT_STREAK;
-        t.synthesize = true;
-        assert!(t.should_synthesize());
         let write = ToolCall {
             id: "w".into(),
             name: "Write".into(),
@@ -574,7 +505,32 @@ mod tests {
         };
         let mut wresp = [ToolResponse::text("w", "wrote a.rs", ToolState::Success)];
         t.fold_and_observe(&ws, &[write], &mut wresp, false, false, None);
-        assert!(!t.should_synthesize());
+        assert_eq!(t.inspect_streak, 0);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn seen_blobs_keep_real_text() {
+        let dir = std::env::temp_dir().join(format!(
+            "hyper-prog-keep-{}",
+            uuid::Uuid::new_v4().simple()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let body = "fn ping() {}\n".repeat(20);
+        std::fs::write(dir.join("a.rs"), &body).unwrap();
+        let ws = Workspace::open(&dir, true).unwrap();
+        let mut t = ProgressTracker::default();
+        let call = ToolCall {
+            id: "r1".into(),
+            name: "Read".into(),
+            arguments: serde_json::json!({"path": "a.rs"}),
+        };
+        let mut first = [ToolResponse::text("r1", body.clone(), ToolState::Success)];
+        t.fold_and_observe(&ws, &[call.clone()], &mut first, false, false, None);
+        let mut second = [ToolResponse::text("r1", body.clone(), ToolState::Success)];
+        t.fold_and_observe(&ws, &[call], &mut second, false, false, None);
+        assert!(second[0].joined_text().contains("fn ping"));
+        assert!(!second[0].joined_text().contains("[already observed]"));
         let _ = std::fs::remove_dir_all(dir);
     }
 

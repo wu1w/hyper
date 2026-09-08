@@ -63,6 +63,7 @@ impl Inner {
         self.session.turn_in_flight() || self.live.contains_key(self.session.session_id())
     }
 
+
     fn session_mut(&mut self, id: &str) -> Option<&mut SidecarSession> {
         if self.session.session_id() == id {
             Some(&mut self.session)
@@ -308,19 +309,64 @@ impl AppState {
                         continue;
                     }
                 }
-                if g.cron.heartbeat_due(now) {
-                    let prompt = heartbeat_prompt(&g.cron, g.session.workspace());
+                if !g.cron.heartbeat_due(now) {
+                    continue;
+                }
+                let ws = g.session.workspace().to_path_buf();
+                let last_fp = g.cron.heartbeat.last_fp.clone();
+                let custom_prompt = !g.cron.heartbeat.prompt.trim().is_empty();
+                drop(g);
+                let pulse = match tokio::task::spawn_blocking({
+                    let ws = ws.clone();
+                    move || hyper_loop::cron::workspace_pulse(&ws)
+                })
+                .await
+                {
+                    Ok(p) => p,
+                    Err(_) => hyper_loop::cron::WorkspacePulse {
+                        fingerprint: last_fp.clone(),
+                        dirty: false,
+                        scripted: false,
+                        summary: String::new(),
+                    },
+                };
+                let mut g = inner.lock().await;
+                if g.focused_live() {
+                    continue;
+                }
+                if !g.cron.heartbeat_due(now) {
+                    continue;
+                }
+                let custom = custom_prompt || pulse.scripted;
+                let primed = !last_fp.is_empty();
+                let same = primed && pulse.fingerprint == last_fp;
+                if same && !custom {
                     g.cron.heartbeat.last_run = Some(now);
                     let _ = g.cron.save();
-                    start_turn(
-                        &mut g,
-                        inner.clone(),
-                        prompt,
-                        Vec::new(),
-                        Some(CronRetry::Heartbeat),
-                        None,
-                    );
+                    continue;
                 }
+                g.cron.heartbeat.last_fp = pulse.fingerprint.clone();
+                g.cron.heartbeat.last_run = Some(now);
+                let _ = g.cron.save();
+                // First sample only primes the sensor. Custom /loop still fires.
+                if !custom && !primed {
+                    continue;
+                }
+                if !custom && same {
+                    continue;
+                }
+                let mut prompt = heartbeat_prompt(&g.cron, g.session.workspace());
+                if pulse.dirty || (primed && !same) {
+                    prompt = format!("{prompt}\n{}", pulse.summary);
+                }
+                start_turn(
+                    &mut g,
+                    inner.clone(),
+                    prompt,
+                    Vec::new(),
+                    Some(CronRetry::Heartbeat),
+                    None,
+                );
             }
         });
     }
@@ -1017,6 +1063,9 @@ pub fn start_turn(
     session_id: Option<String>,
 ) {
     let sid = session_id.unwrap_or_else(|| inner.session.session_id().to_string());
+    if inner.live.contains_key(&sid) {
+        return;
+    }
     let (snapshot, steer) = {
         let Some(sess) = inner.session_mut(&sid) else {
             return;
@@ -1039,6 +1088,14 @@ pub fn start_turn(
         .bus
         .send(notify("event.append", event_payload(&sid, user)));
     let cancel = CancelFlag::new();
+    inner.live.insert(
+        sid.clone(),
+        LiveTurn {
+            cancel: cancel.clone(),
+            join: tokio::spawn(async {}),
+            started_ms: unix_ms(),
+        },
+    );
     let (local_tx, mut local_rx) = mpsc::unbounded_channel();
     let tagged = inner.ev_tx.clone();
     let stamp = sid.clone();
@@ -1063,7 +1120,9 @@ pub fn start_turn(
     let agents_md = inner.agents_md;
     let agents_md_head = inner.agents_md_head;
     let turn_sid = sid.clone();
+    let (ready_tx, ready_rx) = tokio::sync::oneshot::channel();
     let join = tokio::spawn(async move {
+        let _ = ready_rx.await;
         let mut guard = TurnPanicGuard {
             shared: shared.clone(),
             session_id: turn_sid.clone(),
@@ -1118,14 +1177,20 @@ pub fn start_turn(
             start_turn(&mut g, shared.clone(), next, parts, None, Some(turn_sid));
         }
     });
-    inner.live.insert(
-        sid,
-        LiveTurn {
-            cancel,
-            join,
-            started_ms: unix_ms(),
-        },
-    );
+    if let Some(slot) = inner.live.get_mut(&sid) {
+        let old = std::mem::replace(&mut slot.join, join);
+        old.abort();
+    } else {
+        inner.live.insert(
+            sid,
+            LiveTurn {
+                cancel,
+                join,
+                started_ms: unix_ms(),
+            },
+        );
+    }
+    let _ = ready_tx.send(());
     push_state(inner);
 }
 

@@ -17,7 +17,7 @@ impl IterationGate {
     pub fn new(max_iterations: u32) -> Self {
         Self {
             sessions: SessionMap::new(),
-            default_max: max_iterations.max(1),
+            default_max: max_iterations,
         }
     }
 
@@ -37,8 +37,13 @@ impl IterationGate {
             let Some(state) = state else {
                 return GateDecision::Bypass;
             };
+            if state.max_iterations == 0 {
+                return GateDecision::Bypass;
+            }
             state.iteration = state.iteration.saturating_add(1);
-            if state.iteration >= state.max_iterations {
+            if state.max_iterations == 0 {
+                GateDecision::Bypass
+            } else if state.iteration >= state.max_iterations {
                 GateDecision::Stop {
                     reason: format!("Max iterations ({}) reached", state.max_iterations),
                 }

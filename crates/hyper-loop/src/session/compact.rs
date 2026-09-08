@@ -37,24 +37,24 @@ pub use xai_compact::{
     chat_to_input_items, compact_for_transport, compact_url, hoist_hidden_notes_before_query,
     is_xai_transport, messages_to_responses_input, parse_official_compact_json,
     responses_input_after, run_official_compact, run_official_compact_input,
-    should_official_compact, unwrap_qwen_hidden, OfficialCompaction, TransportCompact,
-    PRICE_CLIFF_TOKENS,
+    should_official_compact, unwrap_qwen_hidden, OfficialCompaction, OfficialPersist,
+    TransportCompact, PRICE_CLIFF_TOKENS,
 };
 
 const INDEX_LINES: usize = 80;
 /// Keep the first tools as well as the latest — inspect-only Current State.
 const INDEX_HEAD: usize = 20;
 /// Cursor / grok CLI follow-up sees files the previous turn actually changed.
-const MUTATION_STATE_CAP: usize = 24;
+const MUTATION_STATE_CAP: usize = 48;
 const STATE_INSPECT_WHEN_MUTATIONS: usize = 4;
 const CLIP: usize = 120;
-const ARCHIVE_CHARS: usize = 4000;
+const ARCHIVE_CHARS: usize = 12_000;
 const STATE_CAP: usize = 10;
 const STATE_HEAD: usize = 3;
 const NOTE_CAP: usize = 2;
 const DECISION_CAP: usize = 8;
 /// Last two finals stay long so a follow-up still sees this chat's conclusions.
-const DECISION_KEEP: usize = 1800;
+const DECISION_KEEP: usize = 2400;
 /// Prior real user turns that left the live window. Cap drops oldest.
 const CONSTRAINT_CAP: usize = 6;
 const PRIOR_USER: &str = "Prior User";
@@ -119,6 +119,26 @@ pub fn compact_messages(messages: &[ChatMessage]) -> Option<(CompactEvent, Vec<C
 }
 
 impl CompactEvent {
+    pub fn with_official(mut self, item: &crate::session::OfficialCompaction) -> Self {
+        self.official_id = Some(item.id.clone());
+        self.official_model = Some(item.model.clone());
+        self.official_blob = Some(item.encrypted_content().to_string());
+        self
+    }
+
+    pub fn official(&self) -> Option<crate::session::OfficialCompaction> {
+        let id = self.official_id.as_deref()?.trim();
+        let blob = self.official_blob.as_deref()?.trim();
+        if id.is_empty() || blob.is_empty() {
+            return None;
+        }
+        Some(crate::session::OfficialCompaction::from_persisted(
+            id,
+            self.official_model.as_deref().unwrap_or(""),
+            blob,
+        ))
+    }
+
     pub fn with_hint(mut self, hint: &str) -> Self {
         let h = hint.trim();
         if !h.is_empty() {
@@ -152,7 +172,16 @@ impl CompactEvent {
         }
         body.push_str(footer);
         let body = crate::platform_prefix::wash_platform_injection(&body);
-        clip_chars(&body, ARCHIVE_CHARS)
+        // Keep the live-turn footer. Clip the head (summary+index) if needed.
+        let footer_len = footer.chars().count();
+        let max_head = ARCHIVE_CHARS.saturating_sub(footer_len);
+        let head_len = body.chars().count().saturating_sub(footer_len);
+        if head_len > max_head {
+            let head: String = body.chars().take(max_head).collect();
+            format!("{head}{footer}")
+        } else {
+            body
+        }
     }
 }
 
@@ -199,7 +228,15 @@ fn plan_mode(events: &[SessionEvent], mode: Mode) -> Option<CompactEvent> {
             }
             let drop_after = match closed_after.len() {
                 0 => 0,
-                1 => 1, // only shrink is to drop the sole tool round
+                1 => {
+                    // Overnight: keep the only live tool round if it wrote
+                    // files. Inspect-only rounds can still shrink.
+                    if group_has_mutation(events, closed_after[0]) {
+                        0
+                    } else {
+                        1
+                    }
+                }
                 n => n - 1,
             };
             if drop_after > 0 {
@@ -247,6 +284,9 @@ fn plan_mode(events: &[SessionEvent], mode: Mode) -> Option<CompactEvent> {
         keep_user_seq: user as u64,
         summary,
         index,
+        official_id: None,
+        official_model: None,
+        official_blob: None,
     })
 }
 
@@ -919,15 +959,39 @@ fn is_fs_mutation_state(line: &str) -> bool {
     let name = label.split_whitespace().next().unwrap_or("");
     matches!(
         crate::tools_schema::dispatch_name(name),
-        "write" | "edit" | "delete" | "editnotebook"
+        "write" | "edit" | "delete" | "editnotebook" | "todowrite"
     )
+}
+
+fn group_has_mutation(events: &[SessionEvent], group: &Group) -> bool {
+    events
+        .iter()
+        .take(group.end.saturating_add(1))
+        .skip(group.start)
+        .any(|e| match e {
+            SessionEvent::Tool(t) => {
+                matches!(
+                    crate::tools_schema::dispatch_name(&t.name),
+                    "write" | "edit" | "delete" | "editnotebook" | "todowrite"
+                )
+            }
+            SessionEvent::Assistant(a) => a.tool_calls.as_ref().is_some_and(|cs| {
+                cs.iter().any(|c| {
+                    matches!(
+                        crate::tools_schema::dispatch_name(&c.function.name),
+                        "write" | "edit" | "delete" | "editnotebook" | "todowrite"
+                    )
+                })
+            }),
+            _ => false,
+        })
 }
 
 fn is_fs_mutation_index(line: &str) -> bool {
     line.split_whitespace().any(|w| {
         matches!(
             crate::tools_schema::dispatch_name(w),
-            "write" | "edit" | "delete" | "editnotebook"
+            "write" | "edit" | "delete" | "editnotebook" | "todowrite"
         )
     })
 }
@@ -1254,6 +1318,9 @@ fn archive_compact_event(text: &str, seq: u64) -> Option<CompactEvent> {
         keep_user_seq: seq,
         summary: summary.trim().to_string(),
         index: index.to_string(),
+        official_id: None,
+        official_model: None,
+        official_blob: None,
     })
 }
 
@@ -1378,6 +1445,9 @@ mod tests {
             keep_user_seq: 1,
             summary: "## Active Task\ntask".into(),
             index: "seq 2  assistant  old".into(),
+            official_id: None,
+            official_model: None,
+            official_blob: None,
         };
         let live = apply_compact(&msgs, &plan);
         let sys = live[0].content.as_deref().unwrap_or("");
@@ -1741,6 +1811,9 @@ mod tests {
                 .map(|i| format!("seq {i}  tool bash {}", "W".repeat(40)))
                 .collect::<Vec<_>>()
                 .join("\n"),
+            official_id: None,
+            official_model: None,
+            official_blob: None,
         };
         let body = plan.archive_body();
         assert!(
@@ -1803,6 +1876,20 @@ mod tests {
             LIVE_TASK_POINTER,
             "mid-turn compact must not re-paste the live user into Active Task: {}",
             plan.summary
+        );
+    }
+
+    #[test]
+    fn intra_turn_keeps_sole_write_round() {
+        let events = vec![
+            start(),
+            SessionEvent::user("edit the file"),
+            SessionEvent::assistant("", "", Some(vec![write_call("w1", "main.rs")])),
+            SessionEvent::tool("w1", "Write", "wrote main.rs"),
+        ];
+        assert!(
+            plan_compact(&events).is_none(),
+            "sole Write round must stay live for overnight handoff"
         );
     }
 
@@ -2093,6 +2180,9 @@ mod tests {
             keep_user_seq: 1,
             summary: "## Active Task\ntask".into(),
             index: "seq 2  assistant  old".into(),
+            official_id: None,
+            official_model: None,
+            official_blob: None,
         };
         let live = apply_compact(&msgs, &plan);
         assert_eq!(live[0].role, "system");

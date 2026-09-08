@@ -54,6 +54,11 @@ impl Family {
         matches!(self, Self::Grok46)
     }
 
+    /// Product detector for harness policy. Aliases such as `g46-xhigh` count.
+    pub fn is_grok_product(model_id: &str) -> bool {
+        matches!(Self::detect(model_id), Some(Self::Grok46))
+    }
+
     /// Cursor / grok-proxy aliases → official xAI model ids.
     pub fn wire_model_id(model: &str) -> &str {
         match model.trim() {
@@ -340,6 +345,11 @@ mod tests {
         assert_eq!(Family::implied_effort("grok-4.6"), None);
         assert!(Family::Grok46.thinking_always_on());
         assert!(!Family::Grok46.preserve_thinking_kwarg());
+        assert!(Family::is_grok_product("g46-xhigh"));
+        assert!(Family::is_grok_product("xiaoxi-g46"));
+        assert!(Family::is_grok_product("grok-4.6"));
+        assert!(!Family::is_grok_product("Qwen3.8-27B"));
+        assert!(!Family::is_grok_product("totally-other"));
     }
 
     #[test]

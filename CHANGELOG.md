@@ -2,15 +2,20 @@
 
 未发版之前以 git log 为准。下面记用户能看见的行为变化。
 
+- 自改：`docs/dsh-playbook.md` + 仓库短 `AGENTS.md`。`./scripts/self-snap.sh` 打 tag；`hyper-self-snapshot.sh` / `hyper-self-rollback.sh` 备份家目录配置。`/undo` 只回会话。
+- 过夜：加载配置时把旧默认 500 步 / 1800 秒墙改成 0 并写回。HTTP 不再用整段请求 30 分钟墙，只对空闲读超时。思考截断最多续 3 跳，不立刻 Exhausted。心跳不认目录 mtime。子 agent general/office 不限步。AwaitShell 默认 120 秒。
+- 过夜 compact：官方 blob 按 blob+后缀计价；含 Write 的最后一轮工具不归档；本地卡片 12000 字；TodoWrite 进 Current State；官方 blob 落到会话旁 `*.official.json`，重启可接上。
+- 长任务默认不限跳数、不限墙钟（`max_steps` / `max_wall_seconds` = 0）。同参工具只提醒一次，不再 `budget:repeat` 静默停。硬窗口只 compact 不收轮。
+- 单一裁决：成功工具结果不改写、不跳过 Read/Grep。AwaitShell 超时为 Interrupted。官方 compact 只跟 soft 窗口。心跳先 pulse，工作区没变不调模型。混合跳先并行只读，串行段认 `/stop`。
 - 跟进轮不再只因为工具次数就压缩；Grok 路径不再把相近 Grep / Read / Search 劝退成空结果。`recall` 开场就挂、压缩也不卸。一批改完才跑一次诊断，成功也会回传。官方压缩先看全文，本地重写会清掉旧 blob。
 - Grok Responses 收得到收口/催 Write 备注（`[channel]`）；进度旁白不再当成用户气泡，空跳兜底会作为 assistant 落下。Chat Completions 的 `finish_reason=length` 与 Responses `incomplete`/`failed` 按截断/失败处理；长度截断计数在干净跳后清零。
 - 停止权收拢到单裁决器：撞思考帽保留残稿并失败截断工具，无 finish_reason 的断流当瞬时错误重试；无工具的进度旁白不当终稿。Thinking 保持开启（Cursor / grok CLI），不走 27B thinking-off。
 - 跟进轮对齐 Cursor / grok CLI：compact 优先留下 Write/StrReplace 过的文件，不再只留 Glob/Read 头尾；`[history]` 默认只带本场归档，邻座会话要用户问起才贴；控制台撞步数/时间墙也留一跳收口，方便下一轮接着写。
-- 巡检门对齐 Cursor / grok CLI：`tools[]` 中途不卸。连续只读只催原生 Write，再 Read/Grep/Glob 则跳过并回 `[already observed]`，Shell / TodoWrite 仍执行。泄露旁白（空 html 围栏、I'll write files）不当终稿；「已用 Write 工具写入」仍是终稿。步数墙才是硬停。
+- 巡检门对齐 Cursor / grok CLI：`tools[]` 中途不卸。连续只读不再跳过、不改写结果。泄露旁白（空 html 围栏、I'll write files）不当终稿，只催一次原生 Write；「已用 Write 工具写入」仍是终稿。步数墙才是硬停。
 - 空跳不再当成功结束：无正文、无工具、无 usage 先重试一次；仍空则收口一跳，再空则给「没有可见回复」兜底（控制台也会，不再交空白气泡）
 - Glob / Shell 只拦工作区根上的无过滤递归扫；`**/*` 给一份顶层样本（跳过 vendor / 嵌套 `release` / `out` / `unpacked`），不再空手训一通。带扩展名的会真扫，满 200 条截断；`target_directory` 指到文件时直接报错
 - Grep 默认不扫打包目录（显式 `path` 进该目录仍可搜）。重复 / 近义 pattern 会折；目录级风暴上限 12 次，与 Search 是否挂上无关；单文件 Grep 不占名额
-- 连续 3 跳低新意，或连续 10 跳只巡检（Read/Grep/Glob…，Write 会重置），催原生 Write；再 Read/Grep/Glob 则跳过并回 `[already observed]`，`tools[]` 不卸，Shell 仍跑
+- 连续只读不再跳过、不改写结果。泄露的 Write 旁白只催一次原生工具，不禁止继续 Read。步数墙才是硬停
 - 思考撞上限：软提醒后按原推理模式给一次更宽重试，不关 thinking。空正文先收口一跳（工具仍在），再空则「没有可见回复」
 - ReadLints：超时 / 没跑 checker 不再报「没有编译错误」；超时也不再标成工具 Error，会说明「不是编译结论」。tsc 从文件向上找最近的 tsconfig.json（例如 `web/console`）
 - `view` 未挂进 tools[] 时幻觉调用返回 unknown；Read 图片/音视频会直接加载，不再指向未挂载的 view

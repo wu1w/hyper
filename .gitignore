@@ -37,3 +37,5 @@ mcp.toml
 **/node_modules/
 # Local dsh comparison install (credentials live here)
 eval/dsh_home/
+
+.cursor/

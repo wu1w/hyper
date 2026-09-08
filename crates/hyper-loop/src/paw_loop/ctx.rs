@@ -32,14 +32,19 @@ pub struct ToolFingerprint {
     pub name: String,
     pub args_hash: String,
     pub path: Option<String>,
+    /// Same-argv poll (status/diff/log/tail/AwaitShell). Doom must not halt these.
+    pub poll: bool,
 }
 
 impl ToolFingerprint {
     pub fn new(name: impl Into<String>, args: &str) -> Self {
+        let name = name.into();
+        let poll = looks_like_poll(&name, args);
         Self {
-            name: name.into(),
+            name,
             args_hash: hash_args(args),
             path: None,
+            poll,
         }
     }
 
@@ -47,6 +52,40 @@ impl ToolFingerprint {
         self.path = path.filter(|s| !s.is_empty());
         self
     }
+}
+
+pub fn looks_like_poll(name: &str, args: &str) -> bool {
+    let dispatch = crate::tools_schema::dispatch_name(name);
+    if dispatch == "awaitshell" {
+        return true;
+    }
+    if dispatch != "bash" {
+        return false;
+    }
+    let cmd = poll_command(args);
+    let mut tokens = cmd.split_whitespace();
+    let Some(bin) = tokens.next() else {
+        return false;
+    };
+    let bin = bin.rsplit('/').next().unwrap_or(bin);
+    match bin {
+        "tail" | "watch" | "journalctl" => true,
+        "git" => tokens
+            .next()
+            .is_some_and(|s| matches!(s, "status" | "diff" | "log" | "show")),
+        _ => false,
+    }
+}
+
+fn poll_command(args: &str) -> String {
+    serde_json::from_str::<serde_json::Value>(args)
+        .ok()
+        .and_then(|v| {
+            v.get("command")
+                .and_then(|c| c.as_str())
+                .map(|s| s.to_ascii_lowercase())
+        })
+        .unwrap_or_else(|| args.to_ascii_lowercase())
 }
 
 /// SHA-256 of the full argument bytes, truncated to 16 hex chars.
@@ -68,5 +107,17 @@ mod tests {
         let b = format!("{}b", "x".repeat(2048));
         assert_ne!(hash_args(&a), hash_args(&b));
         assert_eq!(hash_args("same"), hash_args("same"));
+    }
+
+    #[test]
+    fn poll_is_token_not_substring() {
+        assert!(looks_like_poll("bash", r#"{"command":"git status"}"#));
+        assert!(looks_like_poll("Shell", r#"{"command":"git diff --stat"}"#));
+        assert!(looks_like_poll("AwaitShell", r#"{"task_id":"s1"}"#));
+        assert!(!looks_like_poll("bash", r#"{"command":"echo changelog"}"#));
+        assert!(!looks_like_poll("bash", r#"{"command":"ls"}"#));
+        assert!(!looks_like_poll("bash", r#"{"command":"cargo test"}"#));
+        assert!(!looks_like_poll("bash", r#"{"command":"sleep 1"}"#));
+        assert!(!looks_like_poll("Read", r#"{"path":"a.rs"}"#));
     }
 }

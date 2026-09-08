@@ -254,6 +254,138 @@ fn slug(name: &str) -> String {
     }
 }
 
+/// Cheap workspace sensor for host heartbeat. No model call.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct WorkspacePulse {
+    pub fingerprint: String,
+    pub dirty: bool,
+    /// HEARTBEAT.md exists — treat like a user-written /loop prompt.
+    pub scripted: bool,
+    pub summary: String,
+}
+
+fn git_out(root: &Path, args: &[&str]) -> String {
+    use std::io::Read;
+    let mut child = match std::process::Command::new("git")
+        .args(args)
+        .current_dir(root)
+        .env("GIT_OPTIONAL_LOCKS", "0")
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+    {
+        Ok(c) => c,
+        Err(_) => return String::new(),
+    };
+    let mut stdout = match child.stdout.take() {
+        Some(s) => s,
+        None => {
+            let _ = child.kill();
+            return String::new();
+        }
+    };
+    let reader = std::thread::spawn(move || {
+        let mut buf = Vec::new();
+        let _ = stdout.read_to_end(&mut buf);
+        buf
+    });
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+    loop {
+        match child.try_wait() {
+            Ok(Some(_)) => break,
+            Ok(None) if std::time::Instant::now() >= deadline => {
+                let _ = child.kill();
+                let _ = child.wait();
+                break;
+            }
+            Ok(None) => std::thread::sleep(std::time::Duration::from_millis(20)),
+            Err(_) => break,
+        }
+    }
+    let buf = reader.join().unwrap_or_default();
+    String::from_utf8_lossy(&buf).trim().to_string()
+}
+
+fn tree_stamp(root: &Path) -> String {
+    let rd = match fs::read_dir(root) {
+        Ok(rd) => rd,
+        Err(_) => return String::new(),
+    };
+    let mut entries: Vec<String> = Vec::new();
+    for e in rd.flatten().take(64) {
+        let name = e.file_name().to_string_lossy().into_owned();
+        if name.starts_with('.') {
+            continue;
+        }
+        if let Some(secs) = path_mtime_secs(&e.path()) {
+            entries.push(format!("{name}:{secs}"));
+        }
+    }
+    entries.sort();
+    entries.join("\n")
+}
+
+fn path_mtime_secs(p: &Path) -> Option<u64> {
+    let m = fs::metadata(p).ok()?;
+    m.modified()
+        .ok()?
+        .duration_since(std::time::UNIX_EPOCH)
+        .ok()
+        .map(|d| d.as_secs())
+}
+
+pub fn workspace_pulse(root: &Path) -> WorkspacePulse {
+    let porcelain = git_out(root, &["status", "--porcelain", "-b"]);
+    let head = git_out(root, &["rev-parse", "HEAD"]);
+    let mut watch = String::new();
+    for rel in [
+        "HEARTBEAT.md",
+        ".grok-hyper/HEARTBEAT.md",
+        "AGENT.md",
+        "USER.md",
+        ".grok-hyper/inbox",
+    ] {
+        if let Some(secs) = path_mtime_secs(&root.join(rel)) {
+            watch.push_str(&format!("{rel}:{secs}\n"));
+        }
+    }
+    let git = !head.is_empty();
+    let stamp = if git {
+        String::new()
+    } else {
+        tree_stamp(root)
+    };
+    let raw = format!("{porcelain}\n{head}\n{watch}\n{stamp}");
+    let fingerprint = crate::vendor::sha256_hex(raw.as_bytes());
+    let git_dirty = porcelain
+        .lines()
+        .any(|l| !l.starts_with("##") && !l.trim().is_empty());
+    let has_heartbeat_file = ["HEARTBEAT.md", ".grok-hyper/HEARTBEAT.md"]
+        .iter()
+        .any(|rel| {
+            fs::read_to_string(root.join(rel))
+                .map(|s| !s.trim().is_empty())
+                .unwrap_or(false)
+        });
+    let dirty = git_dirty;
+    let summary = if dirty {
+        let lines: Vec<_> = porcelain
+            .lines()
+            .filter(|l| !l.starts_with("##"))
+            .take(20)
+            .collect();
+        format!("workspace changed:\n{}", lines.join("\n"))
+    } else {
+        "workspace unchanged".into()
+    };
+    WorkspacePulse {
+        fingerprint,
+        dirty,
+        scripted: has_heartbeat_file,
+        summary,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -275,6 +407,29 @@ mod tests {
         assert_eq!(parse_interval("30m"), Some(1800));
         assert_eq!(parse_interval("1h"), Some(3600));
         assert_eq!(parse_interval("1d"), Some(86400));
+    }
+
+    #[test]
+    fn workspace_pulse_nongit_tracks_file_mtime() {
+        let dir = std::env::temp_dir().join(format!(
+            "hyper-pulse-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("a.txt"), "one").unwrap();
+        let a = workspace_pulse(&dir);
+        std::thread::sleep(std::time::Duration::from_millis(1100));
+        std::fs::write(dir.join("a.txt"), "two").unwrap();
+        let b = workspace_pulse(&dir);
+        assert_ne!(a.fingerprint, b.fingerprint, "non-git edit must change pulse");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn interval_zero_is_none() {
         assert_eq!(parse_interval("0"), None);
     }
 
@@ -300,5 +455,49 @@ mod tests {
         assert!(wants_cron_card("帮我写个 cron"));
         assert!(wants_cron_card("加一个定时任务"));
         assert!(!wants_cron_card("修一下编译错误"));
+    }
+
+    #[test]
+    fn pulse_ignores_session_sidecar_mtime() {
+        let dir = std::env::temp_dir().join(format!(
+            "hyper-pulse-sess-{}",
+            crate::session::new_session_id()
+        ));
+        fs::create_dir_all(dir.join(".grok-hyper/sessions")).unwrap();
+        let a = workspace_pulse(&dir);
+        std::thread::sleep(std::time::Duration::from_millis(1100));
+        fs::write(dir.join(".grok-hyper/sessions/s1.jsonl"), "x\n").unwrap();
+        let b = workspace_pulse(&dir);
+        assert_eq!(
+            a.fingerprint, b.fingerprint,
+            "session jsonl must not retrigger heartbeat"
+        );
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn pulse_non_git_is_stable_until_watch_file_changes() {
+        let dir = std::env::temp_dir().join(format!(
+            "hyper-pulse-{}",
+            crate::session::new_session_id()
+        ));
+        fs::create_dir_all(&dir).unwrap();
+        let a = workspace_pulse(&dir);
+        let b = workspace_pulse(&dir);
+        assert_eq!(a.fingerprint, b.fingerprint);
+        assert!(!a.dirty);
+        assert!(!a.scripted);
+        fs::write(dir.join("HEARTBEAT.md"), "check inbox\n").unwrap();
+        let c = workspace_pulse(&dir);
+        assert_ne!(a.fingerprint, c.fingerprint);
+        assert!(c.scripted);
+        fs::create_dir_all(dir.join(".grok-hyper")).unwrap();
+        fs::write(dir.join(".grok-hyper/scratch"), "agent log\n").unwrap();
+        let d = workspace_pulse(&dir);
+        assert_eq!(
+            c.fingerprint, d.fingerprint,
+            "session dir mtime must not wake the heartbeat"
+        );
+        let _ = fs::remove_dir_all(dir);
     }
 }

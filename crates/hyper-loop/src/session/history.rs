@@ -607,6 +607,9 @@ mod tests {
             keep_user_seq: 0,
             summary: "unrelated recent summary".into(),
             index: String::new(),
+            official_id: None,
+            official_model: None,
+            official_blob: None,
         }));
         let text = card(
             &dir,
@@ -764,6 +767,9 @@ mod tests {
                 keep_user_seq: 4,
                 summary: "x".into(),
                 index: String::new(),
+                official_id: None,
+                official_model: None,
+                official_blob: None,
             }),
             SessionEvent::user("继续开发"),
         ];
@@ -806,6 +812,9 @@ mod tests {
                 keep_user_seq: 7,
                 summary: "x".into(),
                 index: String::new(),
+                official_id: None,
+                official_model: None,
+                official_blob: None,
             }),
             SessionEvent::user("你复查一下，看修没修好"),
         ];

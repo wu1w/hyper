@@ -205,6 +205,45 @@ impl SessionLog {
         }
         Ok(())
     }
+
+    fn official_path(&self) -> PathBuf {
+        self.dir.join(format!("{}.official.json", self.id))
+    }
+
+    pub fn save_official(
+        &self,
+        item: &crate::session::OfficialCompaction,
+        skip: usize,
+    ) -> Result<()> {
+        let path = self.official_path();
+        let body = serde_json::to_vec(&item.persist_skip(skip)).map_err(Error::msg)?;
+        let mut opts = OpenOptions::new();
+        opts.create(true).write(true).truncate(true);
+        #[cfg(unix)]
+        opts.mode(0o600);
+        let mut f = opts.open(&path)?;
+        #[cfg(unix)]
+        {
+            let _ = f.lock_exclusive();
+        }
+        f.write_all(&body)?;
+        f.write_all(b"\n")?;
+        Ok(())
+    }
+
+    pub fn load_official(&self) -> Option<(crate::session::OfficialCompaction, usize)> {
+        let raw = fs::read_to_string(self.official_path()).ok()?;
+        let p: crate::session::OfficialPersist = serde_json::from_str(&raw).ok()?;
+        if p.encrypted_content.is_empty() {
+            return None;
+        }
+        let skip = p.skip;
+        Some((crate::session::OfficialCompaction::from_persist(p), skip))
+    }
+
+    pub fn clear_official(&self) {
+        let _ = fs::remove_file(self.official_path());
+    }
 }
 
 fn jsonl_path(dir: &Path, id: &str) -> PathBuf {

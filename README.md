@@ -115,3 +115,9 @@ cd web/console && npm install && npm run build
 ## 可选：dsh 插件
 
 已经在用 dsh 的人可以 `hyper dsh-install`，把同一套 loop 挂到 dsh 里。**产品壳仍是 `hyper web`**，不是 dsh。说明见 [`plugins/dsh-plugin-hyper/README.md`](plugins/dsh-plugin-hyper/README.md)。
+
+## 用 Hyper 改 Hyper（dsh 玩法）
+
+把本仓库当工作区打开，模型可以直接读配置和源码、改 harness，再用 snapshot 回滚。玩法见 [`docs/dsh-playbook.md`](docs/dsh-playbook.md)。保险：`scripts/hyper-self-snapshot.sh` / `scripts/hyper-self-rollback.sh`，会话用 `/undo`。
+
+把本仓库当工作区时，模型按 [`docs/dsh-playbook.md`](docs/dsh-playbook.md) 读自己的配置和零件、改自己；改前 `./scripts/self-snap.sh`。

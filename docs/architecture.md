@@ -14,6 +14,13 @@
 
 优化对象是 **grok-4.6 的 Cursor 训练分布**（工具名、并行、AskQuestion、TodoWrite、Task），不是再给 27B 瘦身。
 
+## 单一裁决
+
+循环只有三件事：模型要工具就跑真结果；模型收口就交给用户；上下文太大就 compact 再继续。默认没有步数墙和墙钟（0 = 不限），跟 Cursor / grok CLI 本地长任务一样。硬停只剩用户 `/stop`。硬窗口只 compact，不结束这一轮。
+
+进度统计、压缩、心跳都不是第二套停止权。成功工具结果不会被改写成 `[already observed]`，Read/Grep 不会被跳过。同参工具只提醒一次，不静默停。心跳先看工作区 pulse，没变化不调模型。心跳 pulse 在锁外计算；`start_turn` 先占 live 槽再跑模型。
+
+
 ## 仓库结构
 
 ```
@@ -94,10 +101,10 @@ Cron / 心跳 / 频道入站也是 **主机定时器或适配器** 去调 `turn.
 1. 用户消息（可带图片等 `content_parts`）进入 mailbox。默认 **steer**：运行中发来的普通消息会在当前工具结束、下一个工具尚未启动的安全边界注入；同批尚未启动的串行工具会收到成对的 `skipped` 结果。`/queue` 明确排到当前轮之后，`/stop` 立即 cancel，`/busy steer|queue|interrupt` 可随时切换。AskQuestion 或审批挂起时，下一条发起者回复优先作为控件答案，不会进入 steer；飞书交互卡片和 Telegram inline keyboard 的点击与 `1/2/3`、选项 ID、`/skip`、自由文本一样进 `interaction::answer`。IM 审批默认 **ask**（与控制台/TUI 相同）；`/approvals yolo` 才跳过。`/plan`、`/clarify`、`/approvals` 以及「始终允许」写入 `~/.grok-hyper/sessions/<id>.controls.json`，`hyper web` 重启后仍在。每轮写入带稳定 `run_id / turn_id / step_id / tool_call_id` 的生命周期事件，Web 与 IM 都消费这套状态，而不是从文本猜「思考/工具/重试」。IM 立刻 ACK（「收到，正在处理…」），把思考 delta / 工具状态聚成少量聊天；正文 content delta 以「回复中」草稿预览（可编辑渠道 12s 节奏原地刷新，QQ / 微信 / 钉钉随攒批消息，终稿前不重复倾倒）；终稿超长时按平台上限分泡（自然边界切割，fence 跨泡闭合重开），不再截断；整段 `NO_REPLY` / `SILENT` 视为有意沉默，不外发；群消息注入 `[发言者]` 前缀；入站防抖按渠道 0.3–3s（微信最宽，飞书带媒体 0.8s）。Telegram / QQ C2C / 微信 iLink 发 typing；飞书给入站消息贴 `Typing` 反应，结束时摘掉；企业微信 ACK/思考走 `msgtype: stream` 同一气泡，终稿 `finish=true`。终稿先写 durable outbox，平台确认后转 receipt；重启会重放未确认消息，带入站消息 ID 的平台使用稳定幂等键。循环仍是满血编码 agent（xhigh、稳定 Cursor-shaped 工具面、500 步、30 分钟）。
 2. `SidecarSession` 组 messages：角色边界（只读 `~/.grok-hyper/AGENT.md`，工作区 USER.md/SOUL.md 不能改人设）+ 可选工作区 `AGENTS.md`（项目约定）+ 冻结 tools + 历史。
 3. HTTP 补全；思考 / 正文分通道流式推到 WS。
-4. 工具调用按审批模式停或放行；结果写回 messages，直到模型停或打到 `max_steps`。
+4. 工具调用按审批模式停或放行；结果写回 messages，直到模型自己收口。`max_steps = 0` 时没有跳数墙。
 5. 事件追加到会话 JSONL；`stop` 结束本轮。WS 广播环只推增量；客户端 `Lagged` 时 **这条 socket** 收到 `resync`（state / permit / clarify / 当前会话 `console_events`，与 hello 相同、已去掉 inline `data:`），立刻重绘，不必等 80ms 的 `GET /history`。不要把整份 JSONL 丢回广播总线（Windows 上会卡死）。
 
-默认 `auto` 对 grok-4.6 映射为 **xhigh**（思考关不掉）；Qwen 仍是官方中性 `medium`。`/think`、`--think`、`/fast` 仍可人工覆盖。grok 走 Responses：不回放思考、不回放 tool-hop 助手正文、不把 QwenPaw 的 `[trajectory]` / `[style]` / `[out]` / `[locate]` / `[oracle]` / `[guard]` 注记当用户消息。同参工具第 6 次安静停止（`budget:repeat`）。控制台和 TUI 不把 tool-hop 旁白画成答案气泡。Qwen 本地权重仍走软干预：同参 6 次提醒一次，dump 延后工具并观察一次。
+默认 `auto` 对 grok-4.6 映射为 **xhigh**（思考关不掉）；Qwen 仍是官方中性 `medium`。`/think`、`--think`、`/fast` 仍可人工覆盖。grok 走 Responses：不回放思考、不回放 tool-hop 助手正文、不把 QwenPaw 的 `[trajectory]` / `[style]` / `[out]` / `[locate]` / `[oracle]` / `[guard]` 注记当用户消息。同参工具第 6 次只提醒、不停止。控制台和 TUI 不把 tool-hop 旁白画成答案气泡。Qwen 本地权重仍走软干预：同参 6 次提醒一次，dump 延后工具并观察一次。
 
 轨迹控制：测试转红、修改测试期望和编辑摇摆只作为隐藏事实反馈，不替模型决定停止或回退。思考触及上限时保留模型选择的思考模式；grok 不再追加“collapse to one conclusion”讲义。只有再次触顶、时间、步数或上下文硬上限才终止。控制台/TUI 默认 **500 步**、30 分钟硬墙钟（与 IM / Hermes `max_turns` 对齐）。IM 默认 500 步、**30 分钟墙钟**（`max_wall_unattended_seconds = 1800`）；Shell 未带 `block_until_ms` 时由 coordinator（默认 `code_mode.timeout_s = 60`）offload/取消，bash 内层不再套 120 秒硬杀。出站空正文不发占位句；连接失败会重试，读超时不重试以免 QQ 重复消息。微信 iLink 长轮询独占 cursor，不能和 Hermes weixin 共用同一个 bot。子代理 `Task` 的 registry 写 `{id}.task.json`：进程重启后 `resume` / AwaitShell 能找到孩子；当时还在跑的记成 `interrupted: process restarted`，不自动重跑。
 
@@ -139,6 +146,8 @@ Web 启动时：若 CLI 没传 `--workspace`，用配置里的路径；路径不
 `hyper-loop::channel` 把 QQ / 飞书 / Telegram / 微信 / 企微 / 钉钉 / webhook 收成同一套 mailbox（目录里只有这些 `in_process` 入口）。凭证在配置里，控制台 **频道** 页编辑。适配器任务退出、panic 或 poll lock 冲突后会指数退避再拉起，pill 显示「重试中」而不是「连接错误」。`hyper web` 与 `hyper --channels` 对同一 bot 互斥（poll lock）。无头进程级保活见 `contrib/systemd/hyper-web.service`（请用 **user unit**，不要以 root 原样 enable）。桌面 Electron 在 `hyper web` 退出后会退避再拉起。IM 进度走 `EventSink` 聚合，不改 `drive()` / 工具 JSON / xhigh。终稿先写 durable outbox；坏掉的 pending JSON 进 `quarantine/`，不再永远 skip。
 
 Web 与 CLI 共用一个 `SessionRouter` + `ChannelManager`：同一会话不会被两个平台同时 resume 成两套 agent。群聊 route 默认 per-user（可带 forum topic / 飞书 thread）；`/approvals` `/plan` `/stop` 等控制项只认会话 owner。AskQuestion / Permit 按 prompt id 排队（FIFO、15 分钟 TTL、过期点击有回复）；选完后飞书 / Telegram 卡片保留原问题并标出选择者。IM 控制面含 `/model` `/compact` `/undo` `/usage` `/background`；`/new <title>` 会写入 session meta。QQ / 钉钉 / 企微 / webhook 审批走原生按钮（微信 iLink 仍回复序号）。
+
+源码当工作区时的自改玩法见 [`dsh-playbook.md`](dsh-playbook.md)。`AGENTS.md` 只留短地图（默认 `agents_md_max_tokens=400`，长文会被整份丢掉）。
 
 `hyper --sidecar` 是 newline JSON-RPC（stdio）。dsh 插件和 VS Code 扩展只翻译 UI 事件，**禁止**再开一套工具循环。见 `plugins/dsh-plugin-hyper/README.md`、`plugins/vscode-hyper/README.md`。这不是 Cursor.app 那种 VS Code fork：agent 可以住在编辑器侧栏里，工具循环仍是同一份 `hyper --sidecar`。安装：`hyper vscode-install`。
 

@@ -240,7 +240,7 @@ impl Completer for HttpCompleter {
     }
 
     fn recasts_xai_product(&self) -> bool {
-        grok_like_url(&self.url) || self.model.to_ascii_lowercase().contains("grok")
+        grok_like_url(&self.url) || Family::is_grok_product(&self.model)
     }
 
     fn media_caps(&self) -> crate::media::MediaCaps {

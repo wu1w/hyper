@@ -24,22 +24,27 @@ impl<C: Completer> Agent<C> {
             return None;
         }
         if self.over_soft_window() || self.mid_turn_computer_use() {
-            // Compact the actual transcript, before a lossy local archive.
+            self.signal_preparing();
             let n = self.prefix_tokens_gate() as u64;
             if self.try_official_compact(n).await {
                 return None;
             }
+            let mut local = false;
             for _ in 0..2 {
-                if !self.apply_compact_pass() {
+                if !self.apply_compact_pass(false) {
                     break;
                 }
+                local = true;
                 if !self.over_soft_window() && !self.mid_turn_computer_use() {
                     break;
                 }
             }
+            if local && self.official_compaction.is_none() {
+                if let Some(log) = &self.log {
+                    log.clear_official();
+                }
+            }
         }
-        let n = self.prefix_tokens_gate() as u64;
-        let _ = self.try_official_compact(n).await;
         if !self.over_soft_window() {
             return None;
         }
@@ -47,6 +52,8 @@ impl<C: Completer> Agent<C> {
         // hard return would tombstone the live reply (`finish(last_spoken,
         // None)` with empty text). Keep going — step/wall gates still bound
         // the loop.
+        // Cursor / grok CLI: compact and keep the turn alive. A hard-window
+        // tombstone is how overnight jobs died at the first archive miss.
         if self.physics_nudged {
             return None;
         }
@@ -58,10 +65,11 @@ impl<C: Completer> Agent<C> {
         if !over_hard_threshold(n, self.generation_reserve, self.working_window) {
             return None;
         }
-        Some(format!(
-            "budget:context ({n} prefix + {} reserve > {} window)",
+        self.note(&format!(
+            "[compact] still over window ({n} prefix + {} reserve > {} window); continuing",
             self.generation_reserve, self.working_window
-        ))
+        ));
+        None
     }
 
     /// Archive previous turns at the start of a follow-up user message so a
@@ -92,11 +100,14 @@ impl<C: Completer> Agent<C> {
         if self.try_official_compact(n).await {
             return;
         }
-        if !self.apply_compact_pass() {
+        if !self.apply_compact_pass(false) {
             return;
         }
-        let n = self.prefix_tokens_gate() as u64;
-        let _ = self.try_official_compact(n).await;
+        if self.official_compaction.is_none() {
+            if let Some(log) = &self.log {
+                log.clear_official();
+            }
+        }
     }
 
     fn signal_preparing(&self) {
@@ -120,6 +131,18 @@ impl<C: Completer> Agent<C> {
             .prefix_meter()
             .map(|(f, _)| meter_keeps_reasoning(f))
             .unwrap_or(false);
+        if let Some(blob) = &self.official_compaction {
+            let suffix: Vec<_> = self
+                .messages
+                .iter()
+                .filter(|m| m.role != "system")
+                .skip(self.official_compaction_skip)
+                .cloned()
+                .collect();
+            return blob
+                .estimate_tokens()
+                .saturating_add(estimate_prefix_tokens(&suffix, &self.tools, keep_reasoning));
+        }
         estimate_prefix_tokens(&self.messages, &self.tools, keep_reasoning)
     }
 
@@ -157,25 +180,48 @@ impl<C: Completer> Agent<C> {
                     item.id,
                     item.debug_blob()
                 ));
-                // Rewriting local history invalidates any older blob/offset.
-                // Install the new snapshot only after that rewrite finishes.
-                let _ = self.apply_compact_pass();
+                // Pin the blob before the local rewrite so a crash mid-archive
+                // still resumes on Responses (skip=all is safe: blob covers input).
+                if let Some(log) = &self.log {
+                    let skip_all = self.messages.iter().filter(|m| m.role != "system").count();
+                    let _ = log.save_official(&item, skip_all);
+                }
+                // Local rewrite first. Then pin the new blob. Skip only the
+                // archive card so the live user + open tool group stay on
+                // the Responses wire (Cursor / grok CLI suffix).
+                let local = self.apply_compact_pass(true);
                 self.official_compaction = Some(item);
                 self.completer
                     .set_official_compaction(self.official_compaction.clone());
-                self.official_compaction_skip =
-                    self.messages.iter().filter(|m| m.role != "system").count();
+                self.official_compaction_skip = if local {
+                    1
+                } else {
+                    self.messages.iter().filter(|m| m.role != "system").count()
+                };
                 self.completer
                     .set_compaction_skip(self.official_compaction_skip);
+                if let Some(log) = &self.log {
+                    let _ = log.save_official(
+                        self.official_compaction.as_ref().unwrap(),
+                        self.official_compaction_skip,
+                    );
+                    if let Some(prev) = log.events().iter().rev().find_map(|e| match e {
+                        crate::session::SessionEvent::Compact(c) => Some(c.clone()),
+                        _ => None,
+                    }) {
+                        if let Some(item) = &self.official_compaction {
+                            self.log_event(crate::session::SessionEvent::compact(
+                                prev.with_official(item),
+                            ));
+                        }
+                    }
+                }
                 true
             }
             Err(_) => {
-                if prompt_tokens > crate::session::PRICE_CLIFF_TOKENS {
-                    self.note("[compact] official failed; local archive");
-                    self.apply_compact_pass()
-                } else {
-                    false
-                }
+                // Soft-window local archive is the caller's job.
+                // Do not compact just because we crossed a billing cliff.
+                false
             }
         }
     }
@@ -195,8 +241,8 @@ impl<C: Completer> Agent<C> {
         }
     }
 
-    pub(crate) fn apply_compact_pass(&mut self) -> bool {
-        if !self.try_compact() {
+    pub(crate) fn apply_compact_pass(&mut self, keep_official: bool) -> bool {
+        if !self.try_compact(keep_official) {
             return false;
         }
         self.after_compact();
@@ -260,7 +306,7 @@ impl<C: Completer> Agent<C> {
             .flatten()
     }
 
-    pub(crate) fn try_compact(&mut self) -> bool {
+    pub(crate) fn try_compact(&mut self, keep_official: bool) -> bool {
         let compacted = if self.log.is_some() {
             let plan = self.log.as_ref().and_then(|log| plan_compact(log.events()));
             let Some(plan) = plan else {
@@ -281,12 +327,15 @@ impl<C: Completer> Agent<C> {
             false
         };
         if compacted {
-            // A previous official blob does not contain the newly archived
-            // turns. Never keep it with an offset into a different transcript.
-            self.official_compaction = None;
-            self.official_compaction_skip = 0;
-            self.completer.set_official_compaction(None);
-            self.completer.set_compaction_skip(0);
+            if !keep_official {
+                self.official_compaction = None;
+                self.official_compaction_skip = 0;
+                self.completer.set_official_compaction(None);
+                self.completer.set_compaction_skip(0);
+                if let Some(log) = &self.log {
+                    log.clear_official();
+                }
+            }
             self.refresh_workset_cards();
             let user = self.last_real_user().to_string();
             self.refresh_history_cards(&user);
@@ -296,9 +345,6 @@ impl<C: Completer> Agent<C> {
 
     pub(crate) fn after_compact(&mut self) {
         self.handler.reset_repeat(&self.session_id);
-        self.observed_paths.clear();
-        self.read_paths.clear();
-        crate::lock_unpoison(&self.read_full).clear();
     }
 }
 

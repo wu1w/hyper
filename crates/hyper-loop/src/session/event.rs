@@ -397,6 +397,13 @@ pub struct CompactEvent {
     pub keep_user_seq: u64,
     pub summary: String,
     pub index: String,
+    /// xAI Responses compact id. Resume reuses the blob instead of the lossy card.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub official_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub official_model: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub official_blob: Option<String>,
 }
 
 /// Parent-stream card for a spawned Task. Child transcript lives on the child jsonl.

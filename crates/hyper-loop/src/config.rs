@@ -137,7 +137,7 @@ impl Default for ServerConfig {
             profile: EngineProfile::Auto,
             family: Family::Grok46,
             connect_timeout_s: 30,
-            read_timeout_s: 1800,
+            read_timeout_s: 0,
         }
     }
 }
@@ -191,15 +191,14 @@ pub struct PolicyConfig {
     pub max_think_tokens_low: u32,
     pub max_think_tokens_medium: u32,
     pub max_think_tokens_xhigh: u32,
-    /// TUI / web console. Same 500 as IM (`max_steps_unattended`) so long
-    /// coding tasks close; wall clock still `max_wall_seconds`.
+    /// TUI / web console hop cap. 0 = no cap (Cursor / grok CLI local agents).
     pub max_steps: u32,
     pub max_steps_think: u32,
+    /// Interactive wall from turn start. 0 = no cap.
     pub max_wall_seconds: u64,
-    /// IM / `--channels` step budget. 0 = same as `max_steps`. Hermes `max_turns` is 500.
+    /// IM / `--channels` step budget. 0 = no cap.
     pub max_steps_unattended: u32,
-    /// IM wall from turn start. 0 = no cap. Same 30 min as the console so
-    /// xhigh coding is not cut at 10 min; coordinator still bounds Shell.
+    /// IM wall from turn start. 0 = no cap. Coordinator still bounds Shell.
     pub max_wall_unattended_seconds: u64,
     /// User switch: tighter doom/parse/repeat guards. Off = Q8 / high-precision defaults.
     pub low_precision: bool,
@@ -214,11 +213,11 @@ impl Default for PolicyConfig {
             max_think_tokens_low: 512,
             max_think_tokens_medium: 2048,
             max_think_tokens_xhigh: 4096,
-            max_steps: 500,
+            max_steps: 0,
             max_steps_think: 100,
-            max_wall_seconds: 1800,
-            max_steps_unattended: 500,
-            max_wall_unattended_seconds: 1800,
+            max_wall_seconds: 0,
+            max_steps_unattended: 0,
+            max_wall_unattended_seconds: 0,
             low_precision: false,
         }
     }
@@ -553,7 +552,38 @@ impl Config {
 
     pub fn load_from(path: &Path) -> Result<Self> {
         let raw = fs::read_to_string(path)?;
-        Ok(toml::from_str(&raw)?)
+        let mut cfg: Self = toml::from_str(&raw)?;
+        let _ = cfg.migrate_overnight_defaults();
+        Ok(cfg)
+    }
+
+    /// Old shipped walls (500 steps / 30 min) casually stopped overnight jobs.
+    /// Rewrite those exact legacy defaults to unlimited. Custom values stay.
+    pub fn migrate_overnight_defaults(&mut self) -> bool {
+        const LEGACY_STEPS: u32 = 500;
+        const LEGACY_WALL: u64 = 1800;
+        let mut changed = false;
+        if self.policy.max_steps == LEGACY_STEPS {
+            self.policy.max_steps = 0;
+            changed = true;
+        }
+        if self.policy.max_steps_unattended == LEGACY_STEPS {
+            self.policy.max_steps_unattended = 0;
+            changed = true;
+        }
+        if self.policy.max_wall_seconds == LEGACY_WALL {
+            self.policy.max_wall_seconds = 0;
+            changed = true;
+        }
+        if self.policy.max_wall_unattended_seconds == LEGACY_WALL {
+            self.policy.max_wall_unattended_seconds = 0;
+            changed = true;
+        }
+        if self.server.read_timeout_s == LEGACY_WALL {
+            self.server.read_timeout_s = 0;
+            changed = true;
+        }
+        changed
     }
 
     /// Read `~/.grok-hyper/config.toml` if it exists. Never creates directories
@@ -577,7 +607,12 @@ impl Config {
             cfg.save_to(&path)?;
             cfg
         } else {
-            Self::load_from(&path)?
+            let raw = fs::read_to_string(&path)?;
+            let mut cfg: Self = toml::from_str(&raw)?;
+            if cfg.migrate_overnight_defaults() {
+                let _ = cfg.save_to(&path);
+            }
+            cfg
         };
         let agent_md = dir.join(crate::prompt::AGENT_MD_NAME);
         if !agent_md.exists() {
@@ -754,18 +789,42 @@ mod tests {
             crate::policy::Effort::Xhigh
         );
         assert!(c.server.base_url.is_empty());
-        assert_eq!(c.policy.max_steps, 500);
+        assert_eq!(c.policy.max_steps, 0);
         assert!(!c.policy.low_precision);
-        assert_eq!(c.policy.max_wall_seconds, 1800);
-        assert_eq!(c.policy.max_steps_unattended, 500);
-        assert_eq!(c.policy.max_wall_unattended_seconds, 1800);
-        assert_eq!(c.server.read_timeout_s, 1800);
+        assert_eq!(c.policy.max_wall_seconds, 0);
+        assert_eq!(c.policy.max_steps_unattended, 0);
+        assert_eq!(c.policy.max_wall_unattended_seconds, 0);
+        assert_eq!(c.server.read_timeout_s, 0);
         assert_eq!(c.tools.read_default_lines, 600);
         assert_eq!(c.tools.result_max_chars, 10_000);
         assert_eq!(c.tools.result_head_chars, 8_000);
         assert_eq!(c.tools.result_tail_chars, 2_000);
         assert_eq!(c.context.agents_md_max_tokens, 400);
         assert!(c.features.workspace_write_only);
+    }
+
+    
+    #[test]
+    fn migrate_overnight_walls_only_legacy_values() {
+        let mut c = Config::default();
+        c.policy.max_steps = 500;
+        c.policy.max_wall_seconds = 1800;
+        c.policy.max_steps_unattended = 500;
+        c.policy.max_wall_unattended_seconds = 1800;
+        c.server.read_timeout_s = 1800;
+        assert!(c.migrate_overnight_defaults());
+        assert_eq!(c.policy.max_steps, 0);
+        assert_eq!(c.policy.max_wall_seconds, 0);
+        assert_eq!(c.policy.max_steps_unattended, 0);
+        assert_eq!(c.policy.max_wall_unattended_seconds, 0);
+        assert_eq!(c.server.read_timeout_s, 0);
+        c.policy.max_steps = 80;
+        c.policy.max_wall_seconds = 3600;
+        c.server.read_timeout_s = 600;
+        assert!(!c.migrate_overnight_defaults());
+        assert_eq!(c.policy.max_steps, 80);
+        assert_eq!(c.policy.max_wall_seconds, 3600);
+        assert_eq!(c.server.read_timeout_s, 600);
     }
 
     #[test]

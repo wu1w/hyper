@@ -881,10 +881,10 @@ async fn config_post(
         parse_working_window(n).map_err(|e| (StatusCode::BAD_REQUEST, e.to_string()))?;
     }
     if let Some(n) = p.max_steps {
-        if n == 0 || n > 10_000 {
+        if n > 10_000 {
             return Err((
                 StatusCode::BAD_REQUEST,
-                "max_steps must be 1..=10000".into(),
+                "max_steps must be 0..=10000 (0 = no cap)".into(),
             ));
         }
     }

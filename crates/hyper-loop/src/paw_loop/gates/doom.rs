@@ -70,10 +70,10 @@ impl DoomLoopGate {
         Self::new(2, 1.0, vec![DoomStage::warn(6, REPEAT_NOTE)])
     }
 
-    /// Cursor: sixth identical tool+args stops quietly (`budget:repeat`).
-    /// No Qwen repetition lecture. Iteration/timeout remain the far wall.
+    /// Cursor / grok CLI keep going on a long task. Sixth identical
+    /// tool+args gets one note; the loop does not halt.
     pub fn grok_default() -> Self {
-        Self::new(2, 1.0, vec![DoomStage::halt(6, REPEAT_STOP)])
+        Self::new(2, 1.0, vec![DoomStage::warn(6, REPEAT_NOTE)])
     }
 
     /// Low-precision overlay: one nudge at the second identical call.
@@ -129,21 +129,17 @@ impl DoomLoopGate {
                     state.consecutive_hits += 1;
                 }
 
-                // bash 是有状态命令（git status、tail 日志），同参重放结果
-                // 可变：若仍有 halt 阶段，只把 hard 边再放宽一步。
-                let stateful = state.history.back().is_some_and(|fp| fp.name == "bash");
+                let poll = state.history.back().is_some_and(is_poll_tool);
                 let Some(stage) = self.stages.iter().rev().find(|s| {
-                    let after = if stateful && s.stop {
-                        s.after + 1
-                    } else {
-                        s.after
-                    };
-                    state.consecutive_hits >= after
+                    state.consecutive_hits >= s.after
                 }) else {
                     return GateDecision::Bypass;
                 };
 
                 if stage.stop {
+                    if poll {
+                        return GateDecision::Bypass;
+                    }
                     return GateDecision::Stop {
                         reason: stage.prompt.clone(),
                     };
@@ -210,6 +206,10 @@ fn similarity(window: &[&ToolFingerprint]) -> f64 {
     1.0 - (unique - 1.0) / (total - 1.0)
 }
 
+fn is_poll_tool(fp: &ToolFingerprint) -> bool {
+    fp.poll
+}
+
 fn push_fp(history: &mut VecDeque<ToolFingerprint>, fp: &ToolFingerprint, window_size: usize) {
     if history.len() == window_size * 2 {
         history.pop_front();
@@ -267,7 +267,7 @@ mod tests {
     }
 
     #[test]
-    fn grok_default_halts_quietly_at_sixth_identical() {
+    fn grok_default_notes_at_sixth_identical_and_keeps_going() {
         let gate = DoomLoopGate::grok_default();
         let a = ToolFingerprint::new("read", r#"{"path":"a.rs"}"#);
         for iter in 1..=5 {
@@ -276,33 +276,48 @@ mod tests {
                 "iter={iter}"
             );
         }
-        assert_eq!(gate.continuation("s"), "");
         match hop(&gate, 6, &[a.clone()]) {
-            GateDecision::Stop { reason } => assert_eq!(reason, REPEAT_STOP),
-            other => panic!("expected quiet halt at 6th identical: {other:?}"),
+            GateDecision::Continue { .. } => {
+                assert_eq!(gate.continuation("s"), REPEAT_NOTE);
+            }
+            other => panic!("expected warn at 6th identical: {other:?}"),
         }
-        assert_eq!(gate.continuation("s"), "", "no lecture on Cursor halt");
         match hop(&gate, 7, &[a]) {
-            GateDecision::Stop { reason } => assert_eq!(reason, REPEAT_STOP),
-            other => panic!("expected halt to stick: {other:?}"),
+            GateDecision::Stop { .. } => panic!("long task must not halt on repeat"),
+            _ => {}
         }
     }
 
     #[test]
-    fn grok_bash_repeat_gets_one_extra_hop_then_halts() {
+    fn grok_bash_and_await_never_halt() {
+        for (name, args) in [
+            ("bash", r#"{"command":"git status"}"#),
+            ("Shell", r#"{"command":"git diff"}"#),
+            ("AwaitShell", r#"{"task_id":"s1"}"#),
+            ("awaitshell", r#"{"shell_id":"s1"}"#),
+        ] {
+            let gate = DoomLoopGate::grok_default();
+            let fp = ToolFingerprint::new(name, args);
+            for iter in 1..=8 {
+                assert!(
+                    !matches!(hop(&gate, iter, &[fp.clone()]), GateDecision::Stop { .. }),
+                    "{name} must not halt at {iter}"
+                );
+            }
+        }
+    }
+
+
+    #[test]
+    fn grok_non_poll_bash_does_not_halt() {
         let gate = DoomLoopGate::grok_default();
-        let b = ToolFingerprint::new("bash", r#"{"command":"git status"}"#);
-        for iter in 1..=6 {
+        let fp = ToolFingerprint::new("bash", r#"{"command":"echo once"}"#);
+        for iter in 1..=8 {
             assert!(
-                matches!(hop(&gate, iter, &[b.clone()]), GateDecision::Bypass),
-                "iter={iter}"
+                !matches!(hop(&gate, iter, &[fp.clone()]), GateDecision::Stop { .. }),
+                "echo must not halt at {iter}"
             );
         }
-        match hop(&gate, 7, &[b]) {
-            GateDecision::Stop { reason } => assert_eq!(reason, REPEAT_STOP),
-            other => panic!("expected bash halt at 7th identical: {other:?}"),
-        }
-        assert_eq!(gate.continuation("s"), "");
     }
 
     #[test]

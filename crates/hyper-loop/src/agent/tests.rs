@@ -16,7 +16,7 @@ use super::notes::{
     forbids_glob, forbids_grep, forbids_tools, wants_auto_locate, wants_numeric_check,
     wants_web_check,
 };
-use super::progress::{FORCED_SYNTHESIS_NOTE, INSPECT_SKIP_MSG, INSPECT_STREAK, WRITE_NOW_NOTE};
+use super::progress::{FORCED_SYNTHESIS_NOTE, INSPECT_STREAK, WRITE_NOW_NOTE};
 use super::turn::{
     EMPTY_CHANNEL_NOTE, EMPTY_STOP_FALLBACK, NO_TOOL_THINK_FLOOR, PARSE_REPAIR_NOTE,
     PHYSICS_WRAP_NOTE, STUB_CONTINUE_NOTE, SYNTHESIS_OUTPUT_CAP, SYNTHESIS_THINK_CAP,
@@ -1485,7 +1485,7 @@ is byte-stable and tools stay frozen.";
 }
 
 #[tokio::test]
-async fn grok_identical_reads_halt_quietly() {
+async fn grok_identical_reads_keep_going() {
     let dir =
         std::env::temp_dir().join(format!("hyper-grok-doom-{}", uuid::Uuid::new_v4().simple()));
     std::fs::create_dir_all(&dir).unwrap();
@@ -1502,34 +1502,18 @@ async fn grok_identical_reads_halt_quietly() {
             turn_tool("read", ping.clone()),
             turn_tool("read", ping.clone()),
             turn_tool("read", ping.clone()),
-            turn_text("should-not-run"),
+            turn_text("done from evidence"),
         ])),
         meter: false,
     });
     let mut agent = Agent::new(scripted, o).unwrap();
     let out = agent.run("read ping.txt").await.unwrap();
-    assert_eq!(
+    assert_eq!(out.text, "done from evidence");
+    assert_ne!(
         out.stop_reason.as_deref(),
         Some(crate::paw_loop::REPEAT_STOP),
         "{:?}",
         out.stop_reason
-    );
-    assert_ne!(
-        out.text, "should-not-run",
-        "sixth identical Read must not keep looping"
-    );
-    let hidden: Vec<_> = agent
-        .messages
-        .iter()
-        .filter(|m| m.role == "user")
-        .filter_map(|m| m.content.as_deref())
-        .filter(|c| crate::template::is_hidden_user_text(c))
-        .collect();
-    assert!(
-        hidden
-            .iter()
-            .all(|c| !c.contains(crate::paw_loop::REPEAT_NOTE)),
-        "no repeat lecture on Cursor path: {hidden:?}"
     );
     let _ = std::fs::remove_dir_all(dir);
 }
@@ -3793,13 +3777,12 @@ fn compact_soft_does_not_hard_fail() {
 }
 
 #[test]
-fn turn_start_compact_at_price_cliff_or_soft() {
-    // Preserve a 160k conversation below both the soft limit and price cliff.
+fn turn_start_compact_follows_soft_window_not_price_cliff() {
     assert!(!over_soft_threshold(160_000, 0, 262_144, 0.70));
     assert!(!should_compact_at_user_turn(160_000, 0, 262_144, 0.70));
-    assert!(should_compact_at_user_turn(200_001, 0, 500_000, 0.80));
+    assert!(!should_compact_at_user_turn(200_001, 0, 500_000, 0.80));
+    assert!(should_compact_at_user_turn(400_001, 0, 500_000, 0.80));
     assert!(!should_compact_at_user_turn(100_000, 0, 262_144, 0.70));
-    // Small-window tests hit the soft path, not a 120k fixture.
     assert!(should_compact_at_user_turn(800, 0, 1000, 0.70));
     assert!(!should_compact_at_user_turn(200_000, 0, 0, 0.70));
 }
@@ -6242,13 +6225,13 @@ async fn im_ask_without_clarify_hub_skips() {
 }
 
 #[test]
-fn unattended_im_uses_hermes_caps() {
+fn unattended_im_uses_policy_caps() {
     let dir = std::env::temp_dir().join(format!("grok-hyper-{}", uuid::Uuid::new_v4().simple()));
     let mut o = opts(&dir);
     o.channel = "wechat".into();
     crate::agent::apply_unattended_policy(&mut o, &Config::default());
-    assert_eq!(o.max_steps, 500);
-    assert_eq!(o.max_wall, std::time::Duration::from_secs(1800));
+    assert_eq!(o.max_steps, 0);
+    assert_eq!(o.max_wall, std::time::Duration::ZERO);
     o.channel = "web".into();
     o.max_steps = 80;
     o.max_wall = std::time::Duration::from_secs(1800);
@@ -7402,18 +7385,12 @@ async fn no_progress_permuted_hops_force_synthesis() {
         .filter(|c| crate::template::is_hidden_user_text(c))
         .collect();
     assert!(
-        hidden.iter().any(|c| c.contains(WRITE_NOW_NOTE)),
-        "write-now note missing: {hidden:?}"
-    );
-    let wire = responses_wire(&agent.messages);
-    assert!(
-        wire.contains("[channel]"),
-        "write-now note must reach grok-4.6: {wire}"
-    );
-    assert!(wire.contains("Emit native Write"), "{wire}");
-    assert!(
         hidden.iter().all(|c| !c.contains(FORCED_SYNTHESIS_NOTE)),
-        "inspect cap must not unmount tools: {hidden:?}"
+        "harness must not unmount tools: {hidden:?}"
+    );
+    assert!(
+        hidden.iter().all(|c| !c.contains(WRITE_NOW_NOTE)),
+        "inspect tour must not lecture Write: {hidden:?}"
     );
     let _ = std::fs::remove_dir_all(dir);
 }
@@ -7940,12 +7917,12 @@ async fn inspect_cap_skips_extra_read_keeps_tools() {
         .map(|m| m.content.clone().unwrap_or_default())
         .collect();
     assert!(
-        bodies.iter().any(|t| t.contains(INSPECT_SKIP_MSG)),
-        "extra inspect must return a paired skip result: {bodies:?}"
+        bodies.iter().all(|t| !t.contains("inspection skipped")),
+        "extra inspect must run, not skip: {bodies:?}"
     );
     assert!(
-        bodies.iter().all(|t| !t.contains("fn pong")),
-        "extra Read after write-nudge must not execute: {bodies:?}"
+        bodies.iter().any(|t| t.contains("fn pong")),
+        "extra Read after the tour must execute: {bodies:?}"
     );
     let _ = std::fs::remove_dir_all(dir);
 }
@@ -8042,8 +8019,8 @@ async fn inspect_cap_skips_extra_read_then_write() {
         .map(|m| m.content.clone().unwrap_or_default())
         .collect();
     assert!(
-        bodies.iter().any(|t| t.contains(INSPECT_SKIP_MSG)),
-        "extra Read must be skipped, not executed: {bodies:?}"
+        bodies.iter().all(|t| !t.contains("inspection skipped")),
+        "extra Read must execute: {bodies:?}"
     );
     let _ = std::fs::remove_dir_all(dir);
 }
@@ -8186,8 +8163,8 @@ async fn inspect_cap_still_executes_shell() {
         .map(|m| m.content.clone().unwrap_or_default())
         .collect();
     assert!(
-        bodies.iter().any(|t| t.contains(INSPECT_SKIP_MSG)),
-        "extra Read must still skip: {bodies:?}"
+        bodies.iter().all(|t| !t.contains("inspection skipped")),
+        "extra Read must execute: {bodies:?}"
     );
     let _ = std::fs::remove_dir_all(dir);
 }

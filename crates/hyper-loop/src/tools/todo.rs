@@ -27,7 +27,7 @@ pub fn todo_write(ws: &Workspace, call: &ToolCall) -> ToolResponse {
         .arguments
         .get("merge")
         .and_then(|v| v.as_bool())
-        .unwrap_or(false);
+        .unwrap_or(true);
     let mut incoming = Vec::new();
     for (i, item) in items.iter().enumerate() {
         let content = arg_str(item, "content").unwrap_or_default();

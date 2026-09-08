@@ -73,7 +73,7 @@ impl<C: Completer> Agent<C> {
 
         let gates = vec![
             Gate::from(DoomLoopGate::grok_default()),
-            Gate::from(IterationGate::new(opts.max_steps.max(1))),
+            Gate::from(IterationGate::new(opts.max_steps)),
             Gate::from(TimeoutGate::new(opts.max_wall)),
         ];
         let handler = StopHandler::with_gates(gates);
@@ -152,7 +152,7 @@ impl<C: Completer> Agent<C> {
             .web
             .enabled
             .then(|| crate::tools::WebRunner::new(opts.web.clone(), &mcp));
-        Ok(Self {
+        let mut agent = Self {
             completer,
             workspace,
             handler,
@@ -214,9 +214,7 @@ impl<C: Completer> Agent<C> {
             read_full: std::sync::Mutex::new(HashSet::new()),
             physics_nudged: false,
             channel_nudged: false,
-            force_synthesis: false,
             write_nudge_count: 0,
-            write_hold: false,
             watchdog_roomy_tried: false,
             wrap_up_after_tools: false,
             stub_nudged: false,
@@ -235,7 +233,31 @@ impl<C: Completer> Agent<C> {
             session_dir: opts.session_dir,
             home: opts.home,
             channel_files: Vec::new(),
-        })
+        };
+        agent.restore_official_compaction();
+        Ok(agent)
+    }
+
+    fn restore_official_compaction(&mut self) {
+        let Some(log) = &self.log else {
+            return;
+        };
+        let loaded = log.load_official().or_else(|| {
+            log.events().iter().rev().find_map(|e| match e {
+                crate::session::SessionEvent::Compact(c) => {
+                    let item = c.official()?;
+                    Some((item, 1))
+                }
+                _ => None,
+            })
+        });
+        let Some((item, skip)) = loaded else {
+            return;
+        };
+        self.official_compaction = Some(item.clone());
+        self.official_compaction_skip = skip;
+        self.completer.set_official_compaction(Some(item));
+        self.completer.set_compaction_skip(skip);
     }
 
     pub fn load_messages(&mut self, messages: Vec<ChatMessage>) {
