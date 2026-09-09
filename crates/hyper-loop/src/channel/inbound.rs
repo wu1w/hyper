@@ -61,6 +61,18 @@ pub fn supervise_fail_after(fail: u32, ran: Duration, ok: bool) -> u32 {
     }
 }
 
+/// Next reconnect wait after a gateway attempt. `0` means reconnect immediately
+/// (the previous socket stayed healthy long enough to reset the crash loop).
+pub fn gateway_next_wait(failures: u32, ran: Duration, ok: bool) -> (u32, u64) {
+    let fail = supervise_fail_after(failures, ran, ok);
+    let wait = if fail == 0 {
+        0
+    } else {
+        supervise_backoff_secs(fail)
+    };
+    (fail, wait)
+}
+
 pub fn is_fatal_serve_error(err: &str) -> bool {
     err.contains("no in-process client")
 }
@@ -735,6 +747,19 @@ mod tests {
             supervise_backoff_secs(supervise_fail_after(8, SUPERVISE_HEALTHY, false)),
             5
         );
+    }
+
+    #[test]
+    fn gateway_wait_is_zero_after_a_healthy_run() {
+        assert_eq!(
+            gateway_next_wait(8, SUPERVISE_HEALTHY, true),
+            (0, 0)
+        );
+        assert_eq!(
+            gateway_next_wait(8, Duration::from_secs(1), true),
+            (9, supervise_backoff_secs(9))
+        );
+        assert_eq!(gateway_next_wait(0, Duration::from_millis(10), false).0, 1);
     }
 
     #[test]

@@ -750,7 +750,7 @@ async fn jsonrpc_named(
         }),
     )
     .await?;
-    let reply = read_rpc(&mut reader).await?;
+    let reply = read_rpc(&mut reader, 2).await?;
     let _ = child.kill().await;
     rpc_result(reply)
 }
@@ -780,7 +780,7 @@ async fn jsonrpc_call(
         }),
     )
     .await?;
-    let reply = read_rpc(&mut reader).await?;
+    let reply = read_rpc(&mut reader, 2).await?;
     let _ = child.kill().await;
     rpc_result(reply)
 }
@@ -918,7 +918,7 @@ where
         }),
     )
     .await?;
-    let _init = read_rpc(reader).await?;
+    let _init = read_rpc(reader, 1).await?;
     write_rpc(
         stdin,
         json!({
@@ -954,21 +954,45 @@ fn content_length_of(header_line: &str) -> Option<usize> {
     rest.trim().parse().ok()
 }
 
-fn is_rpc_response(msg: &Value) -> bool {
-    match msg.get("id") {
-        None | Some(Value::Null) => false,
-        Some(_) => true,
+const MCP_MAX_FRAME: usize = 8_000_000;
+
+/// Bound even a peer that never sends a newline before allocating its body.
+async fn read_rpc_line<R: AsyncBufReadExt + Unpin>(r: &mut R, max: usize) -> Result<String> {
+    let mut bytes = Vec::new();
+    loop {
+        let chunk = r.fill_buf().await.map_err(Error::msg)?;
+        if chunk.is_empty() {
+            return Err(Error::msg("mcp eof"));
+        }
+        let n = chunk
+            .iter()
+            .position(|b| *b == b'\n')
+            .map_or(chunk.len(), |i| i + 1);
+        if bytes.len().saturating_add(n) > max {
+            return Err(Error::msg("mcp frame exceeds size limit"));
+        }
+        let done = chunk[n - 1] == b'\n';
+        bytes.extend_from_slice(&chunk[..n]);
+        r.consume(n);
+        if done {
+            return String::from_utf8(bytes).map_err(Error::msg);
+        }
     }
 }
 
-/// One LSP-style frame. Header names are case-insensitive.
+/// Standard MCP newline JSON; tolerate existing framed responses on input.
 async fn read_rpc_frame<R: AsyncBufReadExt + Unpin>(r: &mut R) -> Result<Value> {
+    let first = read_rpc_line(r, MCP_MAX_FRAME).await?;
+    if first.trim_start().starts_with('{') {
+        return serde_json::from_str(&first).map_err(Error::msg);
+    }
     let mut content_len = 0usize;
+    let mut line = first;
+    let mut header_bytes = 0usize;
     loop {
-        let mut line = String::new();
-        let n = r.read_line(&mut line).await.map_err(Error::msg)?;
-        if n == 0 {
-            return Err(Error::msg("mcp eof"));
+        header_bytes = header_bytes.saturating_add(line.len());
+        if header_bytes > 8192 {
+            return Err(Error::msg("mcp headers exceed size limit"));
         }
         let t = line.trim_end();
         if t.is_empty() {
@@ -977,8 +1001,9 @@ async fn read_rpc_frame<R: AsyncBufReadExt + Unpin>(r: &mut R) -> Result<Value> 
         if let Some(n) = content_length_of(t) {
             content_len = n;
         }
+        line = read_rpc_line(r, 8192).await?;
     }
-    if content_len == 0 || content_len > 8_000_000 {
+    if content_len == 0 || content_len > MCP_MAX_FRAME {
         return Err(Error::msg("mcp bad Content-Length"));
     }
     let mut buf = vec![0u8; content_len];
@@ -986,11 +1011,14 @@ async fn read_rpc_frame<R: AsyncBufReadExt + Unpin>(r: &mut R) -> Result<Value> 
     serde_json::from_slice(&buf).map_err(Error::msg)
 }
 
-/// Skip JSON-RPC notifications (no `id`) until a response frame.
-async fn read_rpc<R: AsyncBufReadExt + Unpin>(r: &mut R) -> Result<Value> {
+/// Skip JSON-RPC notifications (no `id`) until a response frame with `expected_id`.
+async fn read_rpc<R: AsyncBufReadExt + Unpin>(r: &mut R, expected_id: u64) -> Result<Value> {
     for _ in 0..MCP_MAX_SKIP {
         let msg = read_rpc_frame(r).await?;
-        if is_rpc_response(&msg) {
+        if msg.get("id").and_then(Value::as_u64) == Some(expected_id)
+            && msg.get("method").is_none()
+            && (msg.get("result").is_some() || msg.get("error").is_some())
+        {
             return Ok(msg);
         }
     }
@@ -1263,9 +1291,31 @@ while True:
             json!({"jsonrpc":"2.0","id":2,"result":{"ok":true}}),
         ));
         let mut reader = BufReader::new(bytes.as_slice());
-        let v = read_rpc(&mut reader).await.unwrap();
+        let v = read_rpc(&mut reader, 2).await.unwrap();
         assert_eq!(v["id"], 2);
         assert_eq!(v["result"]["ok"], true);
+    }
+
+    #[tokio::test]
+    async fn newline_rpc_matches_response_id_and_bounds_frames() {
+        let bytes = concat!(
+            "{\"jsonrpc\":\"2.0\",\"method\":\"notifications/message\"}\n",
+            "{\"jsonrpc\":\"2.0\",\"id\":99,\"result\":{}}\n",
+            "{\"jsonrpc\":\"2.0\",\"id\":2,\"method\":\"ping\"}\n",
+            "{\"jsonrpc\":\"2.0\",\"id\":2,\"result\":{\"ok\":true}}\n"
+        );
+        let mut reader = BufReader::new(bytes.as_bytes());
+        assert_eq!(
+            read_rpc(&mut reader, 2).await.unwrap()["result"]["ok"],
+            true
+        );
+        let oversized = vec![b'x'; MCP_MAX_FRAME + 1];
+        let mut reader = BufReader::new(oversized.as_slice());
+        assert!(read_rpc_frame(&mut reader)
+            .await
+            .unwrap_err()
+            .to_string()
+            .contains("size limit"));
     }
 
     #[test]

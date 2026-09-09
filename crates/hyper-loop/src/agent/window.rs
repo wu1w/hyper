@@ -125,7 +125,7 @@ impl<C: Completer> Agent<C> {
         }
     }
 
-    fn prefix_tokens_gate(&self) -> u32 {
+    pub(crate) fn prefix_tokens_gate(&self) -> u32 {
         let keep_reasoning = self
             .completer
             .prefix_meter()

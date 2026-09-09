@@ -6,6 +6,7 @@
 use reqwest::Client;
 use serde_json::{json, Map, Value};
 use std::collections::HashSet;
+use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::Mutex;
 
 use super::delta::StreamPaint;
@@ -32,6 +33,7 @@ pub struct ResponsesCompleter {
     cache_key: Mutex<Option<String>>,
     compaction: Mutex<Option<OfficialCompaction>>,
     compaction_skip: Mutex<usize>,
+    output_limit: AtomicU32,
     speculate: Mutex<Option<SpeculativeSlot>>,
 }
 
@@ -65,6 +67,7 @@ impl ResponsesCompleter {
             cache_key: Mutex::new(None),
             compaction: Mutex::new(None),
             compaction_skip: Mutex::new(0),
+            output_limit: AtomicU32::new(0),
             speculate: Mutex::new(None),
         })
     }
@@ -92,7 +95,11 @@ impl Completer for ResponsesCompleter {
         messages: &[ChatMessage],
         tools: Option<&[Value]>,
     ) -> Result<ModelTurn> {
-        let policy = self.policy();
+        let mut policy = self.policy();
+        let ceiling = self.output_limit.load(Ordering::Relaxed);
+        if ceiling > 0 {
+            policy.max_tokens = super::cap_max_tokens(policy.max_tokens, ceiling);
+        }
         let sink = self.token_sink();
         let cache_key = lock_str(&self.cache_key).clone();
         let compaction = lock_comp(&self.compaction).clone();
@@ -115,11 +122,32 @@ impl Completer for ResponsesCompleter {
         if let Some(id) = cache_key.as_deref() {
             req = req.header("x-grok-conv-id", id);
         }
-        let mut resp = req.send().await.map_err(|e| sanitize_http(e))?;
+        crate::llm_http::before_llm_request(&self.url, &self.api_key).await;
+        let mut resp = match req.send().await {
+            Ok(resp) => resp,
+            Err(e) => {
+                let err = sanitize_http(e);
+                crate::llm_http::after_llm_error(&self.url, &self.api_key, &err);
+                return Err(err);
+            }
+        };
         let status = resp.status();
         if !status.is_success() {
+            let headers = resp.headers().clone();
             let text = resp.text().await.unwrap_or_default();
-            return Err(auth_or_status(status, &text));
+            let err = if status.as_u16() == 401 || status.as_u16() == 403 {
+                auth_or_status(status, &text)
+            } else {
+                Error::Http(crate::llm_http::attach_retry_after(
+                    format!(
+                        "responses {}",
+                        crate::transport::http_error_snippet(status, &text)
+                    ),
+                    &headers,
+                ))
+            };
+            crate::llm_http::after_llm_error(&self.url, &self.api_key, &err);
+            return Err(err);
         }
         if sink.is_some() {
             let turn = read_responses_sse(&mut resp, sink, self.speculate()).await?;
@@ -173,6 +201,11 @@ impl Completer for ResponsesCompleter {
 
     fn recasts_xai_product(&self) -> bool {
         true
+    }
+
+    fn set_output_limit(&self, limit: Option<u32>) {
+        self.output_limit
+            .store(limit.unwrap_or(0), Ordering::Relaxed);
     }
 
     fn media_caps(&self) -> crate::media::MediaCaps {
@@ -303,6 +336,13 @@ impl Completer for TransportCompleter {
         match self {
             Self::Responses(_) => {}
             Self::Chat(c) => c.set_low_precision(on),
+        }
+    }
+
+    fn set_output_limit(&self, limit: Option<u32>) {
+        match self {
+            Self::Responses(c) => Completer::set_output_limit(c, limit),
+            Self::Chat(c) => Completer::set_output_limit(c, limit),
         }
     }
 

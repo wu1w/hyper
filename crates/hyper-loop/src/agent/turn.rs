@@ -46,6 +46,8 @@ impl<C: Completer> Agent<C> {
         let (forced_mcp, text) = sticky::split_mcp_prefix(&text);
         let mut msg = msg;
         msg.content = Some(text.clone());
+        self.close_interrupted_tools();
+        self.ensure_persistence()?;
         // 用户附带的媒体与 tool 侧同样落盘，否则 resume 重建后丢图。
         let stored = self.persist_turn_media(&msg.parts);
         let stubbed = sticky::stub_expired_notes(&mut self.messages);
@@ -821,7 +823,13 @@ impl<C: Completer> Agent<C> {
                 return;
             }
             if let Some(log) = self.log.as_mut() {
-                let _ = log.append(event);
+                if let Err(error) = log.append(event) {
+                    self.persistence_error.get_or_insert_with(|| {
+                        format!(
+                            "session persistence failed: {error}; task paused before further tools"
+                        )
+                    });
+                }
             }
             return;
         }
@@ -840,7 +848,53 @@ impl<C: Completer> Agent<C> {
             }
         }
         if let Some(log) = self.log.as_mut() {
-            let _ = log.append(event);
+            if let Err(error) = log.append(event) {
+                self.persistence_error.get_or_insert_with(|| {
+                    format!("session persistence failed: {error}; task paused before further tools")
+                });
+            }
+        }
+    }
+
+    pub(crate) fn persist_paused_text(&self) -> String {
+        self.persistence_error
+            .clone()
+            .unwrap_or_else(|| {
+                "session persistence failed; task paused before further tools".into()
+            })
+    }
+
+    pub(crate) fn close_interrupted_tools(&mut self) {
+        let mut pending = std::collections::BTreeMap::new();
+        for message in &self.messages {
+            if let Some(calls) = &message.tool_calls {
+                for call in calls {
+                    if let Some(id) = call["id"].as_str() {
+                        pending.insert(
+                            id.to_string(),
+                            call["function"]["name"]
+                                .as_str()
+                                .unwrap_or("unknown")
+                                .to_string(),
+                        );
+                    }
+                }
+            }
+            if message.role == "tool" {
+                if let Some(id) = &message.tool_call_id {
+                    pending.remove(id);
+                }
+            }
+        }
+        for (id, name) in pending {
+            self.commit_tool(
+                &name,
+                crate::tool_calls::ToolResponse::text(
+                    id,
+                    "Interrupted before a final result was recorded. Side effects are unknown; inspect the workspace before retrying.",
+                    crate::tool_calls::ToolState::Interrupted,
+                ),
+            );
         }
     }
 

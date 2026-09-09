@@ -3,7 +3,7 @@
 //! No `dingtalk-stream` Python SDK. Chatbot fields match QwenPaw; markdown
 //! send matches Hermes.
 
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use futures::{SinkExt, StreamExt};
 use serde_json::{json, Value};
@@ -54,12 +54,20 @@ pub async fn run_gateway(ep: ChannelEndpoint, mgr: ChannelManager) -> Result<()>
     };
     let http = crate::llm_http::env_aware_client(20, OPEN_URL)?;
     eprintln!("hyper dingtalk gateway starting client_id={client_id}");
+    let mut failures = 0u32;
     loop {
-        match run_once(&http, &ep, &mgr, &client_id, &client_secret).await {
+        let started = Instant::now();
+        let result = run_once(&http, &ep, &mgr, &client_id, &client_secret).await;
+        let ok = result.is_ok();
+        let (next, wait) = super::inbound::gateway_next_wait(failures, started.elapsed(), ok);
+        failures = next;
+        match result {
             Ok(()) => eprintln!("hyper dingtalk: socket closed, reconnecting"),
-            Err(e) => eprintln!("hyper dingtalk: {e}; retry in 2s"),
+            Err(e) => eprintln!("hyper dingtalk: {e}; retry in {wait}s"),
         }
-        tokio::time::sleep(Duration::from_secs(2)).await;
+        if wait > 0 {
+            tokio::time::sleep(Duration::from_secs(wait)).await;
+        }
     }
 }
 

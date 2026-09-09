@@ -7,7 +7,7 @@
 //! Tool calls come from the native OpenAI `tool_calls` array only — no Qwen XML.
 
 use std::collections::HashSet;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::Mutex;
 use std::time::Duration;
 
@@ -40,6 +40,7 @@ pub struct HttpCompleter {
     id_slot: Mutex<Option<i64>>,
     conv_id: Mutex<Option<String>>,
     low_precision: AtomicBool,
+    output_limit: AtomicU32,
     speculate: Mutex<Option<SpeculativeSlot>>,
 }
 
@@ -83,6 +84,7 @@ impl HttpCompleter {
             id_slot: Mutex::new(None),
             conv_id: Mutex::new(None),
             low_precision: AtomicBool::new(cfg.policy.low_precision),
+            output_limit: AtomicU32::new(0),
             speculate: Mutex::new(None),
         })
     }
@@ -116,7 +118,11 @@ impl HttpCompleter {
         tools: Option<&[Value]>,
         stream: bool,
     ) -> Result<reqwest::Response> {
-        let policy = self.policy();
+        let mut policy = self.policy();
+        let ceiling = self.output_limit.load(Ordering::Relaxed);
+        if ceiling > 0 {
+            policy.max_tokens = super::cap_max_tokens(policy.max_tokens, ceiling);
+        }
         let pin = matches!(
             self.caps.profile,
             crate::family::EngineProfile::LlamaCpp | crate::family::EngineProfile::Auto
@@ -145,13 +151,26 @@ impl HttpCompleter {
                 req = req.header("x-grok-conv-id", id);
             }
         }
-        let resp = req.send().await.map_err(|e| Error::Http(e.to_string()))?;
+        crate::llm_http::before_llm_request(&self.url, &self.api_key).await;
+        let resp = match req.send().await {
+            Ok(resp) => resp,
+            Err(e) => {
+                let err = Error::Http(e.to_string());
+                crate::llm_http::after_llm_error(&self.url, &self.api_key, &err);
+                return Err(err);
+            }
+        };
         let status = resp.status();
         if !status.is_success() {
+            let headers = resp.headers().clone();
             let text = resp.text().await.unwrap_or_default();
-            return Err(Error::Http(crate::transport::http_error_snippet(
-                status, &text,
-            )));
+            let snippet = crate::llm_http::attach_retry_after(
+                crate::transport::http_error_snippet(status, &text),
+                &headers,
+            );
+            let err = Error::Http(snippet);
+            crate::llm_http::after_llm_error(&self.url, &self.api_key, &err);
+            return Err(err);
         }
         Ok(resp)
     }
@@ -237,6 +256,11 @@ impl Completer for HttpCompleter {
 
     fn set_low_precision(&self, on: bool) {
         self.low_precision.store(on, Ordering::Relaxed);
+    }
+
+    fn set_output_limit(&self, limit: Option<u32>) {
+        self.output_limit
+            .store(limit.unwrap_or(0), Ordering::Relaxed);
     }
 
     fn recasts_xai_product(&self) -> bool {

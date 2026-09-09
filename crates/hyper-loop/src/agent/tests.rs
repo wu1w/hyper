@@ -3774,6 +3774,16 @@ fn compact_ratio_soft_limit_clamped() {
 }
 
 #[test]
+fn generation_room_is_none_on_unlimited_window() {
+    assert_eq!(generation_room(0, 100_000), None);
+    assert_eq!(generation_room(1000, 900), Some(36));
+    assert_eq!(generation_room(100, 100), Some(1));
+    assert_eq!(cap_max_tokens(0, 50), 50);
+    assert_eq!(cap_max_tokens(20, 50), 20);
+    assert_eq!(cap_max_tokens(80, 50), 50);
+}
+
+#[test]
 fn compact_soft_does_not_hard_fail() {
     assert!(over_soft_threshold(800, 0, 1000, 0.70));
     assert!(!over_hard_threshold(800, 0, 1000));
@@ -5886,6 +5896,131 @@ async fn persist_session_writes_jsonl() {
     assert_eq!(steps[1].phase, StepPhase::Completed);
     assert_eq!(steps[0].step_id, steps[1].step_id);
     assert_eq!(log.messages().len(), 4);
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+struct SlowThenOk {
+    n: std::sync::Arc<std::sync::atomic::AtomicU32>,
+}
+
+impl Completer for SlowThenOk {
+    async fn complete(
+        &self,
+        _messages: &[ChatMessage],
+        _tools: Option<&[Value]>,
+    ) -> Result<ModelTurn> {
+        let i = self.n.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        if i == 0 {
+            tokio::time::sleep(std::time::Duration::from_secs(1800)).await;
+            return Err(Error::Http("stream timeout".into()));
+        }
+        Ok(turn_text("recovered"))
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn slow_first_timeout_still_gets_an_agent_retry() {
+    let dir = std::env::temp_dir().join(format!("grok-hyper-{}", uuid::Uuid::new_v4().simple()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let n = std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0));
+    let mut agent = Agent::new(
+        SlowThenOk { n: n.clone() },
+        opts(&dir),
+    )
+    .unwrap();
+    let out = agent.run("hi").await.unwrap();
+    assert_eq!(out.text, "recovered");
+    assert_eq!(n.load(std::sync::atomic::Ordering::SeqCst), 2);
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn log_failure_between_serial_tools_blocks_later_writes() {
+    let dir = std::env::temp_dir().join(format!("hyper-persist-{}", uuid::Uuid::new_v4().simple()));
+    let sess = dir.join("sessions");
+    std::fs::create_dir_all(&sess).unwrap();
+    let mut o = opts(&dir);
+    o.persist_session = true;
+    o.session_id = "batch-failure".into();
+    o.session_dir = Some(sess.clone());
+    let scripted = Scripted {
+        turns: Mutex::new(VecDeque::from([turn_tools(vec![
+            (
+                "fault",
+                "bash",
+                json!({"command": "chmod a-w sessions/batch-failure.jsonl"}),
+            ),
+            (
+                "later",
+                "write",
+                json!({"path": "must-not-exist.txt", "contents": "bad"}),
+            ),
+        ])])),
+        meter: false,
+    };
+    let mut agent = Agent::new(scripted, o).unwrap();
+    assert!(agent.run("Execute the two writes.").await.is_err());
+    assert!(!dir.join("must-not-exist.txt").exists());
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+#[tokio::test]
+async fn missing_result_is_closed_on_resume() {
+    let dir = std::env::temp_dir().join(format!("hyper-resume-{}", uuid::Uuid::new_v4().simple()));
+    let sess = dir.join("sessions");
+    std::fs::create_dir_all(&sess).unwrap();
+    let start = crate::session::SessionStart::new(
+        "resume",
+        dir.display().to_string(),
+        SessionMode::Agent,
+        "sys",
+        crate::session::tools_hash(&[]),
+        SessionMode::Agent.default_policy(),
+    );
+    let mut log = SessionLog::create_in(&sess, start).unwrap();
+    log.append(SessionEvent::user("old-task")).unwrap();
+    log.append(SessionEvent::assistant(
+        "",
+        "",
+        Some(vec![crate::session::OpenAiToolCall::function(
+            "unfinished",
+            "bash",
+            r#"{"command":"true"}"#,
+        )]),
+    ))
+    .unwrap();
+    drop(log);
+    let mut o = opts(&dir);
+    o.persist_session = true;
+    o.session_id = "resume".into();
+    o.session_dir = Some(sess);
+    let scripted = Scripted {
+        turns: Mutex::new(VecDeque::from([turn_text("resumed")])),
+        meter: false,
+    };
+    let mut agent = Agent::new(scripted, o).unwrap();
+    let out = agent.run("继续").await.unwrap();
+    assert_eq!(out.text, "resumed");
+    assert!(agent.messages.iter().any(|m| {
+        m.role == "tool" && m.text().contains("Side effects are unknown")
+    }));
+    let mut pending = std::collections::BTreeSet::new();
+    for message in &agent.messages {
+        if let Some(calls) = &message.tool_calls {
+            for call in calls {
+                if let Some(id) = call["id"].as_str() {
+                    pending.insert(id.to_string());
+                }
+            }
+        }
+        if message.role == "tool" {
+            if let Some(id) = &message.tool_call_id {
+                pending.remove(id);
+            }
+        }
+    }
+    assert!(pending.is_empty(), "tool_calls must stay paired: {pending:?}");
     let _ = std::fs::remove_dir_all(dir);
 }
 

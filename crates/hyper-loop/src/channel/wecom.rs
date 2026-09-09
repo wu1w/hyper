@@ -135,12 +135,20 @@ pub async fn run_gateway(ep: ChannelEndpoint, mgr: ChannelManager) -> Result<()>
     };
     let url = websocket_url(&ep);
     eprintln!("hyper wecom gateway starting bot_id={bot_id}");
+    let mut failures = 0u32;
     loop {
-        match run_once(&ep, &mgr, &bot_id, &secret, &url).await {
+        let started = Instant::now();
+        let result = run_once(&ep, &mgr, &bot_id, &secret, &url).await;
+        let ok = result.is_ok();
+        let (next, wait) = super::inbound::gateway_next_wait(failures, started.elapsed(), ok);
+        failures = next;
+        match result {
             Ok(()) => eprintln!("hyper wecom: socket closed, reconnecting"),
-            Err(e) => eprintln!("hyper wecom: {e}; retry in 2s"),
+            Err(e) => eprintln!("hyper wecom: {e}; retry in {wait}s"),
         }
-        tokio::time::sleep(Duration::from_secs(2)).await;
+        if wait > 0 {
+            tokio::time::sleep(Duration::from_secs(wait)).await;
+        }
     }
 }
 

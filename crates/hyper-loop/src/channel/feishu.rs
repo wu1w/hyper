@@ -26,7 +26,6 @@ use super::ChannelEndpoint;
 const FEISHU_BASE: &str = "https://open.feishu.cn";
 const LARK_BASE: &str = "https://open.larksuite.com";
 const TOKEN_TTL: Duration = Duration::from_secs(50 * 60);
-const RECONNECT_WAIT: Duration = Duration::from_secs(2);
 const PING_INTERVAL: Duration = Duration::from_secs(30);
 /// Replay only recent downtime, not the whole chat history on first boot.
 const CATCHUP_MAX_AGE_MS: u64 = 30 * 60 * 1000;
@@ -247,12 +246,20 @@ pub async fn run_ws(ep: ChannelEndpoint, mgr: ChannelManager) -> Result<()> {
     let base = open_base(&ep);
     let http = crate::llm_http::env_aware_client(20, base)?;
     eprintln!("hyper feishu gateway starting app_id={app_id} base={base}");
+    let mut failures = 0u32;
     loop {
-        match run_once(&http, &ep, &mgr, &app_id, &secret, base).await {
+        let started = Instant::now();
+        let result = run_once(&http, &ep, &mgr, &app_id, &secret, base).await;
+        let ok = result.is_ok();
+        let (next, wait) = super::inbound::gateway_next_wait(failures, started.elapsed(), ok);
+        failures = next;
+        match result {
             Ok(()) => eprintln!("hyper feishu: socket closed, reconnecting"),
-            Err(e) => eprintln!("hyper feishu: {e}; retry in 2s"),
+            Err(e) => eprintln!("hyper feishu: {e}; retry in {wait}s"),
         }
-        tokio::time::sleep(RECONNECT_WAIT).await;
+        if wait > 0 {
+            tokio::time::sleep(Duration::from_secs(wait)).await;
+        }
     }
 }
 

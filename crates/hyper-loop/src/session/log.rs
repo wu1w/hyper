@@ -1,5 +1,5 @@
 use std::fs::{self, File, OpenOptions};
-use std::io::{BufRead, BufReader, Write};
+use std::io::{BufRead, BufReader, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 
 use fs2::FileExt;
@@ -335,21 +335,98 @@ fn write_events_locked(file: &mut File, events: &[SessionEvent]) -> Result<()> {
 }
 
 fn read_jsonl(path: &Path) -> Result<Vec<SessionEvent>> {
-    let file = File::open(path)?;
-    file.lock_shared()?;
+    // Recovery must hold the same exclusive lock as append, so another writer
+    // cannot complete the tail while we diagnose/truncate it.
+    let mut file = OpenOptions::new().read(true).write(true).open(path)?;
+    file.lock_exclusive()?;
     let result = (|| {
         let mut events = Vec::new();
-        for (i, line) in BufReader::new(&file).lines().enumerate() {
-            let line = line?;
-            if line.trim().is_empty() {
+        let mut reader = BufReader::new(&file);
+        let mut line = Vec::new();
+        let mut offset = 0u64;
+        let mut repair = None;
+        let mut needs_newline = false;
+        loop {
+            line.clear();
+            let n = read_record(&mut reader, &mut line)?;
+            if n == 0 {
+                break;
+            }
+            let terminated = line.last() == Some(&b'\n');
+            if line.iter().all(u8::is_ascii_whitespace) {
+                offset += n as u64;
                 continue;
             }
-            let event: SessionEvent = serde_json::from_str(&line)
-                .map_err(|e| Error::msg(format!("{}:{}: {e}", path.display(), i + 1)))?;
-            events.push(event);
+            match serde_json::from_slice::<SessionEvent>(&line) {
+                Ok(event) => {
+                    events.push(event);
+                    needs_newline = !terminated;
+                }
+                Err(error) if !terminated && error.is_eof() && !events.is_empty() => {
+                    repair = Some(offset);
+                    break;
+                }
+                Err(error) => {
+                    return Err(Error::msg(format!(
+                        "{} at byte {offset}: {error}",
+                        path.display()
+                    )))
+                }
+            }
+            offset += n as u64;
+        }
+        drop(reader);
+        if let Some(offset) = repair {
+            let backup =
+                path.with_extension(format!("jsonl.torn-{}", uuid::Uuid::new_v4().simple()));
+            let mut opts = OpenOptions::new();
+            opts.write(true).create_new(true);
+            #[cfg(unix)]
+            opts.mode(0o600);
+            let mut saved = opts.open(&backup)?;
+            file.seek(SeekFrom::Start(0))?;
+            std::io::copy(&mut file, &mut saved)?;
+            saved.sync_all()?;
+            file.set_len(offset)?;
+            file.sync_all()?;
+            eprintln!(
+                "hyper: recovered incomplete session tail; backup {}",
+                backup.display()
+            );
+        } else if needs_newline {
+            file.seek(SeekFrom::End(0))?;
+            file.write_all(b"\n")?;
+            file.sync_all()?;
         }
         Ok(events)
     })();
     let _ = file.unlock();
     result
+}
+
+const MAX_RECORD_BYTES: usize = 128 * 1024 * 1024;
+
+fn read_record(reader: &mut impl BufRead, line: &mut Vec<u8>) -> std::io::Result<usize> {
+    line.clear();
+    loop {
+        let chunk = reader.fill_buf()?;
+        if chunk.is_empty() {
+            return Ok(line.len());
+        }
+        let n = chunk
+            .iter()
+            .position(|b| *b == b'\n')
+            .map_or(chunk.len(), |i| i + 1);
+        if line.len().saturating_add(n) > MAX_RECORD_BYTES {
+            return Err(std::io::Error::other(
+                "session event exceeds 128 MiB; source preserved",
+            ));
+        }
+        let done = chunk[n - 1] == b'\n';
+        line.extend_from_slice(&chunk[..n]);
+        reader.consume(n);
+        if done {
+            return Ok(line.len());
+        }
+    }
 }

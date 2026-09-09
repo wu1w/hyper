@@ -136,6 +136,9 @@ pub trait Completer: Send + Sync {
     /// Lossy overlay sampling (repetition_penalty 1.1). Default no-op.
     fn set_low_precision(&self, _on: bool) {}
 
+    /// Cap `max_tokens` / `max_output_tokens` to remaining window. `None` clears.
+    fn set_output_limit(&self, _limit: Option<u32>) {}
+
     fn media_caps(&self) -> crate::media::MediaCaps {
         crate::media::MediaCaps::default()
     }
@@ -347,6 +350,28 @@ pub(crate) fn clamp_generation_reserve(window: u32, reserve: u32) -> u32 {
     reserve.min(cap)
 }
 
+/// Remaining generation tokens after the current prefix. `None` = do not cap
+/// (unlimited working window). Never a stop reason — compact still continues.
+pub(crate) fn generation_room(working_window: u32, prefix: u32) -> Option<u32> {
+    if working_window == 0 {
+        return None;
+    }
+    Some(
+        working_window
+            .saturating_sub(prefix)
+            .saturating_sub(64)
+            .max(1),
+    )
+}
+
+pub(crate) fn cap_max_tokens(policy_max: u32, room: u32) -> u32 {
+    if policy_max == 0 {
+        room.max(1)
+    } else {
+        policy_max.min(room).max(1)
+    }
+}
+
 fn clamp_compact_ratio(ratio: f64) -> f64 {
     if ratio.is_finite() {
         ratio.clamp(0.10, 1.0)
@@ -530,6 +555,8 @@ pub struct Agent<C> {
     config: Config,
     child: Option<crate::subagent::ChildCtx>,
     persist_session: bool,
+    /// First JSONL append failure this Agent. Further tools are Interrupted.
+    persistence_error: Option<String>,
     session_dir: Option<PathBuf>,
     home: Option<PathBuf>,
     channel_files: Vec<String>,

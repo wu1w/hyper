@@ -236,6 +236,7 @@ impl<C: Completer> Agent<C> {
             config: opts.config,
             child: opts.child,
             persist_session: opts.persist_session,
+            persistence_error: None,
             session_dir: opts.session_dir,
             home: opts.home,
             channel_files: Vec::new(),

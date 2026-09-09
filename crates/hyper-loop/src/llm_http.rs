@@ -4,7 +4,8 @@
 //! and automatic retries until the path is back (or the user stops).
 
 use std::future::Future;
-use std::time::{Duration, Instant};
+use std::time::Duration;
+use tokio::time::Instant;
 
 use reqwest::Client;
 use serde_json::Value;
@@ -16,7 +17,8 @@ use crate::tool_calls::CancelFlag;
 /// Floor for remote TLS/connect. Loopback keeps the configured value.
 pub const CONNECT_TIMEOUT_FLOOR_S: u64 = 20;
 
-/// Keep retrying transient failures for this long, then surface the last error.
+/// Admit new attempts for this long after the first transient failure. An
+/// admitted request uses its own HTTP timeout; a recovered long stream may finish.
 pub const RETRY_BUDGET: Duration = Duration::from_secs(600);
 
 const BACKOFF_CAP_S: u64 = 20;
@@ -188,7 +190,115 @@ pub fn is_transient(err: &Error) -> bool {
         Error::Watchdog => false,
         Error::Config(_) | Error::Template(_) | Error::Tokenizer(_) | Error::Vendor(_) => false,
         Error::Io(_) => true,
-        Error::Http(s) | Error::Msg(s) => looks_transient(s),
+        Error::Http(s) | Error::Msg(s) => !quota_exhausted(s) && looks_transient(s),
+    }
+}
+
+fn quota_exhausted(body: &str) -> bool {
+    let text = body.to_ascii_lowercase();
+    [
+        "insufficient_quota",
+        "quota_exceeded",
+        "insufficient_balance",
+        "credit balance",
+        "billing_hard_limit",
+        "余额不足",
+        "额度耗尽",
+    ]
+    .iter()
+    .any(|word| text.contains(word))
+}
+
+pub fn retry_delay_for(error: &Error, attempt: u32) -> Duration {
+    retry_after_from_err(error)
+        .unwrap_or_else(|| retry_delay(attempt))
+        .max(retry_delay(attempt))
+}
+
+fn retry_after_from_err(error: &Error) -> Option<Duration> {
+    let raw = match error {
+        Error::Http(s) | Error::Msg(s) => s.as_str(),
+        _ => return None,
+    };
+    let l = raw.to_ascii_lowercase();
+    for key in ["retry-after:", "retry after "] {
+        if let Some(rest) = l.split_once(key).map(|(_, r)| r.trim_start()) {
+            let digits: String = rest.chars().take_while(|c| c.is_ascii_digit()).collect();
+            if let Ok(secs) = digits.parse::<u64>() {
+                if secs > 0 {
+                    return Some(Duration::from_secs(secs.min(86400)));
+                }
+            }
+        }
+    }
+    None
+}
+
+/// Shared cooldown across turns using the same endpoint/account.
+#[derive(Default)]
+pub struct EndpointCooldown(std::sync::Mutex<Option<tokio::time::Instant>>);
+impl EndpointCooldown {
+    pub async fn wait(&self) {
+        loop {
+            let at = *self.0.lock().unwrap_or_else(|e| e.into_inner());
+            match at {
+                Some(at) if at > tokio::time::Instant::now() => tokio::time::sleep_until(at).await,
+                _ => return,
+            }
+        }
+    }
+    pub fn defer(&self, delay: Duration) {
+        let mut at = self.0.lock().unwrap_or_else(|e| e.into_inner());
+        let next = tokio::time::Instant::now() + delay.min(Duration::from_secs(86400));
+        *at = Some(at.map_or(next, |old| old.max(next)));
+    }
+}
+
+pub fn endpoint_cooldown(endpoint: &str, key: &str) -> std::sync::Arc<EndpointCooldown> {
+    use std::sync::{Arc, Mutex, OnceLock};
+    type Registry = std::collections::VecDeque<(String, Arc<EndpointCooldown>)>;
+    static REGISTRY: OnceLock<Mutex<Registry>> = OnceLock::new();
+    let hash = crate::vendor::sha256_hex(format!("{endpoint}\0{key}").as_bytes());
+    let mut registry = REGISTRY
+        .get_or_init(Default::default)
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    if let Some(i) = registry.iter().position(|(k, _)| k == &hash) {
+        let entry = registry.remove(i).expect("entry exists");
+        let cooldown = entry.1.clone();
+        registry.push_back(entry);
+        return cooldown;
+    }
+    if registry.len() >= 32 {
+        registry.pop_front();
+    }
+    let cooldown = Arc::new(EndpointCooldown::default());
+    registry.push_back((hash, cooldown.clone()));
+    cooldown
+}
+
+pub async fn before_llm_request(endpoint: &str, key: &str) {
+    endpoint_cooldown(endpoint, key).wait().await;
+}
+
+pub fn after_llm_error(endpoint: &str, key: &str, err: &Error) {
+    if is_transient(err) {
+        endpoint_cooldown(endpoint, key).defer(retry_delay_for(err, 1));
+    }
+}
+
+pub fn attach_retry_after(snippet: String, headers: &reqwest::header::HeaderMap) -> String {
+    let Some(raw) = headers
+        .get(reqwest::header::RETRY_AFTER)
+        .and_then(|h| h.to_str().ok())
+    else {
+        return snippet;
+    };
+    let digits: String = raw.trim().chars().take_while(|c| c.is_ascii_digit()).collect();
+    if digits.is_empty() {
+        snippet
+    } else {
+        format!("{snippet}; retry-after: {digits}")
     }
 }
 
@@ -335,7 +445,7 @@ where
     F: FnMut() -> Fut,
     Fut: Future<Output = Result<T>>,
 {
-    let started = Instant::now();
+    let mut retry_started: Option<Instant> = None;
     let mut attempt = 0u32;
     loop {
         if cancel.is_cancelled() {
@@ -346,10 +456,15 @@ where
             Err(_) if cancel.is_cancelled() => return Err(Error::msg("aborted")),
             Err(e) if is_transient(&e) => {
                 attempt += 1;
+                // A long first request must still get a recovery window.
+                let started = retry_started.get_or_insert_with(Instant::now);
                 if started.elapsed() >= RETRY_BUDGET {
                     return Err(e);
                 }
-                let wait = retry_delay(attempt);
+                let wait = retry_delay_for(&e, attempt);
+                if wait > RETRY_BUDGET.saturating_sub(started.elapsed()) {
+                    return Err(e);
+                }
                 on_retry(attempt, wait, &e);
                 tokio::select! {
                     biased;
@@ -470,6 +585,18 @@ mod tests {
             "400 Bad Request: model not found".into()
         )));
         assert!(!is_transient(&Error::Watchdog));
+        assert!(!is_transient(&Error::Http(
+            "429 Too Many Requests: insufficient_quota".into()
+        )));
+        assert!(!is_transient(&Error::Http("余额不足".into())));
+    }
+
+    #[test]
+    fn retry_after_header_beats_exponential() {
+        let err = Error::Http("429 Too Many Requests: retry-after: 12".into());
+        assert_eq!(retry_delay_for(&err, 1).as_secs(), 12);
+        let err = Error::Http("429 retry after 8".into());
+        assert_eq!(retry_delay_for(&err, 1).as_secs(), 8);
     }
 
     #[test]
@@ -506,6 +633,30 @@ mod tests {
         let line = retry_status_line(2, Duration::from_secs(4));
         assert!(line.contains(NET_RETRY_HINT));
         assert!(line.contains("第2次"));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn slow_first_timeout_still_gets_a_retry() {
+        let mut calls = 0;
+        let result = retry_transient(
+            &CancelFlag::new(),
+            || {
+                calls += 1;
+                let first = calls == 1;
+                async move {
+                    if first {
+                        tokio::time::sleep(Duration::from_secs(1800)).await;
+                        Err(Error::Http("stream timeout".into()))
+                    } else {
+                        Ok(7)
+                    }
+                }
+            },
+            |_, _, _| {},
+        )
+        .await;
+        assert_eq!(result.unwrap(), 7);
+        assert_eq!(calls, 2);
     }
 
     #[tokio::test(start_paused = true)]

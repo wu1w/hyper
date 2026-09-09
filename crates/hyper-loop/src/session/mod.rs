@@ -640,4 +640,34 @@ mod tests {
 
         assert!(parse_slash("/mode chat").unwrap().policy().is_none());
     }
+
+    #[test]
+    fn torn_tail_recovers_but_middle_corruption_is_not_silently_discarded() {
+        use std::io::Write;
+        let dir = tmp_dir();
+        let mut log =
+            SessionLog::create_in(&dir, start("torn", SessionMode::Agent, "sys")).unwrap();
+        log.append(SessionEvent::assistant("evidence-JADE", "", None))
+            .unwrap();
+        drop(log);
+        let p = dir.join("torn.jsonl");
+        let original = fs::read(&p).unwrap();
+        fs::OpenOptions::new()
+            .append(true)
+            .open(&p)
+            .unwrap()
+            .write_all(b"{\"type\":\"assistant\",\"content\":\"")
+            .unwrap();
+        let recovered = SessionLog::open_in(&dir, "torn").unwrap();
+        assert!(recovered
+            .messages()
+            .iter()
+            .any(|m| m.text() == "evidence-JADE"));
+        assert_eq!(fs::read(&p).unwrap(), original);
+        let corrupt = [original.as_slice(), b"{not-json}\n", original.as_slice()].concat();
+        fs::write(&p, &corrupt).unwrap();
+        assert!(SessionLog::open_in(&dir, "torn").is_err());
+        assert_eq!(fs::read(&p).unwrap(), corrupt);
+        let _ = fs::remove_dir_all(dir);
+    }
 }

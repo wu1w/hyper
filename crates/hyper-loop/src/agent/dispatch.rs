@@ -412,6 +412,21 @@ impl<C: Completer> Agent<C> {
     }
 
     pub(crate) async fn execute_tools(&mut self, calls: Vec<ToolCall>) {
+        if self.persistence_error.is_some() {
+            let text = self.persist_paused_text();
+            for call in &calls {
+                self.commit_tool(
+                    &call.name,
+                    ToolResponse::text(&call.id, &text, ToolState::Interrupted),
+                );
+                self.emit_tool_lifecycle(
+                    call,
+                    ToolLifecyclePhase::Interrupted,
+                    Some(clip_lifecycle_summary(&text)),
+                );
+            }
+            return;
+        }
         if self.code_index.is_none() && calls.iter().any(needs_search_index) {
             self.start_code_index();
             self.settle_code_index().await;
@@ -620,6 +635,13 @@ impl<C: Completer> Agent<C> {
     }
 
     pub(crate) async fn gate_tool(&self, call: &ToolCall) -> Option<ToolResponse> {
+        if self.persistence_error.is_some() {
+            return Some(ToolResponse::text(
+                &call.id,
+                self.persist_paused_text(),
+                ToolState::Interrupted,
+            ));
+        }
         if let Some(denied) = crate::subagent::filter_tool(call, self.child.as_ref()) {
             return Some(denied);
         }
@@ -673,19 +695,49 @@ impl<C: Completer> Agent<C> {
         result
     }
 
+    pub(crate) fn ensure_persistence(&self) -> Result<()> {
+        match &self.persistence_error {
+            Some(error) => Err(crate::error::Error::msg(error)),
+            None => Ok(()),
+        }
+    }
+
+    fn apply_generation_room(&self) {
+        self.completer.set_output_limit(super::generation_room(
+            self.working_window,
+            self.prefix_tokens_gate(),
+        ));
+    }
+
+    fn probe_journal(&mut self) {
+        if self.persistence_error.is_some() {
+            return;
+        }
+        let Some(log) = &self.log else {
+            return;
+        };
+        if let Err(error) = std::fs::OpenOptions::new().append(true).open(log.path()) {
+            self.persistence_error = Some(format!(
+                "session persistence failed: {error}; task paused before further tools"
+            ));
+        }
+    }
+
     /// One model hop. Transient endpoint drops retry with backoff so a flaky
     /// path continues the same turn (tools already run stay) instead of erroring.
     pub(crate) async fn complete_resilient(
         &self,
         tools: Option<&[Value]>,
     ) -> Result<Option<ModelTurn>> {
-        let started = std::time::Instant::now();
+        let mut retry_started: Option<tokio::time::Instant> = None;
         let mut attempt = 0u32;
         let hop = self.model_hops.fetch_add(1, Ordering::Relaxed);
         loop {
             if self.cancel.is_cancelled() {
                 return Ok(None);
             }
+            self.ensure_persistence()?;
+            self.apply_generation_room();
             self.arm_sink();
             // Hop 0: leave execute_turn's PREPARE_HINT until the first token.
             // Later hops: clear the previous think panel. Do not paint
@@ -718,10 +770,14 @@ impl<C: Completer> Agent<C> {
                     if let Some(slot) = self.completer.speculate() {
                         slot.abort();
                     }
+                    let started = retry_started.get_or_insert_with(tokio::time::Instant::now);
                     if started.elapsed() >= crate::llm_http::RETRY_BUDGET {
                         return Err(e);
                     }
-                    let wait = crate::llm_http::retry_delay(attempt);
+                    let wait = crate::llm_http::retry_delay_for(&e, attempt);
+                    if wait > crate::llm_http::RETRY_BUDGET.saturating_sub(started.elapsed()) {
+                        return Err(e);
+                    }
                     self.signal_net_retry(attempt, wait, &e);
                     tokio::select! {
                         biased;
@@ -1508,6 +1564,14 @@ impl<C: Completer> Agent<C> {
                     ));
                     continue;
                 }
+                if self.persistence_error.is_some() {
+                    out[i] = Some(ToolResponse::text(
+                        &call.id,
+                        self.persist_paused_text(),
+                        ToolState::Interrupted,
+                    ));
+                    continue;
+                }
                 self.emit_tool_lifecycle(
                     call,
                     ToolLifecyclePhase::Started,
@@ -1519,6 +1583,7 @@ impl<C: Completer> Agent<C> {
                     self.dispatch_one(call).await
                 };
                 out[i] = Some(r);
+                self.probe_journal();
             }
         }
         if let Some(slot) = &slot {

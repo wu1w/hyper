@@ -138,12 +138,20 @@ pub async fn run_gateway(ep: ChannelEndpoint, mgr: ChannelManager) -> Result<()>
     let http = crate::llm_http::env_aware_client(20, TOKEN_URL)?;
     let bases = api_bases(&ep);
     eprintln!("hyper qq gateway starting app_id={app_id}");
+    let mut failures = 0u32;
     loop {
-        match run_once(&http, &ep, &mgr, &app_id, &secret, &bases).await {
+        let started = Instant::now();
+        let result = run_once(&http, &ep, &mgr, &app_id, &secret, &bases).await;
+        let ok = result.is_ok();
+        let (next, wait) = super::inbound::gateway_next_wait(failures, started.elapsed(), ok);
+        failures = next;
+        match result {
             Ok(()) => eprintln!("hyper qq: socket closed, reconnecting"),
-            Err(e) => eprintln!("hyper qq: {e}; retry in 2s"),
+            Err(e) => eprintln!("hyper qq: {e}; retry in {wait}s"),
         }
-        tokio::time::sleep(Duration::from_secs(2)).await;
+        if wait > 0 {
+            tokio::time::sleep(Duration::from_secs(wait)).await;
+        }
     }
 }
 
