@@ -31,7 +31,7 @@ export type PreviewKind = {
   load: () => Promise<ComponentType<PreviewProps>>;
 };
 
-function ext(path: string): string {
+export function previewExt(path: string): string {
   const n = (path.split(/[\\/]/).pop() || "").toLowerCase();
   if (n.endsWith(".canvas.json")) return ".canvas.json";
   const i = n.lastIndexOf(".");
@@ -42,21 +42,21 @@ export const KINDS: PreviewKind[] = [
   {
     id: "browser",
     label: "浏览器",
-    match: (p) => [".html", ".htm"].includes(ext(p)),
+    match: (p) => [".html", ".htm"].includes(previewExt(p)),
     editable: true,
     load: () => import("./browser").then((m) => m.BrowserPreview),
   },
   {
     id: "image",
     label: "图片",
-    match: (p) => [".png", ".jpg", ".jpeg", ".gif", ".webp", ".svg", ".bmp"].includes(ext(p)),
+    match: (p) => [".png", ".jpg", ".jpeg", ".gif", ".webp", ".svg", ".bmp"].includes(previewExt(p)),
     editable: false,
     load: () => import("./image").then((m) => m.ImagePreview),
   },
   {
     id: "word",
     label: "Word",
-    match: (p) => [".docx", ".doc", ".docm", ".odt"].includes(ext(p)),
+    match: (p) => [".docx", ".doc", ".docm", ".odt"].includes(previewExt(p)),
     editable: true,
     hint: "OnlyOffice 编辑，保留公式与原格式。",
     load: () => import("./word").then((m) => m.WordPreview),
@@ -64,7 +64,7 @@ export const KINDS: PreviewKind[] = [
   {
     id: "sheet",
     label: "表格",
-    match: (p) => [".xlsx", ".xlsm", ".xls", ".csv", ".ods"].includes(ext(p)),
+    match: (p) => [".xlsx", ".xlsm", ".xls", ".csv", ".ods"].includes(previewExt(p)),
     editable: true,
     hint: "OnlyOffice 表格（公式、多表、大表）。",
     load: () => import("./sheet").then((m) => m.SheetPreview),
@@ -72,7 +72,7 @@ export const KINDS: PreviewKind[] = [
   {
     id: "ppt",
     label: "PPT",
-    match: (p) => [".pptx", ".ppt", ".ppsx", ".pptm", ".odp"].includes(ext(p)),
+    match: (p) => [".pptx", ".ppt", ".ppsx", ".pptm", ".odp"].includes(previewExt(p)),
     editable: true,
     hint: "OnlyOffice 幻灯片。",
     load: () => import("./ppt").then((m) => m.PptPreview),
@@ -80,7 +80,7 @@ export const KINDS: PreviewKind[] = [
   {
     id: "pdf",
     label: "PDF",
-    match: (p) => ext(p) === ".pdf",
+    match: (p) => previewExt(p) === ".pdf",
     editable: true,
     hint: "OnlyOffice 可填表、批注、改 PDF。",
     load: () => import("./pdf").then((m) => m.PdfPreview),
@@ -88,14 +88,14 @@ export const KINDS: PreviewKind[] = [
   {
     id: "canvas",
     label: "画布",
-    match: (p) => ext(p) === ".canvas.json",
+    match: (p) => previewExt(p) === ".canvas.json",
     editable: true,
     load: () => import("./canvas").then((m) => m.CanvasPreview),
   },
   {
     id: "visio",
     label: "Visio",
-    match: (p) => [".vsd", ".vsdx"].includes(ext(p)),
+    match: (p) => [".vsd", ".vsdx"].includes(previewExt(p)),
     editable: false,
     hint: "vsdx 显示页面大纲；旧版 .vsd 是二进制，请另存为 vsdx。",
     load: () => import("./visio").then((m) => m.VisioPreview),

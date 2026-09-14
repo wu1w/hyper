@@ -137,6 +137,41 @@ export type RunPhase =
   | "retrying"
   | "preparing";
 
+export const PHASE_LABEL: Record<RunPhase, string> = {
+  idle: "空闲",
+  waiting: "等待模型",
+  thinking: "思考中",
+  writing: "生成中",
+  tool: "调用工具",
+  permit: "等待审批",
+  clarify: "AskQuestion",
+  stopping: "正在停止",
+  retrying: "正在重连",
+  preparing: "准备中",
+};
+
+export function fmtElapsed(s: number) {
+  if (s < 60) return `${s}s`;
+  const m = Math.floor(s / 60);
+  const r = s % 60;
+  return `${m}:${r.toString().padStart(2, "0")}`;
+}
+
+export function callLabelOf(phase: RunPhase, imagine: boolean, waitPrefix: number): string {
+  if (
+    phase === "stopping" ||
+    phase === "permit" ||
+    phase === "clarify" ||
+    phase === "retrying" ||
+    phase === "preparing"
+  ) {
+    return PHASE_LABEL[phase];
+  }
+  if (imagine && (phase === "waiting" || phase === "writing")) return "正在生成图片";
+  if (waitPrefix > 0) return `正在调用模型 · ${waitPrefix.toLocaleString()} tokens`;
+  return "正在调用模型";
+}
+
 export function runPhase(opts: {
   busy: boolean;
   aborting?: boolean;

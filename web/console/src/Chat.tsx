@@ -20,7 +20,10 @@ import {
   type Uploaded,
 } from "./api";
 import {
+  callLabelOf,
   editDiffFromTool,
+  fmtElapsed,
+  PHASE_LABEL,
   runPhase,
   stripLeakedToolMarkup,
   stripThinkRestatement,
@@ -28,7 +31,7 @@ import {
   type EditDiffView,
   type RunPhase,
 } from "./chat-live";
-import { isJunkPath, lastLiveUserIndex, mergeArtifactLists, siblingStamp, turnArtifacts, turnEditedPaths, turnPreviewPaths, turnTouchedPaths } from "./artifacts";
+import { lastLiveUserIndex, mergeArtifactLists, siblingStamp, turnArtifacts, turnEditedPaths, turnPreviewPaths, turnTouchedPaths } from "./artifacts";
 import { parseTreeEntry, WorkspaceTree, type TreeEntry } from "./tree";
 import { isOfficeKind, kindFor } from "./preview/kinds";
 import { PreviewDock } from "./preview/PreviewDock";
@@ -49,86 +52,48 @@ import {
   userMediaFromEvent,
   type StoredMedia,
 } from "./media";
+import {
+  agentStatusLabel,
+  attachPayload,
+  cacheHitLabel,
+  clipEnd,
+  composerHintLine,
+  composerKeyPlan,
+  composerPlaceholder,
+  detailsRailClass,
+  detailsRailStyle,
+  editorPayload,
+  firstLine,
+  fmtTokS,
+  fuzzyFiles,
+  hiddenNote,
+  imeBusy,
+  insertAtCaret,
+  isAskTool,
+  isHarnessNote,
+  isHostImageTool,
+  isTaskTool,
+  isTodoTool,
+  mentionToken,
+  parseJsonObj,
+  parseTaskOutput,
+  pickAgentStatus,
+  previewPathsOf,
+  quietStopReason,
+  sendButtonLabel,
+  stepStatusOf,
+  thinkTail,
+  toolBadge,
+  toolKey,
+  toolLabel,
+  waitPrefixBit,
+  windowGauge,
+} from "./chat-model";
 
 export type { RunPhase };
 export { runPhase };
 
-/** IME confirm (Enter / 选词) must not send the message. keyCode 229 is the composition sentinel. */
-function imeBusy(e: { nativeEvent: { isComposing?: boolean }; isComposing?: boolean; keyCode: number }) {
-  return e.isComposing === true || e.nativeEvent.isComposing === true || e.keyCode === 229;
-}
-
 type FileHit = TreeEntry;
-
-function fuzzyScore(query: string, text: string): number | null {
-  const q = query.toLowerCase();
-  const t = text.toLowerCase();
-  if (!q) return 0;
-  const hit = t.indexOf(q);
-  if (hit >= 0) return 2000 - hit * 3 - Math.max(0, t.length - q.length);
-  let qi = 0;
-  let score = 0;
-  let run = 0;
-  for (let i = 0; i < t.length && qi < q.length; i++) {
-    if (t[i] === q[qi]) {
-      run++;
-      score += 8 + run * 4;
-      qi++;
-    } else run = 0;
-  }
-  return qi === q.length ? score : null;
-}
-
-function fuzzyFiles(entries: FileHit[], query: string): FileHit[] {
-  const q = query.trim().toLowerCase();
-  const scored: Array<{ hit: FileHit; score: number }> = [];
-  for (const hit of entries) {
-    if (isJunkPath(hit.path) || isJunkPath(hit.name)) continue;
-    let score: number | null;
-    if (!q) score = (hit.dir ? 0 : 80) - Math.min(80, hit.path.length);
-    else score = fuzzyScore(q, hit.path) ?? fuzzyScore(q, hit.name);
-    if (score == null) continue;
-    scored.push({ hit, score });
-  }
-  scored.sort((a, b) => b.score - a.score || a.hit.path.length - b.hit.path.length);
-  return scored.slice(0, 12).map((s) => s.hit);
-}
-
-/** `@token` at the cursor — not a leading slash command, token has no spaces. */
-function mentionToken(text: string, cursor: number): { start: number; end: number; query: string } | null {
-  if (text.startsWith("/")) return null;
-  const at = text.slice(0, cursor).lastIndexOf("@");
-  if (at < 0) return null;
-  if (/\s/.test(text.slice(at + 1, cursor))) return null;
-  if (at > 0 && !/[\s(\[{,:;'"`、]/.test(text[at - 1])) return null;
-  let end = cursor;
-  while (end < text.length && !/\s/.test(text[end])) end++;
-  return { start: at, end, query: text.slice(at + 1, end) };
-}
-
-function attachPayload(raw: string, atts: Uploaded[]) {
-  const parts: unknown[] = [];
-  const notes: string[] = [];
-  for (const f of atts) {
-    if (f.content_part && (f.kind === "image" || f.kind === "video" || f.kind === "audio")) {
-      parts.push(f.content_part);
-    } else notes.push(f.path);
-  }
-  let prompt = raw;
-  if (notes.length) prompt = `${prompt ? prompt + "\n\n" : ""}${notes.map((p) => `[attached: ${p}]`).join("\n")}`;
-  return { prompt: prompt || " ", content_parts: parts };
-}
-
-function editorPayload(previewPath: string) {
-  const path = previewPath.trim().replace(/^\/+/, "");
-  if (!path) return { files: [] as { path: string }[] };
-  return { active: path, files: [{ path }] };
-}
-
-function insertAtCaret(current: string, insert: string, start: number, end: number): { next: string; caret: number } {
-  const next = current.slice(0, start) + insert + current.slice(end);
-  return { next, caret: start + insert.length };
-}
 
 function MediaStrip({ items, onOpen }: { items: StoredMedia[]; onOpen?: (path: string) => void }) {
   if (!items.length) return null;
@@ -200,75 +165,7 @@ async function copyText(text: string): Promise<boolean> {
   }
 }
 
-function fmtTokS(n: number): string {
-  if (n >= 100) return `${Math.round(n)} tok/s`;
-  if (n >= 10) return `${n.toFixed(1)} tok/s`;
-  return `${n.toFixed(2)} tok/s`;
-}
-
-function toolBadge(name: string) {
-  const n = name.toLowerCase().replace(/_/g, "");
-  if (n === "read" || n === "view" || n === "recall" || n === "memorysearch") return "read";
-  if (n === "edit" || n === "strreplace") return "edit";
-  if (n === "write" || n === "delete") return "write";
-  return "bash";
-}
-
-function toolKey(name: string): string {
-  return (name || "").toLowerCase().replace(/_/g, "");
-}
-
-function isTodoTool(name: string): boolean {
-  const n = toolKey(name);
-  return n === "todowrite" || n === "todo";
-}
-
-function isTaskTool(name: string): boolean {
-  const n = toolKey(name);
-  return n === "task" || n === "spawnsubagent";
-}
-
-function parseTaskOutput(out: string): { id?: string; status?: string } {
-  const bg = out.match(/^BACKGROUND\s+(\S+)/m);
-  if (bg) return { id: bg[1], status: "running" };
-  const st = out.match(/^STATUS\s+(\S+)\s+id=(\S+)/m);
-  if (st) return { status: st[1], id: st[2] };
-  return {};
-}
-
-function agentStatusLabel(status?: string): string {
-  const s = (status || "").toLowerCase();
-  if (s === "running") return "运行中";
-  if (s === "done" || s === "completed") return "已完成";
-  if (s === "failed") return "失败";
-  if (s === "cancelled" || s === "canceled") return "已取消";
-  return status || "";
-}
-
-function isAskTool(name: string): boolean {
-  const n = toolKey(name);
-  return n === "askquestion" || n === "ask";
-}
-
-function isHostImageTool(name: string): boolean {
-  return toolKey(name) === "imagegeneration";
-}
-
-function toolLabel(name: string): string {
-  if (isHostImageTool(name)) return "生成图片";
-  return name;
-}
-
 type TodoItem = { id?: string; content: string; status?: string };
-
-function parseJsonObj(raw: string): Record<string, unknown> | null {
-  try {
-    const v = JSON.parse(raw || "{}") as unknown;
-    return v && typeof v === "object" && !Array.isArray(v) ? (v as Record<string, unknown>) : null;
-  } catch {
-    return null;
-  }
-}
 
 function parseTodos(raw: string): TodoItem[] {
   const a = parseJsonObj(raw);
@@ -375,26 +272,6 @@ function livePromptTokens(events: SessionEvent[], snap?: Snap): number {
 function compactCount(events: SessionEvent[], snap?: Snap): number {
   const n = events.filter((e) => e.type === "session/compact").length;
   return n || usageCompacts(snap?.usage);
-}
-
-export const PHASE_LABEL: Record<RunPhase, string> = {
-  idle: "空闲",
-  waiting: "等待模型",
-  thinking: "思考中",
-  writing: "生成中",
-  tool: "调用工具",
-  permit: "等待审批",
-  clarify: "AskQuestion",
-  stopping: "正在停止",
-  retrying: "正在重连",
-  preparing: "准备中",
-};
-
-export function fmtElapsed(s: number) {
-  if (s < 60) return `${s}s`;
-  const m = Math.floor(s / 60);
-  const r = s % 60;
-  return `${m}:${r.toString().padStart(2, "0")}`;
 }
 
 export function RunChip({
@@ -1271,12 +1148,10 @@ export function ChatPage({
   const eventArts = useMemo(() => turnArtifacts(events, snap.workspace), [events, snap.workspace]);
   const arts = useMemo(() => mergeArtifactLists(diskOut, eventArts), [diskOut, eventArts]);
   const edited = useMemo(() => turnEditedPaths(events, snap.workspace), [events, snap.workspace]);
-  const previewList = useMemo(() => {
-    const products = arts;
-    if (products.length) return products;
-    if (edited.length) return edited;
-    return turnPreviewPaths(events, snap.workspace);
-  }, [arts, edited, events, snap.workspace]);
+  const previewList = useMemo(
+    () => previewPathsOf(arts, edited, turnPreviewPaths(events, snap.workspace)),
+    [arts, edited, events, snap.workspace],
+  );
   const touched = useMemo(() => turnTouchedPaths(events, snap.workspace), [events, snap.workspace]);
   const liveUser = useMemo(() => lastLiveUserIndex(events), [events]);
   const dockRev = useMemo(() => siblingStamp(previewPath, touched), [previewPath, touched]);
@@ -1377,26 +1252,18 @@ export function ChatPage({
   const usage = snap.usage;
   const win = snap.window || 0;
   const used = livePromptTokens(events, snap);
-  const rawPct = win ? Math.round((used / win) * 100) : 0;
-  const pct = Math.min(100, Math.max(0, rawPct));
+  const { rawPct, pct } = windowGauge(used, win);
   const compacts = compactCount(events, snap);
   const hitPct = usageHitPct(usage);
-  const hit = usageCachedReported(usage) && hitPct != null ? `${hitPct.toFixed(1)}%` : "n/a";
+  const hit = cacheHitLabel(usageCachedReported(usage), hitPct);
   const queued = snap.queued ?? 0;
   const steered = snap.steered ?? 0;
   const policy = snap.busy || "steer";
   const phase = runPhase({ busy, aborting, live, events, permit, clarify });
   const waitPrefix =
     phase === "waiting" ? usageLivePrompt(usage) : 0;
-  const waitPrefixBit = waitPrefix > 0 ? ` · ${waitPrefix} tokens` : "";
-  const callLabel =
-    phase === "stopping" || phase === "permit" || phase === "clarify" || phase === "retrying" || phase === "preparing"
-      ? PHASE_LABEL[phase]
-      : snap.imagine_mode && (phase === "waiting" || phase === "writing")
-        ? "正在生成图片"
-        : waitPrefix > 0
-          ? `正在调用模型 · ${waitPrefix.toLocaleString()} tokens`
-          : "正在调用模型";
+  const waitPrefixBitText = waitPrefixBit(waitPrefix);
+  const callLabel = callLabelOf(phase, !!snap.imagine_mode, waitPrefix);
 
   /** 把流式中的思考/正文合并进最后一轮：思考进轨迹块，正文在下方流式生长。 */
   const withLive = (blocks: Block[]): Block[] => {
@@ -1618,30 +1485,8 @@ export function ChatPage({
     }
   };
 
-  const sendLabel = !busy
-    ? snap.imagine_mode
-      ? "生成"
-      : "发送"
-    : policy === "queue"
-      ? "排队"
-      : policy === "steer"
-        ? "转向"
-        : "打断";
-  const placeholder = snap.imagine_mode && !busy
-    ? "描述要生成的图片… Enter 调用生图端点"
-    : !busy
-    ? "给 grok-hyper 发消息…  / 唤起命令，粘贴图片走上传"
-    : policy === "queue"
-      ? "本轮结束后会跑这段话…"
-      : policy === "steer"
-        ? "下一个安全工具边界会吸收这段引导…"
-        : "发送将打断当前轮次并改跑这段话…";
-  const policyHint =
-    policy === "queue"
-      ? "忙碌策略 queue：Enter 排到本轮之后"
-      : policy === "steer"
-        ? "忙碌策略 steer：Enter 在下一个安全工具边界注入"
-        : "忙碌策略 interrupt：Enter 打断本轮";
+  const sendLabel = sendButtonLabel(busy, policy, !!snap.imagine_mode);
+  const placeholder = composerPlaceholder(busy, policy, !!snap.imagine_mode);
 
   return (
       <div className={`page chat-page${previewMax ? " pv-maxed" : ""}`}
@@ -1796,7 +1641,7 @@ export function ChatPage({
                   <span>
                     {snap.model || "model"}
                     {elapsed > 0 ? ` · ${fmtElapsed(elapsed)}` : ""}
-                    {waitPrefixBit}
+                    {waitPrefixBitText}
                     {policy !== "interrupt" ? ` · busy ${policy}` : ""}
                   </span>
                 </div>
@@ -1939,55 +1784,36 @@ export function ChatPage({
                   if (!el.value.startsWith("/")) refreshPickers(el.value, el.selectionStart ?? el.value.length);
                 }}
                 onKeyDown={(e) => {
-                  if (imeBusy(e) || imeLock.current) return;
-                  if (slash.length && e.key === "Escape") {
-                    e.preventDefault();
-                    setSlash([]);
-                    return;
-                  }
-                  if (mentions.length && e.key === "Escape") {
-                    e.preventDefault();
-                    setMentions([]);
-                    return;
-                  }
-                  if (slash.length && (e.key === "ArrowDown" || e.key === "ArrowUp")) {
-                    e.preventDefault();
+                  const plan = composerKeyPlan({
+                    composing: imeBusy(e) || imeLock.current,
+                    key: e.key,
+                    shiftKey: e.shiftKey,
+                    slashN: slash.length,
+                    mentionN: mentions.length,
+                    typed: text.trim(),
+                    slashCmd: slash[slashSel]?.[0],
+                  });
+                  if (plan.act === "skip") return;
+                  e.preventDefault();
+                  if (plan.act === "clearSlash") setSlash([]);
+                  else if (plan.act === "clearMentions") setMentions([]);
+                  else if (plan.act === "navSlash") {
                     setSlashSel((s) =>
-                      e.key === "ArrowDown" ? Math.min(slash.length - 1, s + 1) : Math.max(0, s - 1),
+                      plan.dir === 1 ? Math.min(slash.length - 1, s + 1) : Math.max(0, s - 1),
                     );
-                    return;
-                  }
-                  if (mentions.length && (e.key === "ArrowDown" || e.key === "ArrowUp")) {
-                    e.preventDefault();
+                  } else if (plan.act === "navMentions") {
                     setMentionSel((s) =>
-                      e.key === "ArrowDown" ? Math.min(mentions.length - 1, s + 1) : Math.max(0, s - 1),
+                      plan.dir === 1 ? Math.min(mentions.length - 1, s + 1) : Math.max(0, s - 1),
                     );
-                    return;
-                  }
-                  if (slash.length && e.key === "Tab") {
-                    e.preventDefault();
-                    applySlash(slash[slashSel][0]);
-                    return;
-                  }
-                  if (mentions.length && e.key === "Tab") {
-                    e.preventDefault();
-                    applyMention(mentions[mentionSel]);
-                    return;
-                  }
-                  if (e.key === "Enter" && !e.shiftKey) {
-                    e.preventDefault();
-                    if (slash.length) {
-                      // 敲全命令（含带参数）直接回车执行；半截命令先补全。
-                      const cmd = slash[slashSel][0];
-                      const typed = text.trim();
-                      if (typed === cmd || typed.startsWith(`${cmd} `)) {
-                        setSlash([]);
-                        send();
-                      } else applySlash(cmd);
-                    } else if (mentions.length) {
-                      applyMention(mentions[mentionSel]);
-                    } else send();
-                  }
+                  } else if (plan.act === "applySlash") applySlash(slash[slashSel][0]);
+                  else if (plan.act === "applyMention") applyMention(mentions[mentionSel]);
+                  else if (plan.act === "enterSlash") {
+                    if (plan.full) {
+                      setSlash([]);
+                      send();
+                    } else applySlash(slash[slashSel][0]);
+                  } else if (plan.act === "enterMention") applyMention(mentions[mentionSel]);
+                  else send();
                 }}
                 onCompositionStart={() => {
                   imeLock.current = true;
@@ -2052,11 +1878,7 @@ export function ChatPage({
                 ) : null}
                 <span className="spacer" style={{ flex: 1 }} />
                 <span className="composer-hint">
-                  {busy
-                    ? `${policyHint} · 也可点停止 / 转向 / 排队`
-                    : snap.imagine_mode
-                      ? "Enter 生成图片 · Shift+Enter 换行"
-                      : "Enter 发送 · Shift+Enter 换行"}
+                  {composerHintLine(busy, policy, !!snap.imagine_mode)}
                 </span>
                 <button
                   type="button"
@@ -2154,8 +1976,13 @@ export function ChatPage({
         ) : null}
       </div>
       <aside
-        className={`details${detailsOpen ? "" : " closed"}${detailsTab === "agent" || (previewPath && detailsTab === "preview") ? " wide" : ""}${previewMax ? " pv-fill" : ""}${detailsTab === "agent" ? " agent-open" : ""}`}
-        style={detailsOpen && (detailsTab === "agent" || (previewPath && detailsTab === "preview")) && !previewMax ? { width: railWidth, flex: "0 0 auto" } : undefined}
+        className={detailsRailClass({
+          open: detailsOpen,
+          tab: detailsTab,
+          previewPath,
+          previewMax,
+        })}
+        style={detailsRailStyle(detailsOpen, detailsTab, previewPath, previewMax, railWidth)}
       >
         <div
           className="dt-split"
@@ -2354,48 +2181,6 @@ export function ChatPage({
 }
 
 /* ── 轮次分组：把会话事件折成「用户消息 + 轨迹块 + 正文」 ────────── */
-
-const HIDE_OPEN = "<tool_response>";
-const HIDE_CLOSE = "</tool_response>";
-
-/** Harness 注入的隐藏注记（守卫、提示、转向）以 tool_response 包裹存进 user 事件。 */
-function hiddenNote(text: string): string | null {
-  const t = text.trim();
-  if (!t.startsWith(HIDE_OPEN) || !t.endsWith(HIDE_CLOSE)) return null;
-  const inner = t
-    .slice(HIDE_OPEN.length, Math.max(HIDE_OPEN.length, t.length - HIDE_CLOSE.length))
-    .trim();
-  if (isHarnessNote(inner)) return "";
-  return inner;
-}
-
-function isHarnessNote(s: string): boolean {
-  return /\[(trajectory|locate|out|web|doc-read|oracle|baseline|style|cron|compact|verify:numeric|guard|background)\b/i.test(
-    s,
-  ) || s.startsWith("HYPER_WORKING_WINDOW=") || /^MEMORY(\.md| hot| hosts)/.test(s);
-}
-
-function firstLine(s: string): string {
-  for (const line of s.split("\n")) {
-    const t = line.trim();
-    if (t) return t;
-  }
-  return "";
-}
-
-function clipEnd(s: string, n: number): string {
-  const cs = [...s];
-  return cs.length <= n ? s : `${cs.slice(0, n - 1).join("")}…`;
-}
-
-/** 直播思考里“正在说的那句话”：取末行的尾段。 */
-function thinkTail(s: string): string {
-  const t = s.trimEnd();
-  const nl = t.lastIndexOf("\n");
-  const line = (nl >= 0 ? t.slice(nl + 1) : t).trim();
-  const cs = [...line];
-  return cs.length <= 64 ? line : `…${cs.slice(-63).join("")}`;
-}
 
 type ToolStep = {
   kind: "tool";
@@ -2696,14 +2481,6 @@ function dropHostImageToolIfShot(turn: TurnGroup) {
       };
     })
     .filter((b) => b.kind !== "activity" || b.steps.length > 0);
-}
-
-function pickAgentStatus(rpc?: string | null, card?: string, eventCount = 0): string {
-  if (rpc === "running") return "running";
-  if (card === "failed" || card === "cancelled") return card;
-  if (rpc) return rpc;
-  if (card) return card;
-  return eventCount > 0 ? "done" : "done";
 }
 
 function AgentDock({
@@ -3084,18 +2861,6 @@ function argPreview(name: string, raw: string): string {
   }
 }
 
-function quietStopReason(reason: string): boolean {
-  const r = reason.trim();
-  if (!r || r === "stop" || r === "done" || r === "end_turn") return true;
-  if (r === "parse failed") return true;
-  if (r.startsWith("budget:")) return true;
-  if (r.includes("Max iterations")) return true;
-  if (r.includes("time limit")) return true;
-  if (r.includes("Token budget")) return true;
-  if (r.includes("call budget")) return true;
-  return false;
-}
-
 function toolIcon(name: string): string {
   const n = toolKey(name);
   if (n === "read" || n === "view") return "book";
@@ -3109,14 +2874,6 @@ function toolIcon(name: string): string {
   if (n === "imagegeneration") return "image";
   if (n === "todowrite" || n === "todo" || n === "askquestion" || n === "ask") return "list";
   return "wrench";
-}
-
-function stepStatus(s: ToolStep): "run" | "ok" | "err" | "warn" {
-  if (!s.done) return "run";
-  const out = (s.output || "").trimStart();
-  if (out === "tool task aborted") return "warn";
-  if (/^(error|错误)/i.test(out)) return "err";
-  return "ok";
 }
 
 function fmtArgs(raw: string): string {
@@ -3236,7 +2993,7 @@ function StepRow({
       </div>
     );
   }
-  const st = stepStatus(step);
+  const st = stepStatusOf(step.done, step.output);
   const todoItems = isTodoTool(step.name)
     ? parseTodos(step.args).length
       ? parseTodos(step.args)

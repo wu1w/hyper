@@ -1,12 +1,15 @@
 import assert from "node:assert/strict";
 import {
   applyHistoryIncoming,
+  callLabelOf,
   coversLive,
   editDiffFromTool,
   editDiffLines,
+  fmtElapsed,
   isPrepareHint,
   lastAssistantContent,
   lastAssistantInCurrentTurn,
+  PHASE_LABEL,
   preferFresherHistory,
   runPhase,
   stripLeakedToolJson,
@@ -36,6 +39,7 @@ assert.equal(lastAssistantInCurrentTurn([user]), "");
   assert.equal(coversLive([user], { think: "正在连接模型…\n", content: "" }), false);
   assert.equal(coversLive([user, hop], { think: "正在连接模型…\n", content: "" }), true);
   assert.equal(coversLive([user, hop], { think: "计划先读入口。", content: "" }), false);
+  assert.equal(coversLive([], { think: "", content: "" }), true);
 }
 
 {
@@ -199,3 +203,11 @@ assert.equal(isPrepareHint("hmm, the user asked…"), false);
   ]);
   assert.equal(editDiffFromTool("Read", JSON.stringify({ path: "a.txt" })), null);
 }
+
+assert.equal(fmtElapsed(5), "5s");
+assert.equal(fmtElapsed(65), "1:05");
+assert.equal(PHASE_LABEL.waiting, "等待模型");
+assert.equal(callLabelOf("stopping", false, 0), "正在停止");
+assert.equal(callLabelOf("waiting", true, 0), "正在生成图片");
+assert.ok(callLabelOf("waiting", false, 1200).includes("tokens"));
+assert.equal(callLabelOf("writing", false, 0), "正在调用模型");

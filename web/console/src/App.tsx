@@ -1,27 +1,28 @@
-import { useEffect, useRef, useState, type ReactNode } from "react";
+import { useEffect, useRef, useState } from "react";
 import { api, connectEvents, rpc, type Clarify, type Permit, type SessionEvent, type Snap } from "./api";
-import { applyHistoryIncoming, PREPARE_HINT, isPrepareHint, nextLive, preferFresherHistory, runPhase } from "./chat-live";
-
-type LiveBuf = { think: string; content: string };
-type Transcript = { events: SessionEvent[]; live: LiveBuf };
-
-function emptyLive(): LiveBuf {
-  return { think: "", content: "" };
-}
-
-function applyDelta(live: LiveBuf, e: SessionEvent): LiveBuf {
-  if (e.reset) {
-    if (e.content_only) return { ...live, content: "" };
-    return emptyLive();
-  }
-  if (e.channel === "reasoning") return { ...live, think: live.think + (e.text || "") };
-  return { ...live, content: live.content + (e.text || "") };
-}
-
-function modalForFocus<T extends { session?: string } | null>(item: T, focused?: string): T | null {
-  if (!item || !item.session || !focused || item.session === focused) return item;
-  return null;
-}
+import {
+  FOOT,
+  NAV,
+  TITLES,
+  detailsOpenFromStore,
+  linkChipClass,
+  linkDotClass,
+  modelLinkLabel,
+  pageFromHash,
+  type PageId,
+} from "./app-nav";
+import { KeepPane, Titlebar } from "./app-chrome";
+import {
+  beginTurnLive,
+  emptyLive,
+  failTurnLive,
+  handleConsoleRpc,
+  modalForFocus,
+  parkReload,
+  type RpcCtx,
+  type Transcript,
+} from "./app-session";
+import { PREPARE_HINT, isPrepareHint, nextLive, preferFresherHistory, runPhase } from "./chat-live";
 import { ChatPage, ClarifyModal, PermitModal, RunChip } from "./Chat";
 import {
   ChannelsPage,
@@ -40,171 +41,24 @@ import {
 import { DialogHost, HoleMark, Icon } from "./ui";
 import hyperWordmark from "./assets/hyper-wordmark.png";
 
-function isWinDesktop() {
-  return window.grokHyperDesktop?.platform === "win32";
-}
-
-function WinCaptionIcon({ kind }: { kind: "min" | "max" | "close" }) {
-  if (kind === "min") {
-    return (
-      <svg viewBox="0 0 10 10" aria-hidden>
-        <rect x="1" y="4.5" width="8" height="1" rx="0.2" />
-      </svg>
-    );
-  }
-  if (kind === "max") {
-    return (
-      <svg viewBox="0 0 10 10" aria-hidden>
-        <rect x="1.5" y="1.5" width="7" height="7" fill="none" stroke="currentColor" strokeWidth="1" />
-      </svg>
-    );
-  }
-  return (
-    <svg viewBox="0 0 10 10" aria-hidden>
-      <path d="M2 2 L8 8 M8 2 L2 8" fill="none" stroke="currentColor" strokeWidth="1.15" />
-    </svg>
-  );
-}
-
-function WindowButtons() {
-  const desktop = window.grokHyperDesktop;
-  if (!desktop) {
-    return (
-      <div className="traffic" aria-hidden>
-        <span className="tl-r" />
-        <span className="tl-y" />
-        <span className="tl-g" />
-      </div>
-    );
-  }
-  const win = desktop.platform === "win32";
-  return (
-    <div className="traffic">
-      {win ? (
-        <>
-          <button type="button" className="tl-y" aria-label="最小化" onClick={() => desktop.minimize()}>
-            <WinCaptionIcon kind="min" />
-          </button>
-          <button type="button" className="tl-g" aria-label="最大化" onClick={() => desktop.toggleMaximize()}>
-            <WinCaptionIcon kind="max" />
-          </button>
-          <button type="button" className="tl-r" aria-label="关闭" onClick={() => desktop.close()}>
-            <WinCaptionIcon kind="close" />
-          </button>
-        </>
-      ) : (
-        <>
-          <button type="button" className="tl-r" aria-label="关闭" onClick={() => desktop.close()} />
-          <button type="button" className="tl-y" aria-label="最小化" onClick={() => desktop.minimize()} />
-          <button type="button" className="tl-g" aria-label="最大化" onClick={() => desktop.toggleMaximize()} />
-        </>
-      )}
-    </div>
-  );
-}
-
-/** 右侧状态栏默认态：宽屏展开，窄屏收起；用户手动切换后记住偏好。 */
 function initialDetails(): boolean {
-  const saved = localStorage.getItem("hyper.details.open");
-  if (saved === "1") return true;
-  if (saved === "0") return false;
-  return window.matchMedia("(min-width: 1181px)").matches;
-}
-
-export type PageId =
-  | "chat"
-  | "inbox"
-  | "channels"
-  | "sessions"
-  | "cron"
-  | "heartbeat"
-  | "files"
-  | "skills"
-  | "mcp"
-  | "tools"
-  | "settings"
-  | "security"
-  | "usage";
-
-const NAV: Array<{ group: string; items: Array<{ id: PageId; label: string; icon: string; badge?: boolean }> }> = [
-  {
-    group: "主页",
-    items: [
-      { id: "chat", label: "聊天", icon: "chat" },
-      { id: "channels", label: "频道", icon: "radio" },
-      { id: "files", label: "文件", icon: "folder" },
-      { id: "cron", label: "定时任务", icon: "clock" },
-      { id: "heartbeat", label: "心跳", icon: "pulse" },
-    ],
-  },
-  {
-    group: "工作区",
-    items: [
-      { id: "inbox", label: "收件箱", icon: "shield", badge: true },
-      { id: "sessions", label: "会话", icon: "list" },
-      { id: "skills", label: "技能", icon: "spark" },
-      { id: "mcp", label: "MCP", icon: "plug" },
-      { id: "tools", label: "工具", icon: "wrench" },
-    ],
-  },
-];
-
-const FOOT: Array<{ id: PageId; label: string; icon: string }> = [
-  { id: "settings", label: "模型", icon: "cpu" },
-  { id: "security", label: "安全", icon: "lock" },
-  { id: "usage", label: "用量", icon: "chart" },
-];
-
-const TITLES: Record<PageId, string> = {
-  chat: "聊天",
-  inbox: "收件箱",
-  channels: "频道",
-  sessions: "会话",
-  cron: "定时任务",
-  heartbeat: "心跳",
-  files: "文件",
-  skills: "技能",
-  mcp: "MCP",
-  tools: "工具",
-  settings: "模型",
-  security: "安全",
-  usage: "用量",
-};
-
-function pageFromHash(): PageId {
-  const h = location.hash.replace(/^#/, "") as PageId;
-  if (h && TITLES[h]) return h;
-  return "chat";
-}
-
-function KeepPane({
-  id,
-  page,
-  seen,
-  children,
-}: {
-  id: PageId;
-  page: PageId;
-  seen: Set<PageId>;
-  children: ReactNode;
-}) {
-  if (page !== id && !seen.has(id)) return null;
-  return (
-    <div className="main-pane" hidden={page !== id} aria-hidden={page !== id}>
-      {children}
-    </div>
+  return detailsOpenFromStore(
+    localStorage.getItem("hyper.details.open"),
+    window.matchMedia("(min-width: 1181px)").matches,
   );
 }
+
+export type { PageId };
 
 export function App() {
-  const [page, setPage] = useState<PageId>(pageFromHash);
-  const [seen, setSeen] = useState<Set<PageId>>(() => new Set(["chat", pageFromHash()]));
+  const [page, setPage] = useState<PageId>(() => pageFromHash(location.hash));
+  const [seen, setSeen] = useState<Set<PageId>>(() => new Set(["chat", pageFromHash(location.hash)]));
   const [rail, setRail] = useState(false);
   const [details, setDetails] = useState(initialDetails);
   const [wsUp, setWsUp] = useState(true);
   const [snap, setSnap] = useState<Snap>({});
   const [events, setEvents] = useState<SessionEvent[]>([]);
-  const [live, setLive] = useState({ think: "", content: "" });
+  const [live, setLive] = useState(emptyLive);
   const [permit, setPermit] = useState<Permit>(null);
   const [clarify, setClarify] = useState<Clarify>(null);
   const [elapsed, setElapsed] = useState(0);
@@ -230,13 +84,12 @@ export function App() {
     setClarify(modalForFocus(st.clarify ?? null, st.session));
     const h = await api<{ events: SessionEvent[] }>("/history");
     const incoming = h.events || [];
-    const switched = !!st.session && !!prevSess && st.session !== prevSess;
     const parked = st.session ? transcriptsRef.current[st.session] : undefined;
-    const next = applyHistoryIncoming(parked?.events || incoming, incoming, switched);
-    setEvents(next);
+    const next = parkReload(prevSess, st, incoming, parked);
+    setEvents(next.events);
     setLive((l) => {
-      const liveNext = switched ? emptyLive() : nextLive(next, parked?.live || l);
-      if (st.session) transcriptsRef.current[st.session] = { events: next, live: liveNext };
+      const liveNext = next.switched ? emptyLive() : nextLive(next.events, parked?.live || l);
+      if (st.session) transcriptsRef.current[st.session] = { events: next.events, live: liveNext };
       return liveNext;
     });
   };
@@ -250,7 +103,7 @@ export function App() {
   const beginTurn = () => {
     setPendingTurn(true);
     setLive((l) => {
-      const next = l.think || l.content ? l : { think: PREPARE_HINT, content: "" };
+      const next = beginTurnLive(l, PREPARE_HINT);
       const id = sessionRef.current;
       if (id) {
         const t = transcriptsRef.current[id] || { events: [], live: emptyLive() };
@@ -263,7 +116,7 @@ export function App() {
   const failTurn = () => {
     setPendingTurn(false);
     setLive((l) => {
-      const next = isPrepareHint(l.think) && !l.content ? emptyLive() : l;
+      const next = failTurnLive(l, isPrepareHint);
       const id = sessionRef.current;
       if (id) {
         const t = transcriptsRef.current[id];
@@ -280,7 +133,7 @@ export function App() {
   };
 
   useEffect(() => {
-    const onHash = () => setPage(pageFromHash());
+    const onHash = () => setPage(pageFromHash(location.hash));
     window.addEventListener("hashchange", onHash);
     return () => window.removeEventListener("hashchange", onHash);
   }, []);
@@ -339,156 +192,20 @@ export function App() {
           });
       }, 80);
     };
-    const stop = connectEvents(
-      (msg) => {
-        if (msg.method === "hello") {
-          const p = msg.params as {
-            state?: Snap;
-            events?: SessionEvent[];
-            permit?: Permit;
-            clarify?: Clarify;
-          };
-          const st = p.state || {};
-          setSnap(st);
-          if (p.events) setEvents(p.events);
-          setPermit(modalForFocus(p.permit ?? null, st.session));
-          setClarify(modalForFocus(p.clarify ?? null, st.session));
-          cancelLiveRaf();
-          setLive(emptyLive());
-          setPendingTurn(false);
-          if (st.session) {
-            transcriptsRef.current[st.session] = { events: p.events || [], live: emptyLive() };
-          }
-        } else if (msg.method === "resync") {
-          const p = msg.params as {
-            state?: Snap;
-            events?: SessionEvent[];
-            permit?: Permit;
-            clarify?: Clarify;
-          };
-          if (p.state) setSnap(p.state);
-          const focused = p.state?.session || sessionRef.current;
-          setPermit(modalForFocus(p.permit ?? null, focused));
-          setClarify(modalForFocus(p.clarify ?? null, focused));
-          if (Array.isArray(p.events)) {
-            const incoming = p.events;
-            const id = focused;
-            const parked = id ? transcriptsRef.current[id] : undefined;
-            const next = preferFresherHistory(parked?.events || incoming, incoming);
-            cancelLiveRaf();
-            setEvents(next);
-            setLive((l) => {
-              const liveNext = nextLive(next, parked?.live || l);
-              if (id) transcriptsRef.current[id] = { events: next, live: liveNext };
-              return liveNext;
-            });
-          } else {
-            pullHistory();
-          }
-        } else if (msg.method === "history.replace") {
-          const p = msg.params as {
-            events?: SessionEvent[];
-            refetch?: boolean;
-            session?: string;
-            reset?: boolean;
-          };
-          const focused = sessionRef.current;
-          if (p.session && focused && p.session !== focused && !p.events && !p.reset) return;
-          if (p.reset) {
-            const incoming = p.events || [];
-            const sid = p.session || focused || "";
-            if (sid) transcriptsRef.current[sid] = { events: incoming, live: emptyLive() };
-            cancelLiveRaf();
-            setEvents(incoming);
-            setLive(emptyLive());
-            setPendingTurn(false);
-            return;
-          }
-          if (p.refetch || !p.events) pullHistory();
-          else {
-            const sid = p.session || focused || "";
-            const parked = sid ? transcriptsRef.current[sid] : undefined;
-            const next = preferFresherHistory(parked?.events || p.events, p.events);
-            const keep = parked?.live || emptyLive();
-            const liveNext = nextLive(next, keep);
-            if (sid) transcriptsRef.current[sid] = { events: next, live: liveNext };
-            if (p.session && focused && p.session !== focused) return;
-            cancelLiveRaf();
-            setEvents(next);
-            setLive(liveNext);
-          }
-        } else if (msg.method === "event.append") {
-          const e = msg.params as SessionEvent;
-          const focused = sessionRef.current;
-          const sid = e.session || focused || "";
-          const t = transcriptsRef.current[sid] || { events: [], live: emptyLive() };
-          if (e.type === "delta") {
-            t.live = applyDelta(t.live, e);
-            transcriptsRef.current[sid] = t;
-            if (!e.session || !focused || e.session === focused) scheduleLive(sid);
-            return;
-          }
-          if (e.type === "assistant") {
-            const body = (e.content || "").trim();
-            let dup = false;
-            for (let i = t.events.length - 1; i >= 0; i--) {
-              if (t.events[i].type !== "assistant") continue;
-              if ((t.events[i].content || "") === (e.content || "") && body) dup = true;
-              break;
-            }
-            if (!dup) t.events = [...t.events, e];
-            // Empty assistant hops must not wipe the overlay: history may
-            // still be catching up, and stop arrives before the body lands.
-            if (body) t.live = emptyLive();
-            transcriptsRef.current[sid] = t;
-            if (e.session && focused && e.session !== focused) return;
-            if (body) {
-              cancelLiveRaf();
-              setLive(emptyLive());
-            }
-            if (!dup) {
-              setEvents((xs) => {
-                for (let i = xs.length - 1; i >= 0; i--) {
-                  if (xs[i].type !== "assistant") continue;
-                  if ((xs[i].content || "") === (e.content || "") && body) return xs;
-                  break;
-                }
-                return [...xs, e];
-              });
-            }
-            return;
-          }
-          t.events = [...t.events, e];
-          if (e.type === "stop") t.live = { think: "", content: t.live.content };
-          transcriptsRef.current[sid] = t;
-          if (e.session && focused && e.session !== focused) return;
-          if (e.type === "stop") {
-            setPendingTurn(false);
-            // Keep streamed content until history covers it; drop leftover CoT
-            // so idle turns do not keep a 思考 overlay.
-            setLive((l) => (l.think ? { think: "", content: l.content } : l));
-          }
-          setEvents((xs) => [...xs, e]);
-        } else if (msg.method === "permit.ask") {
-          const p = msg.params as Permit;
-          const focused = sessionRef.current;
-          if (p && p.session && focused && p.session !== focused) return;
-          setPermit(p);
-        } else if (msg.method === "permit.clear") {
-          setPermit(null);
-        } else if (msg.method === "clarify.ask") {
-          const p = msg.params as Clarify;
-          const focused = sessionRef.current;
-          if (p && p.session && focused && p.session !== focused) return;
-          setClarify(p);
-        } else if (msg.method === "clarify.clear") {
-          setClarify(null);
-        } else if (msg.method === "state") {
-          setSnap(msg.params as Snap);
-        }
-      },
-      (up) => setWsUp(up),
-    );
+    const ctx: RpcCtx = {
+      session: () => sessionRef.current,
+      transcripts: transcriptsRef.current,
+      setSnap,
+      setEvents,
+      setLive,
+      setPermit,
+      setClarify,
+      setPendingTurn,
+      scheduleLive,
+      pullHistory,
+      cancelLiveRaf,
+    };
+    const stop = connectEvents((msg) => handleConsoleRpc(msg, ctx), (up) => setWsUp(up));
     return () => {
       cancelLiveRaf();
       window.clearTimeout(histTimer);
@@ -553,44 +270,26 @@ export function App() {
     <>
       <div className="desktop" />
       <div className="window">
-        <header
-          className={`titlebar${isWinDesktop() ? " win" : ""}`}
-          onDoubleClick={() => window.grokHyperDesktop?.toggleMaximize()}
-        >
-          {isWinDesktop() ? null : <WindowButtons />}
-          <div className="titlebar-title">
-            <span className="doc-title">grok-hyper 控制台</span>
-            <span className="doc-sub"> · {TITLES[page]}</span>
-          </div>
-          <div className="spacer" />
-          <div className="no-drag">
-            <RunChip
-              phase={phase}
-              elapsed={elapsed}
-              queued={snap.queued ?? 0}
-              steered={snap.steered ?? 0}
-              onClick={() => goChat()}
-            />
-            <button
-              type="button"
-              className={`chip link-chip${linked ? "" : link.ok === false ? " bad" : ""}`}
-              title={link.error || (linked ? "模型端点可达" : "点此检查模型连接")}
-              onClick={() => go("settings")}
-            >
-              <span className={`dot${linked ? "" : link.ok === null ? " wait" : " off"}`} />
-              <span className="link-txt">
-                {linked
-                  ? modelLabel
-                    ? `模型可达 · ${modelLabel}`
-                    : "模型可达"
-                  : link.ok === null
-                    ? "检测中"
-                    : "模型不可达"}
-              </span>
-            </button>
-          </div>
-          {isWinDesktop() ? <WindowButtons /> : null}
-        </header>
+        <Titlebar pageTitle={TITLES[page]}>
+          <RunChip
+            phase={phase}
+            elapsed={elapsed}
+            queued={snap.queued ?? 0}
+            steered={snap.steered ?? 0}
+            onClick={() => goChat()}
+          />
+          <button
+            type="button"
+            className={linkChipClass(link.ok)}
+            title={link.error || (linked ? "模型端点可达" : "点此检查模型连接")}
+            onClick={() => go("settings")}
+          >
+            <span className={linkDotClass(link.ok)} />
+            <span className="link-txt">
+              {modelLinkLabel({ linked, probing: link.ok === null, model: modelLabel })}
+            </span>
+          </button>
+        </Titlebar>
         {!wsUp ? (
           <div className="ws-banner" role="alert">
             与 hyper 服务的连接已断开，正在自动重连… 若刚重启过服务，几秒内会自动恢复。

@@ -20,7 +20,7 @@ use super::progress::{FORCED_SYNTHESIS_NOTE, INSPECT_STREAK, WRITE_NOW_NOTE};
 use super::turn::{
     EMPTY_CHANNEL_NOTE, EMPTY_STOP_FALLBACK, NO_TOOL_THINK_FLOOR, PARSE_REPAIR_NOTE,
     PHYSICS_WRAP_NOTE, STUB_CONTINUE_NOTE, SYNTHESIS_OUTPUT_CAP, SYNTHESIS_THINK_CAP,
-    THINK_DIVERGENCE_NOTE,
+    THINK_DIVERGENCE_NOTE, is_physics_stop,
 };
 use super::*;
 use crate::error::Error;
@@ -240,6 +240,16 @@ fn opts_search(dir: &std::path::Path) -> RunOpts {
     let mut o = opts(dir);
     o.code_search = true;
     o
+}
+
+#[test]
+fn physics_stop_is_budget_context_not_repeat() {
+    assert!(is_physics_stop("budget:context"));
+    assert!(is_physics_stop("budget:context after compact"));
+    assert!(is_physics_stop("Max iterations (20) reached"));
+    assert!(!is_physics_stop("budget:repeat"));
+    assert!(!is_physics_stop("budget:never"));
+    assert!(!is_physics_stop(""));
 }
 
 #[test]

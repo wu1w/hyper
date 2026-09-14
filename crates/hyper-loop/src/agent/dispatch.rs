@@ -1076,6 +1076,47 @@ impl<C: Completer> Agent<C> {
         })
     }
 
+    fn fold_gate_reply(&self, call: &ToolCall) -> Option<ToolResponse> {
+        let msg = match dispatch_name(&call.name) {
+            "grep" => self.grep_gate(call)?,
+            "read" => self.read_gate(call)?,
+            "glob" => self.glob_gate(call)?,
+            "bash" => self.bash_cat_gate(call)?,
+            _ => return None,
+        };
+        Some(ToolResponse::text(&call.id, msg, ToolState::Success))
+    }
+
+    async fn coordinated<F, Fut>(
+        &self,
+        call: &ToolCall,
+        timeout: Option<f64>,
+        work: F,
+    ) -> ToolResponse
+    where
+        F: FnOnce(CancelFlag) -> Fut + Send + 'static,
+        Fut: std::future::Future<Output = ToolResponse> + Send + 'static,
+    {
+        let agent_cancel = self.cancel.clone();
+        let id = call.id.clone();
+        self.coordinator
+            .execute(call.clone(), "hyper", timeout, move |per_call| async move {
+                let (merged, link) = spawn_cancel_bridge(agent_cancel, per_call);
+                let res = tokio::select! {
+                    biased;
+                    _ = merged.cancelled() => ToolResponse::text(
+                        &id,
+                        "Error: tool task aborted",
+                        ToolState::Interrupted,
+                    ),
+                    r = work(merged.clone()) => r,
+                };
+                link.abort();
+                res
+            })
+            .await
+    }
+
     pub(crate) async fn dispatch_one(&self, call: &ToolCall) -> ToolResponse {
         if let Some(denied) = self.gate_tool(call).await {
             return denied;
@@ -1083,28 +1124,11 @@ impl<C: Completer> Agent<C> {
         if crate::subagent::handles(&call.name) {
             return crate::subagent::dispatch(call, &self.dispatch_ctx()).await;
         }
-        if dispatch_name(&call.name) == "grep" {
-            if let Some(msg) = self.grep_gate(call) {
-                return ToolResponse::text(&call.id, msg, ToolState::Success);
-            }
+        if let Some(gated) = self.fold_gate_reply(call) {
+            return gated;
         }
-        if dispatch_name(&call.name) == "read" {
-            if let Some(msg) = self.read_gate(call) {
-                return ToolResponse::text(&call.id, msg, ToolState::Success);
-            }
-            if media_read_path(call).is_some() {
-                return self.dispatch_view(call).await;
-            }
-        }
-        if dispatch_name(&call.name) == "glob" {
-            if let Some(msg) = self.glob_gate(call) {
-                return ToolResponse::text(&call.id, msg, ToolState::Success);
-            }
-        }
-        if dispatch_name(&call.name) == "bash" {
-            if let Some(msg) = self.bash_cat_gate(call) {
-                return ToolResponse::text(&call.id, msg, ToolState::Success);
-            }
+        if dispatch_name(&call.name) == "read" && media_read_path(call).is_some() {
+            return self.dispatch_view(call).await;
         }
         match dispatch_name(&call.name) {
             "ask" => self.run_ask(call).await,
@@ -1117,62 +1141,8 @@ impl<C: Completer> Agent<C> {
                     ToolState::Error,
                 ),
             },
-            "search" => {
-                if !has_tool(&self.tools, "Search") {
-                    return unknown_tool_reply(&call.id, &call.name);
-                }
-                match &self.code_index {
-                    Some(idx) => {
-                        if let Some(msg) = self.search_gate(call) {
-                            return ToolResponse::text(&call.id, msg, ToolState::Success);
-                        }
-                        run_search(idx, &self.workspace, call, self.limits)
-                    }
-                    None => ToolResponse::text(
-                        &call.id,
-                        crate::tools::SEARCH_WARMING,
-                        ToolState::Success,
-                    ),
-                }
-            }
-            "readlints" => {
-                let mut paths: Vec<String> = call
-                    .arguments
-                    .get("paths")
-                    .and_then(Value::as_array)
-                    .into_iter()
-                    .flatten()
-                    .filter_map(Value::as_str)
-                    .map(str::trim)
-                    .filter(|path| !path.is_empty())
-                    .map(str::to_string)
-                    .collect();
-                if let Some(path) = crate::tools::arg_str(&call.arguments, "path") {
-                    if !path.trim().is_empty() && !paths.iter().any(|item| item == &path) {
-                        paths.push(path);
-                    }
-                }
-                if paths.is_empty() {
-                    paths.extend(
-                        self.observed_paths
-                            .iter()
-                            .filter(|path| verify::is_code_path(path))
-                            .cloned(),
-                    );
-                    paths.sort();
-                }
-                if paths.is_empty() {
-                    return ToolResponse::text(
-                        &call.id,
-                        "Error: ReadLints needs `paths` before any code file has been observed.",
-                        ToolState::Error,
-                    );
-                }
-                let report =
-                    verify::run_lints_async(self.workspace.root(), &paths, &self.cancel).await;
-                let (text, state) = verify::read_lints_reply(&report, &paths);
-                ToolResponse::text(&call.id, text, state)
-            }
+            "search" => self.dispatch_search(call),
+            "readlints" => self.dispatch_read_lints(call).await,
             "web" => {
                 let Some(web) = self.web.clone() else {
                     return ToolResponse::text(
@@ -1184,92 +1154,40 @@ impl<C: Completer> Agent<C> {
                 let blobs = self.blobs.clone();
                 let limits = self.limits;
                 let owned = call.clone();
-                let agent_cancel = self.cancel.clone();
-                self.coordinator
-                    .execute(call.clone(), "hyper", None, move |per_call| async move {
-                        let (merged, link) = spawn_cancel_bridge(agent_cancel, per_call);
-                        let res = tokio::select! {
-                            biased;
-                            _ = merged.cancelled() => ToolResponse::text(
-                                &owned.id,
-                                "Error: tool task aborted",
-                                ToolState::Interrupted,
-                            ),
-                            r = web.run(&owned, limits, Some(&blobs)) => r,
-                        };
-                        link.abort();
-                        res
-                    })
-                    .await
+                self.coordinated(call, None, move |_merged| async move {
+                    web.run(&owned, limits, Some(&blobs)).await
+                })
+                .await
             }
             "mcp" => {
                 let mcp = self.mcp.clone();
                 let blobs = self.blobs.clone();
                 let limits = self.limits;
                 let owned = call.clone();
-                let agent_cancel = self.cancel.clone();
-                self.coordinator
-                    .execute(call.clone(), "hyper", None, move |per_call| async move {
-                        let (merged, link) = spawn_cancel_bridge(agent_cancel, per_call);
-                        let res = tokio::select! {
-                            biased;
-                            _ = merged.cancelled() => ToolResponse::text(
-                                &owned.id,
-                                "Error: tool task aborted",
-                                ToolState::Interrupted,
-                            ),
-                            r = run_mcp(&mcp, &owned, limits, Some(&blobs)) => r,
-                        };
-                        link.abort();
-                        res
-                    })
-                    .await
+                self.coordinated(call, None, move |_merged| async move {
+                    run_mcp(&mcp, &owned, limits, Some(&blobs)).await
+                })
+                .await
             }
             "getdynamictools" => {
                 let mcp = self.mcp.clone();
                 let blobs = self.blobs.clone();
                 let limits = self.limits;
                 let owned = call.clone();
-                let agent_cancel = self.cancel.clone();
-                self.coordinator
-                    .execute(call.clone(), "hyper", None, move |per_call| async move {
-                        let (merged, link) = spawn_cancel_bridge(agent_cancel, per_call);
-                        let res = tokio::select! {
-                            biased;
-                            _ = merged.cancelled() => ToolResponse::text(
-                                &owned.id,
-                                "Error: tool task aborted",
-                                ToolState::Interrupted,
-                            ),
-                            r = get_dynamic_tools(&mcp, &owned, limits, Some(&blobs)) => r,
-                        };
-                        link.abort();
-                        res
-                    })
-                    .await
+                self.coordinated(call, None, move |_merged| async move {
+                    get_dynamic_tools(&mcp, &owned, limits, Some(&blobs)).await
+                })
+                .await
             }
             "calldynamictool" => {
                 let mcp = self.mcp.clone();
                 let blobs = self.blobs.clone();
                 let limits = self.limits;
                 let owned = call.clone();
-                let agent_cancel = self.cancel.clone();
-                self.coordinator
-                    .execute(call.clone(), "hyper", None, move |per_call| async move {
-                        let (merged, link) = spawn_cancel_bridge(agent_cancel, per_call);
-                        let res = tokio::select! {
-                            biased;
-                            _ = merged.cancelled() => ToolResponse::text(
-                                &owned.id,
-                                "Error: tool task aborted",
-                                ToolState::Interrupted,
-                            ),
-                            r = call_dynamic_tool(&mcp, &owned, limits, Some(&blobs)) => r,
-                        };
-                        link.abort();
-                        res
-                    })
-                    .await
+                self.coordinated(call, None, move |_merged| async move {
+                    call_dynamic_tool(&mcp, &owned, limits, Some(&blobs)).await
+                })
+                .await
             }
             "fetchmcpresource" => {
                 let mcp = self.mcp.clone();
@@ -1277,29 +1195,10 @@ impl<C: Completer> Agent<C> {
                 let limits = self.limits;
                 let owned = call.clone();
                 let ws = self.workspace.clone();
-                let agent_cancel = self.cancel.clone();
-                self.coordinator
-                    .execute(call.clone(), "hyper", None, move |per_call| async move {
-                        let (merged, link) = spawn_cancel_bridge(agent_cancel, per_call);
-                        let res = tokio::select! {
-                            biased;
-                            _ = merged.cancelled() => ToolResponse::text(
-                                &owned.id,
-                                "Error: tool task aborted",
-                                ToolState::Interrupted,
-                            ),
-                            r = fetch_mcp_resource(
-                                &mcp,
-                                &owned,
-                                limits,
-                                Some(&blobs),
-                                Some(&ws),
-                            ) => r,
-                        };
-                        link.abort();
-                        res
-                    })
-                    .await
+                self.coordinated(call, None, move |_merged| async move {
+                    fetch_mcp_resource(&mcp, &owned, limits, Some(&blobs), Some(&ws)).await
+                })
+                .await
             }
             "generateimage" => {
                 let prompt = crate::tools::arg_str_any(&call.arguments, &["description", "prompt"])
@@ -1308,35 +1207,17 @@ impl<C: Completer> Agent<C> {
                 let cfg = self.config.clone();
                 let root = self.workspace.root().to_path_buf();
                 let owned = call.clone();
-                let agent_cancel = self.cancel.clone();
                 let ws = self.workspace.clone();
-                self.coordinator
-                    .execute(call.clone(), "hyper", None, move |per_call| async move {
-                        let (merged, link) = spawn_cancel_bridge(agent_cancel, per_call);
-                        let res = tokio::select! {
-                            biased;
-                            _ = merged.cancelled() => ToolResponse::text(
-                                &owned.id,
-                                "Error: tool task aborted",
-                                ToolState::Interrupted,
-                            ),
-                            r = crate::imagine::generate(&cfg, &prompt, &root, &merged) => {
-                                match r {
-                                    Ok(out) => finish_generate_image(&owned.id, out, filename.as_deref(), &ws),
-                                    Err(e) => ToolResponse::text(
-                                        &owned.id,
-                                        format!("Error: {e}"),
-                                        ToolState::Error,
-                                    ),
-                                }
-                            },
-                        };
-                        link.abort();
-                        res
-                    })
-                    .await
+                self.coordinated(call, None, move |merged| async move {
+                    match crate::imagine::generate(&cfg, &prompt, &root, &merged).await {
+                        Ok(out) => finish_generate_image(&owned.id, out, filename.as_deref(), &ws),
+                        Err(e) => {
+                            ToolResponse::text(&owned.id, format!("Error: {e}"), ToolState::Error)
+                        }
+                    }
+                })
+                .await
             }
-            // Not in tools[]. XML / hallucinated native calls still need a result.
             "skill" => run_skill(&self.skills, call, self.limits, Some(&self.blobs)),
             "view" => {
                 if !has_tool(&self.tools, "view") {
@@ -1349,24 +1230,11 @@ impl<C: Completer> Agent<C> {
                     return unknown_tool_reply(&call.id, &call.name);
                 }
                 let owned = call.clone();
-                let agent_cancel = self.cancel.clone();
                 let session_id = self.session_id.clone();
-                self.coordinator
-                    .execute(call.clone(), "hyper", None, move |per_call| async move {
-                        let (merged, link) = spawn_cancel_bridge(agent_cancel, per_call);
-                        let res = tokio::select! {
-                            biased;
-                            _ = merged.cancelled() => ToolResponse::text(
-                                &owned.id,
-                                "Error: tool task aborted",
-                                ToolState::Interrupted,
-                            ),
-                            r = crate::tools::computer::computer_use(&owned, merged.clone(), &session_id) => r,
-                        };
-                        link.abort();
-                        res
-                    })
-                    .await
+                self.coordinated(call, None, move |merged| async move {
+                    crate::tools::computer::computer_use(&owned, merged, &session_id).await
+                })
+                .await
             }
             _ => {
                 let ws = self.workspace.clone();
@@ -1374,24 +1242,45 @@ impl<C: Completer> Agent<C> {
                 let inherit_env = self.inherit_env;
                 let blobs = self.blobs.clone();
                 let owned = call.clone();
-                let cancel = self.cancel.clone();
-                self.coordinator
-                    .execute(
-                        call.clone(),
-                        "hyper",
-                        bash_coordinator_timeout_secs(call),
-                        move |per_call| async move {
-                            let (merged, link) = spawn_cancel_bridge(cancel, per_call);
-                            let res =
-                                run_tool(&ws, &owned, merged, limits, inherit_env, Some(&blobs))
-                                    .await;
-                            link.abort();
-                            res
-                        },
-                    )
-                    .await
+                self.coordinated(
+                    call,
+                    bash_coordinator_timeout_secs(call),
+                    move |merged| async move {
+                        run_tool(&ws, &owned, merged, limits, inherit_env, Some(&blobs)).await
+                    },
+                )
+                .await
             }
         }
+    }
+
+    fn dispatch_search(&self, call: &ToolCall) -> ToolResponse {
+        if !has_tool(&self.tools, "Search") {
+            return unknown_tool_reply(&call.id, &call.name);
+        }
+        match &self.code_index {
+            Some(idx) => {
+                if let Some(msg) = self.search_gate(call) {
+                    return ToolResponse::text(&call.id, msg, ToolState::Success);
+                }
+                run_search(idx, &self.workspace, call, self.limits)
+            }
+            None => ToolResponse::text(&call.id, crate::tools::SEARCH_WARMING, ToolState::Success),
+        }
+    }
+
+    async fn dispatch_read_lints(&self, call: &ToolCall) -> ToolResponse {
+        let paths = collect_read_lints_paths(call, &self.observed_paths);
+        if paths.is_empty() {
+            return ToolResponse::text(
+                &call.id,
+                "Error: ReadLints needs `paths` before any code file has been observed.",
+                ToolState::Error,
+            );
+        }
+        let report = verify::run_lints_async(self.workspace.root(), &paths, &self.cancel).await;
+        let (text, state) = verify::read_lints_reply(&report, &paths);
+        ToolResponse::text(&call.id, text, state)
     }
 
     async fn dispatch_view(&self, call: &ToolCall) -> ToolResponse {
@@ -1400,23 +1289,10 @@ impl<C: Completer> Agent<C> {
         let bins = self.media_bins.clone();
         let max_bytes = self.media_max_bytes;
         let owned = call.clone();
-        let agent_cancel = self.cancel.clone();
-        self.coordinator
-            .execute(call.clone(), "hyper", None, move |per_call| async move {
-                let (merged, link) = spawn_cancel_bridge(agent_cancel, per_call);
-                let res = tokio::select! {
-                    biased;
-                    _ = merged.cancelled() => ToolResponse::text(
-                        &owned.id,
-                        "Error: tool task aborted",
-                        ToolState::Interrupted,
-                    ),
-                    r = view(&ws, &owned, &caps, &bins, max_bytes) => r,
-                };
-                link.abort();
-                res
-            })
-            .await
+        self.coordinated(call, None, move |_merged| async move {
+            view(&ws, &owned, &caps, &bins, max_bytes).await
+        })
+        .await
     }
 
     pub(crate) async fn dispatch_parallel(&self, calls: &[ToolCall]) -> Vec<ToolResponse> {
@@ -2270,6 +2146,35 @@ pub(crate) fn parallel_safe_batch(calls: &[ToolCall]) -> bool {
     calls.len() > 1 && calls.iter().all(|c| is_parallel_safe(&c.name))
 }
 
+pub(crate) fn collect_read_lints_paths(call: &ToolCall, observed: &HashSet<String>) -> Vec<String> {
+    let mut paths: Vec<String> = call
+        .arguments
+        .get("paths")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(Value::as_str)
+        .map(str::trim)
+        .filter(|path| !path.is_empty())
+        .map(str::to_string)
+        .collect();
+    if let Some(path) = crate::tools::arg_str(&call.arguments, "path") {
+        if !path.trim().is_empty() && !paths.iter().any(|item| item == &path) {
+            paths.push(path);
+        }
+    }
+    if paths.is_empty() {
+        paths.extend(
+            observed
+                .iter()
+                .filter(|path| verify::is_code_path(path))
+                .cloned(),
+        );
+        paths.sort();
+    }
+    paths
+}
+
 pub(crate) fn media_read_path(call: &ToolCall) -> Option<String> {
     if dispatch_name(&call.name) != "read" {
         return None;
@@ -2401,5 +2306,35 @@ fn edit_snippet(call: &ToolCall) -> String {
             .take(4000)
             .collect(),
         _ => String::new(),
+    }
+}
+
+#[cfg(test)]
+mod collect_read_lints_paths_tests {
+    use super::*;
+    use serde_json::json;
+
+    fn call(args: Value) -> ToolCall {
+        ToolCall {
+            id: "1".into(),
+            name: "ReadLints".into(),
+            arguments: args,
+        }
+    }
+
+    #[test]
+    fn collect_read_lints_paths_from_paths_and_path() {
+        let c = call(json!({"paths": ["a.rs", ""], "path": "b.ts"}));
+        let got = collect_read_lints_paths(&c, &HashSet::new());
+        assert_eq!(got, vec!["a.rs".to_string(), "b.ts".to_string()]);
+    }
+
+    #[test]
+    fn collect_read_lints_paths_falls_back_to_observed_code() {
+        let mut obs = HashSet::new();
+        obs.insert("src/lib.rs".into());
+        obs.insert("README.md".into());
+        let got = collect_read_lints_paths(&call(json!({})), &obs);
+        assert_eq!(got, vec!["src/lib.rs".to_string()]);
     }
 }

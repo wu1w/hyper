@@ -7,7 +7,7 @@
     "dev": "vite",
     "build": "vite build",
     "preview": "vite preview",
-    "test": "node --experimental-strip-types --test src/chat-live.test.ts src/tree.test.ts src/artifacts.test.ts src/md.test.ts"
+    "test": "node --experimental-strip-types --test src/chat-live.test.ts src/tree.test.ts src/artifacts.test.ts src/md.test.ts src/settings-model.test.ts src/files-model.test.ts src/tools-model.test.ts src/sessions-model.test.ts src/channel-model.test.ts src/app-nav.test.ts src/app-session.test.ts src/mcp-model.test.ts src/chat-model.test.ts src/preview/kinds.test.ts src/preview/word-model.test.ts src/preview/bytes.test.ts src/media.test.ts"
   },
   "dependencies": {
     "@aiden0z/pptx-renderer": "^1.2.4",

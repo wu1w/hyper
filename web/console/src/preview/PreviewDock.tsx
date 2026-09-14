@@ -4,8 +4,16 @@ import { fileHref, siteHref, basename } from "../media";
 import { Icon } from "../ui";
 import { isOfficeKind, kindFor, type PreviewKind, type PreviewProps } from "./kinds";
 import { loadPreviewBytes, savePreview } from "./save";
+import {
+  canSavePreview,
+  maximizeLabel,
+  officeTick,
+  previewDockClass,
+  truncatedPreviewNote,
+  type OfficePoll,
+} from "./dock-model";
 
-type OfficeStatus = { ready?: boolean; starting?: boolean; docs_url?: string; hint?: string | null };
+type OfficeStatus = OfficePoll & { docs_url?: string };
 
 export function PreviewDock({
   path,
@@ -72,7 +80,7 @@ export function PreviewDock({
         if (gone) return;
         setBytes(buf);
         setView(() => Comp);
-        if (truncated) setNote("文件超过 96MB，预览是截断后的内容，可能打不开。");
+        if (truncated) setNote(truncatedPreviewNote(true));
       } catch (e) {
         if (!gone) setErr(failMsg(e));
       }
@@ -89,16 +97,13 @@ export function PreviewDock({
     const tick = async () => {
       const st = await api<OfficeStatus>("/office/status").catch(() => null);
       if (stop || !st) return;
-      if (st.ready) {
-        if (dirty) {
-          setNote("文档服务已就绪。保存或关闭后重新打开即可完整编辑。");
-        } else {
-          setBoot((n) => n + 1);
-        }
+      const tickResult = officeTick(st, dirty);
+      if (tickResult.reload) {
+        setBoot((n) => n + 1);
         return;
       }
-      if (st.hint) setNote(String(st.hint));
-      if (st.starting) timer = window.setTimeout(() => void tick(), 4000);
+      if (tickResult.note) setNote(tickResult.note);
+      if (tickResult.wait) timer = window.setTimeout(() => void tick(), 4000);
     };
     timer = window.setTimeout(() => void tick(), 4000);
     return () => {
@@ -160,12 +165,13 @@ export function PreviewDock({
     }
   };
 
-  const canSave = kind.editable && (office ? !!officeKey : !!bytes);
+  const canSave = canSavePreview(kind.editable, office, officeKey, !!bytes);
+  const maxLbl = maximizeLabel(maximized);
 
   return (
     <div
       ref={hostRef}
-      className={`pv-dock${maximized ? " max" : ""}${office ? " oo" : ""}${layout === "chat" ? " chat" : ""}`}
+      className={previewDockClass({ maximized, office, layout })}
     >
       <div className="pv-bar">
         <span className="pv-kind">{kind.label}</span>
@@ -191,8 +197,8 @@ export function PreviewDock({
         <button
           type="button"
           className="icon-btn"
-          aria-label={maximized ? "还原预览" : "最大化预览"}
-          title={maximized ? "还原" : "最大化"}
+          aria-label={maxLbl.aria}
+          title={maxLbl.title}
           onClick={() => onMaximize?.(!maximized)}
         >
           <Icon name={maximized ? "restore" : "maximize"} />

@@ -1,99 +1,31 @@
 import { useEffect, useRef, useState, type KeyboardEvent } from "react";
 import { api, failMsg, type ChannelEp, type ChannelKind } from "./api";
+import {
+  DM_POLICY,
+  GROUP_POLICY,
+  addableAction,
+  addableKinds,
+  addChannelPlan,
+  cardStatus,
+  channelCardClass,
+  channelEnableHint,
+  extraRecord,
+  extraStr,
+  isBound,
+  kindSpec,
+  matchLine,
+  mergeQrCreds,
+  mergeTags,
+  newChannelRow,
+  parseTagDraft,
+  qrButtonLabel,
+  qrFailMessage,
+  qrPollDone,
+  qrPollGap,
+  qrStatusLabel,
+  upsertBody,
+} from "./channel-model";
 import { Empty, PageHead, Seg, Switch, uiConfirm } from "./ui";
-
-/** 频道运行时状态 → 状态点。后端没给 runtime 字段时不显示。 */
-function runtimePill(e: ChannelEp): { cls: string; label: string } | null {
-  const st = e.runtime?.state;
-  if (!st) return null;
-  if (st === "running") return { cls: "ok", label: "运行中" };
-  if (st === "retry") return { cls: "warn", label: "重试中" };
-  if (st === "error") return { cls: "err", label: "连接错误" };
-  if (st === "no_credentials") return { cls: "warn", label: "缺凭证" };
-  if (e.enabled) return { cls: "idle", label: "未连接" };
-  return null;
-}
-
-const DM_POLICY = [
-  { id: "open", label: "开放" },
-  { id: "allowlist", label: "白名单" },
-  { id: "closed", label: "关闭" },
-];
-const GROUP_POLICY = [
-  { id: "open", label: "开放" },
-  { id: "allowlist", label: "白名单" },
-  { id: "mention", label: "需提及" },
-  { id: "closed", label: "关闭" },
-];
-
-function policyName(kind: "dm" | "group", id?: string) {
-  const fallback = kind === "dm" ? "allowlist" : "mention";
-  const rows = kind === "dm" ? DM_POLICY : GROUP_POLICY;
-  return rows.find((r) => r.id === (id || fallback))?.label || id || (kind === "dm" ? "白名单" : "需提及");
-}
-
-function matchLine(e: ChannelEp) {
-  const bits = [`私信 ${policyName("dm", e.dm_policy)}`, `群聊 ${policyName("group", e.group_policy)}`];
-  if (e.require_mention && e.group_policy !== "mention") bits.push("群需@");
-  const n = (e.allow_from || []).length;
-  if (n) bits.push(`白名单 ${n}`);
-  const d = (e.deny_from || []).length;
-  if (d) bits.push(`拒绝 ${d}`);
-  return bits.join(" · ");
-}
-
-function extraRecord(extra?: Record<string, unknown>): Record<string, string> {
-  const out: Record<string, string> = {};
-  if (!extra) return out;
-  for (const [k, v] of Object.entries(extra)) {
-    if (typeof v === "string") out[k] = v;
-  }
-  return out;
-}
-
-function extraStr(e: ChannelEp, key: string): string {
-  const v = e.extra?.[key];
-  return typeof v === "string" ? v : "";
-}
-
-function nextEpId(eps: ChannelEp[], kind: string) {
-  if (!eps.some((e) => e.id === kind)) return kind;
-  let i = 2;
-  while (eps.some((e) => e.id === `${kind}-${i}`)) i += 1;
-  return `${kind}-${i}`;
-}
-
-function toChannelPayload(eps: ChannelEp[]) {
-  return eps.map((e) => {
-    const extra = extraRecord(e.extra);
-    if (e.kind === "telegram" && e.bot_token?.trim()) extra.bot_token = e.bot_token.trim();
-    return {
-      id: e.id.trim() || nextEpId(eps, e.kind),
-      kind: e.kind,
-      enabled: !!e.enabled,
-      bind: e.bind || "",
-      reply_url: e.reply_url || "",
-      require_mention: e.require_mention !== false,
-      dm_policy: e.dm_policy || "allowlist",
-      group_policy: e.group_policy || "mention",
-      allow_from: e.allow_from || [],
-      deny_from: e.deny_from || [],
-      secret: e.secret || "",
-      extra,
-    };
-  });
-}
-
-function kindSpec(catalog: ChannelKind[], kind: string): ChannelKind | undefined {
-  return catalog.find((c) => c.id === kind);
-}
-
-function isBound(e: ChannelEp, spec?: ChannelKind) {
-  if (e.bot_token_set || e.secret_set) return true;
-  const set = new Set(e.creds_set || []);
-  if (spec?.fields.some((f) => f.secret && set.has(f.key))) return true;
-  return set.size > 0 && !!spec?.qr;
-}
 
 function ChannelTags({
   values,
@@ -106,14 +38,9 @@ function ChannelTags({
 }) {
   const [draft, setDraft] = useState("");
   const add = (raw: string) => {
-    const parts = raw
-      .split(/[,，\s]+/)
-      .map((s) => s.trim())
-      .filter(Boolean);
+    const parts = parseTagDraft(raw);
     if (!parts.length) return;
-    const next = [...values];
-    for (const p of parts) if (!next.includes(p)) next.push(p);
-    onChange(next);
+    onChange(mergeTags(values, parts));
     setDraft("");
   };
   const onKey = (e: KeyboardEvent<HTMLInputElement>) => {
@@ -159,25 +86,6 @@ function ChannelMark({ spec, sm }: { spec?: ChannelKind; sm?: boolean }) {
       <span className="ch-mark">{spec?.mark || "?"}</span>
     </span>
   );
-}
-
-function qrPollGap(kind: string) {
-  if (kind === "feishu") return 5000;
-  if (kind === "qq" || kind === "wecom" || kind === "dingtalk") return 3000;
-  return 1500;
-}
-
-function qrStatusLabel(status: string, kind?: string, live?: boolean) {
-  if (status === "waiting") {
-    if (kind === "qq") return "等待扫码 · QQ 开通机器人可能要一会儿";
-    if (kind === "dingtalk") return "等待扫码 · 钉钉可能要创建/发布应用";
-    return "等待扫码";
-  }
-  if (status === "scanned") return "已扫，请在手机上确认";
-  if (status === "success") return live ? "凭证已写入，正在连接" : "凭证已写入";
-  if (status === "expired") return "二维码已过期";
-  if (status === "fail") return "授权失败";
-  return status;
 }
 
 function QrBind({
@@ -237,10 +145,9 @@ function QrBind({
         if (j.status === "success") {
           setToken("");
           boundRef.current(j.credentials || {});
-        } else if (j.status === "fail" || j.status === "expired") {
+        } else if (qrPollDone(j.status)) {
           setToken("");
-          const reason = j.credentials?.fail_reason;
-          setErr(j.status === "expired" ? "二维码已过期，请重新获取" : reason || "授权失败");
+          setErr(qrFailMessage(j.status, j.credentials?.fail_reason));
         }
       } catch (e) {
         if (!stop) setErr(failMsg(e));
@@ -266,7 +173,7 @@ function QrBind({
           </div>
         </div>
         <button type="button" className="btn primary small" disabled={busy} onClick={start}>
-          {image ? "刷新二维码" : "获取二维码"}
+          {qrButtonLabel(!!image)}
         </button>
       </div>
       {err ? <div className="err">{err}</div> : null}
@@ -277,6 +184,83 @@ function QrBind({
       )}
       {status ? <div className={`ch-qr-st ${status}`}>{qrStatusLabel(status, kind, live)}</div> : null}
     </div>
+  );
+}
+
+function ChannelGrid({
+  rows,
+  eps,
+  sel,
+  open,
+  catalog,
+  openAt,
+}: {
+  rows: ChannelEp[];
+  eps: ChannelEp[];
+  sel: number;
+  open: boolean;
+  catalog: ChannelKind[];
+  openAt: (i: number) => void;
+}) {
+  return (
+    <div className="ch-grid">
+      {rows.map((e) => {
+        const i = eps.findIndex((x) => x.id === e.id && x.kind === e.kind);
+        return (
+          <ChannelCard
+            key={`${e.kind}-${e.id}`}
+            e={e}
+            catalog={catalog}
+            selected={open && i === sel}
+            onOpen={() => openAt(i)}
+          />
+        );
+      })}
+    </div>
+  );
+}
+
+function ChannelCard({
+  e,
+  catalog,
+  selected,
+  onOpen,
+}: {
+  e: ChannelEp;
+  catalog: ChannelKind[];
+  selected: boolean;
+  onOpen: () => void;
+}) {
+  const s = kindSpec(catalog, e.kind);
+  const bound = isBound(e, s);
+  const st = cardStatus(e);
+  return (
+    <button
+      type="button"
+      className={channelCardClass(selected, !!e.enabled)}
+      onClick={onOpen}
+    >
+      <div className="ch-card-top">
+        <ChannelMark spec={s} />
+        <span className={`pill ${st.cls}`} title={e.runtime?.detail || undefined}>
+          {st.label}
+        </span>
+      </div>
+      <div className="ch-name">{s?.name || e.kind}</div>
+      <div className="ch-id mono">{e.id}</div>
+      <div className="ch-tags">
+        {s?.qr ? <span className="pill ink">扫码</span> : null}
+        {bound ? <span className="pill ok">{s?.in_process ? "已绑定" : "凭证已写入"}</span> : null}
+        {s?.in_process ? <span className="pill idle">进程内</span> : null}
+      </div>
+      {(e.runtime?.state === "error" || e.runtime?.state === "retry") && e.runtime.detail ? (
+        <div className="ch-err" title={e.runtime.detail}>
+          {e.runtime.detail}
+        </div>
+      ) : null}
+      <div className="sub">{matchLine(e)}</div>
+      <div className="sub">{s?.blurb}</div>
+    </button>
   );
 }
 
@@ -307,7 +291,7 @@ export function ChannelsPage({ active = true }: { active?: boolean }) {
   const enabled = eps.filter((e) => e.enabled);
   const idle = eps.filter((e) => !e.enabled);
   const configuredKinds = new Set(eps.map((e) => e.kind));
-  const addable = catalog.filter((c) => c.in_process && (!c.once || !configuredKinds.has(c.id)));
+  const addable = addableKinds(catalog, eps);
   const patch = (p: Partial<ChannelEp>) => {
     if (!cur) return;
     const n = [...eps];
@@ -327,27 +311,13 @@ export function ChannelsPage({ active = true }: { active?: boolean }) {
     setDirty(false);
   };
   const add = (kind: string) => {
-    const spec = kindSpec(catalog, kind);
-    if (!spec?.in_process) return;
-    if (spec?.once) {
-      const existing = eps.findIndex((e) => e.kind === kind);
-      if (existing >= 0) {
-        openAt(existing);
-        return;
-      }
+    const plan = addChannelPlan(kind, catalog, eps);
+    if (plan.action === "ignore") return;
+    if (plan.action === "open") {
+      openAt(plan.index);
+      return;
     }
-    const im = kind !== "webhook";
-    const row: ChannelEp = {
-      id: nextEpId(eps, kind),
-      kind,
-      enabled: false,
-      require_mention: im,
-      dm_policy: im ? "allowlist" : "open",
-      group_policy: im ? "mention" : "open",
-      bind: kind === "webhook" ? "127.0.0.1:8788" : "",
-      extra: kind === "feishu" ? { domain: "feishu" } : {},
-      _local: true,
-    };
+    const row = newChannelRow(kind, eps);
     setEps([...eps, row]);
     setSel(eps.length);
     setOpen(true);
@@ -388,21 +358,17 @@ export function ChannelsPage({ active = true }: { active?: boolean }) {
     if (!row) return;
     try {
       setErr("");
-      const payload = toChannelPayload([row])[0];
-      const orig = (row._origId || "").trim();
+      const body = upsertBody(row);
       await api("/channels", {
         method: "POST",
-        body: JSON.stringify({
-          upsert: payload,
-          rename: orig && orig !== payload.id ? orig : undefined,
-        }),
+        body: JSON.stringify(body),
       });
       setDirty(false);
       if (close) {
         setOpen(false);
         await load();
       } else {
-        await load(payload.id);
+        await load(body.upsert.id);
       }
     } catch (e) {
       setErr(failMsg(e));
@@ -410,11 +376,7 @@ export function ChannelsPage({ active = true }: { active?: boolean }) {
   };
   const onQrBound = (creds: Record<string, string>) => {
     if (!cur) return;
-    const extra = { ...extraRecord(cur.extra) };
-    for (const [k, v] of Object.entries(creds)) {
-      if (v) extra[k] = v;
-    }
-    const row: ChannelEp = { ...cur, extra, enabled: true, _local: false };
+    const row = mergeQrCreds(cur, creds);
     const n = [...eps];
     n[sel] = row;
     setEps(n);
@@ -444,41 +406,6 @@ export function ChannelsPage({ active = true }: { active?: boolean }) {
       setErr(failMsg(e));
     }
   };
-  const card = (e: ChannelEp) => {
-    const i = eps.findIndex((x) => x.id === e.id && x.kind === e.kind);
-    const s = kindSpec(catalog, e.kind);
-    const bound = isBound(e, s);
-    const rt = runtimePill(e);
-    return (
-      <button
-        key={`${e.kind}-${e.id}`}
-        type="button"
-        className={`card ch-card${open && i === sel ? " on" : ""}${e.enabled ? "" : " dim"}`}
-        onClick={() => openAt(i)}
-      >
-        <div className="ch-card-top">
-          <ChannelMark spec={s} />
-          <span className={`pill ${rt ? rt.cls : e.enabled ? "ok" : "idle"}`} title={e.runtime?.detail || undefined}>
-            {rt ? rt.label : e.enabled ? "已启用" : "未启用"}
-          </span>
-        </div>
-        <div className="ch-name">{s?.name || e.kind}</div>
-        <div className="ch-id mono">{e.id}</div>
-        <div className="ch-tags">
-          {s?.qr ? <span className="pill ink">扫码</span> : null}
-          {bound ? <span className="pill ok">{s?.in_process ? "已绑定" : "凭证已写入"}</span> : null}
-          {s?.in_process ? <span className="pill idle">进程内</span> : null}
-        </div>
-        {(e.runtime?.state === "error" || e.runtime?.state === "retry") && e.runtime.detail ? (
-          <div className="ch-err" title={e.runtime.detail}>
-            {e.runtime.detail}
-          </div>
-        ) : null}
-        <div className="sub">{matchLine(e)}</div>
-        <div className="sub">{s?.blurb}</div>
-      </button>
-    );
-  };
   return (
     <div className="page ch-page">
       <PageHead title="频道" hint="扫码或填字段绑定；进程内频道由本控制台自动连接" />
@@ -507,7 +434,7 @@ export function ChannelsPage({ active = true }: { active?: boolean }) {
             <span>{enabled.length}</span>
           </h3>
           {enabled.length > 0 ? (
-            <div className="ch-grid">{enabled.map(card)}</div>
+            <ChannelGrid rows={enabled} eps={eps} sel={sel} open={open} catalog={catalog} openAt={openAt} />
           ) : (
             <div className="card">
               <Empty title="没有已启用的频道" body="从「可添加」选一个平台，扫码或填凭证后打开启用。" />
@@ -521,7 +448,7 @@ export function ChannelsPage({ active = true }: { active?: boolean }) {
               未启用
               <span>{idle.length}</span>
             </h3>
-            <div className="ch-grid">{idle.map(card)}</div>
+            <ChannelGrid rows={idle} eps={eps} sel={sel} open={open} catalog={catalog} openAt={openAt} />
           </div>
         ) : null}
 
@@ -538,7 +465,7 @@ export function ChannelsPage({ active = true }: { active?: boolean }) {
                   <b>{c.name}</b>
                   <div className="sub">{c.blurb}</div>
                 </span>
-                <span className="sub">{configuredKinds.has(c.id) && !c.once ? "再添加" : c.qr ? "扫码" : "添加"}</span>
+                <span className="sub">{addableAction(c, configuredKinds.has(c.id))}</span>
               </button>
             ))}
           </div>
@@ -563,25 +490,7 @@ export function ChannelsPage({ active = true }: { active?: boolean }) {
               <div className="switch-row">
                 <div>
                   <b>已启用</b>
-                  <div className="sub">
-                    {spec?.in_process
-                      ? spec.id === "qq"
-                        ? "扫码成功后本进程会连 QQ 官方网关，手机「连接中」才会结束"
-                        : spec.id === "wechat"
-                          ? "扫码成功后本进程会 iLink 长轮询，才能收到微信消息"
-                          : spec.id === "wecom"
-                            ? "扫码成功后本进程会连企微 WebSocket"
-                            : spec.id === "dingtalk"
-                              ? "扫码成功后本进程会连钉钉 Stream"
-                              : spec.id === "feishu"
-                                ? "扫码成功后本进程会连飞书长连接"
-                        : spec.id === "telegram"
-                          ? "保存后本进程会 long-poll Bot API"
-                          : spec.id === "webhook"
-                            ? "保存后本进程会在 bind 地址接听 POST /inbound"
-                            : "保存后本进程会连接官方接口"
-                      : "凭证写入 config.toml。该平台消息适配器尚未进进程。"}
-                  </div>
+                  <div className="sub">{channelEnableHint(spec)}</div>
                 </div>
                 <Switch
                   checked={!!cur.enabled}

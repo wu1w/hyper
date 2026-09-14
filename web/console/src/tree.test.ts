@@ -5,6 +5,10 @@ import { dirtyAncestors, nestTree, parseTreeEntry } from "./tree-model.ts";
   const e = parseTreeEntry({ path: "src/main.rs", name: "main.rs", dir: false });
   assert.equal(e?.path, "src/main.rs");
   assert.equal(e?.dir, false);
+  assert.equal(parseTreeEntry(null), null);
+  assert.equal(parseTreeEntry({ name: "solo.rs" })?.path, "solo.rs");
+  assert.equal(parseTreeEntry({ path: "src/main.rs", name: "" })?.name, "main.rs");
+  assert.equal(parseTreeEntry({ path: "", name: "" }), null);
 }
 
 {

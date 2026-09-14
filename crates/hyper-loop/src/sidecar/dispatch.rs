@@ -39,20 +39,51 @@ impl SidecarSession {
 
     pub(crate) fn dispatch_slash(&mut self, cmd: SlashCmd) -> Dispatch {
         match cmd {
-            SlashCmd::Mode(mode) => self.fork_mode(mode),
-            SlashCmd::Off | SlashCmd::Think(_) => {
-                self.policy = slash_policy(&cmd, &self.caps);
-                self.effort_locked = true;
-                if matches!(self.policy.effort, Some(Effort::Xhigh)) {
-                    eprintln!("{XHIGH_WARN}");
-                }
-                let event = SessionEvent::policy(self.policy.clone(), PolicyReason::Slash);
-                self.record(event.clone());
-                Dispatch::Result {
-                    result: json!({"ok": true, "text": format!("thinking {}", if self.policy.enabled { "on" } else { "off" })}),
-                    events: vec![event],
-                }
-            }
+            SlashCmd::Help
+            | SlashCmd::Status
+            | SlashCmd::Context { .. }
+            | SlashCmd::History
+            | SlashCmd::Usage
+            | SlashCmd::Tools
+            | SlashCmd::Skills
+            | SlashCmd::Mcp
+            | SlashCmd::Version
+            | SlashCmd::Config
+            | SlashCmd::Diff { .. }
+            | SlashCmd::Sessions { .. }
+            | SlashCmd::Unsupported { .. }
+            | SlashCmd::Setup
+            | SlashCmd::Reload => self.slash_inspect(cmd),
+            SlashCmd::Mode(_)
+            | SlashCmd::Title { .. }
+            | SlashCmd::New { .. }
+            | SlashCmd::Clear
+            | SlashCmd::Resume { .. }
+            | SlashCmd::Fork { .. }
+            | SlashCmd::Compress { .. }
+            | SlashCmd::Undo
+            | SlashCmd::Retry
+            | SlashCmd::Model { .. } => self.slash_session(cmd),
+            SlashCmd::Stop
+            | SlashCmd::Queue { .. }
+            | SlashCmd::Steer { .. }
+            | SlashCmd::Background { .. }
+            | SlashCmd::InvokeSkill { .. }
+            | SlashCmd::InvokeMcp { .. }
+            | SlashCmd::Plan { .. } => self.slash_turn(cmd),
+            SlashCmd::Off
+            | SlashCmd::Think(_)
+            | SlashCmd::Busy { .. }
+            | SlashCmd::Approvals { .. }
+            | SlashCmd::Clarify { .. }
+            | SlashCmd::Imagine { .. }
+            | SlashCmd::LowPrecision { .. }
+            | SlashCmd::Cron { .. } => self.slash_policy(cmd),
+        }
+    }
+
+    fn slash_inspect(&mut self, cmd: SlashCmd) -> Dispatch {
+        match cmd {
             SlashCmd::Help => self.reply_text(help_text()),
             SlashCmd::Status => {
                 let view = self.view();
@@ -86,11 +117,39 @@ impl SidecarSession {
             SlashCmd::Diff { args } => self.reply_text(diff_text(&self.workspace, &args)),
             SlashCmd::Sessions { search } => self.reply_sessions(search.as_deref()),
             SlashCmd::Unsupported { name } => self.reply_text(unsupported_text(&name)),
+            SlashCmd::Setup => self.reply_text(setup_text()),
+            SlashCmd::Reload => self.reply_text("config will apply on the next turn".into()),
+            other => unreachable!("slash_inspect got {other:?}"),
+        }
+    }
+
+    fn slash_session(&mut self, cmd: SlashCmd) -> Dispatch {
+        match cmd {
+            SlashCmd::Mode(mode) => self.fork_mode(mode),
             SlashCmd::Title { name } => self.set_title(&name),
             SlashCmd::New { title } => self.fresh_session(title.as_deref(), true),
             SlashCmd::Clear => self.fresh_session(None, false),
             SlashCmd::Resume { query } => self.resume_query(query.as_deref()),
+            SlashCmd::Fork { directive } => self.fork_session(directive),
             SlashCmd::Compress { hint } => self.force_compact(hint.as_deref()),
+            SlashCmd::Undo => self.undo_last(),
+            SlashCmd::Retry => self.retry_last(),
+            SlashCmd::Model { args } => self.switch_model(&args),
+            other => unreachable!("slash_session got {other:?}"),
+        }
+    }
+
+    fn turn_or_queue(&mut self, prompt: String) -> Dispatch {
+        if self.turn_in_flight {
+            self.enqueue_prompt(prompt, false)
+        } else {
+            self.turn_in_flight = true;
+            Dispatch::turn(prompt)
+        }
+    }
+
+    fn slash_turn(&mut self, cmd: SlashCmd) -> Dispatch {
+        match cmd {
             SlashCmd::Stop => {
                 let n = self.mailbox.clear_queue();
                 let _ = self.mailbox.take_redirect();
@@ -98,6 +157,47 @@ impl SidecarSession {
             }
             SlashCmd::Queue { text } => self.enqueue_prompt(text, false),
             SlashCmd::Steer { text } => self.enqueue_prompt(text, true),
+            SlashCmd::Background { prompt } => match prompt.filter(|p| !p.trim().is_empty()) {
+                Some(text) => self.enqueue_prompt(text, false),
+                None => self.reply_text(
+                    "Send `/background <task>` to queue a job. In IM, `/background` detaches the live turn so the next message starts a new session.".into(),
+                ),
+            },
+            SlashCmd::InvokeSkill { name, args } => {
+                self.turn_or_queue(crate::sticky::skill_turn_prompt(&name, &args))
+            }
+            SlashCmd::InvokeMcp { name, args } => {
+                self.turn_or_queue(crate::sticky::mcp_turn_prompt(&name, &args))
+            }
+            SlashCmd::Plan { action, prompt } => {
+                let prompt = prompt.filter(|p| !p.trim().is_empty());
+                if matches!(action, PlanAction::On) {
+                    if let Some(prompt) = prompt {
+                        let _ = self.set_plan(PlanAction::On);
+                        return self.turn_or_queue(prompt);
+                    }
+                }
+                self.set_plan(action)
+            }
+            other => unreachable!("slash_turn got {other:?}"),
+        }
+    }
+
+    fn slash_policy(&mut self, cmd: SlashCmd) -> Dispatch {
+        match cmd {
+            SlashCmd::Off | SlashCmd::Think(_) => {
+                self.policy = slash_policy(&cmd, &self.caps);
+                self.effort_locked = true;
+                if matches!(self.policy.effort, Some(Effort::Xhigh)) {
+                    eprintln!("{XHIGH_WARN}");
+                }
+                let event = SessionEvent::policy(self.policy.clone(), PolicyReason::Slash);
+                self.record(event.clone());
+                Dispatch::Result {
+                    result: json!({"ok": true, "text": format!("thinking {}", if self.policy.enabled { "on" } else { "off" })}),
+                    events: vec![event],
+                }
+            }
             SlashCmd::Busy { policy } => match policy {
                 None => self.reply_text(format!("busy={}", self.mailbox.busy.as_str())),
                 Some(p) => {
@@ -105,58 +205,14 @@ impl SidecarSession {
                     self.reply_text(format!("busy={}", p.as_str()))
                 }
             },
-            SlashCmd::Background { prompt } => match prompt.filter(|p| !p.trim().is_empty()) {
-                Some(text) => self.enqueue_prompt(text, false),
-                None => self.reply_text(
-                    "Send `/background <task>` to queue a job. In IM, `/background` detaches the live turn so the next message starts a new session.".into(),
-                ),
-            },
-            SlashCmd::Undo => self.undo_last(),
-            SlashCmd::Retry => self.retry_last(),
-            SlashCmd::Model { args } => self.switch_model(&args),
-            SlashCmd::Reload => self.reply_text("config will apply on the next turn".into()),
-            SlashCmd::Setup => self.reply_text(setup_text()),
             SlashCmd::Approvals { mode } => self.set_approvals(mode),
-            SlashCmd::Plan { action, prompt } => {
-                let prompt = prompt.filter(|p| !p.trim().is_empty());
-                if matches!(action, PlanAction::On) {
-                    if let Some(prompt) = prompt {
-                        let _ = self.set_plan(PlanAction::On);
-                        return if self.turn_in_flight {
-                            self.enqueue_prompt(prompt, false)
-                        } else {
-                            self.turn_in_flight = true;
-                            Dispatch::turn(prompt)
-                        };
-                    }
-                }
-                self.set_plan(action)
-            }
-            SlashCmd::Fork { directive } => self.fork_session(directive),
             SlashCmd::Clarify { on } => self.set_clarify(on),
             SlashCmd::Imagine { on, prompt } => self.set_imagine(on, prompt),
             SlashCmd::LowPrecision { on } => self.set_lossy(on),
-            SlashCmd::InvokeSkill { name, args } => {
-                let prompt = crate::sticky::skill_turn_prompt(&name, &args);
-                if self.turn_in_flight {
-                    self.enqueue_prompt(prompt, false)
-                } else {
-                    self.turn_in_flight = true;
-                    Dispatch::turn(prompt)
-                }
-            }
-            SlashCmd::InvokeMcp { name, args } => {
-                let prompt = crate::sticky::mcp_turn_prompt(&name, &args);
-                if self.turn_in_flight {
-                    self.enqueue_prompt(prompt, false)
-                } else {
-                    self.turn_in_flight = true;
-                    Dispatch::turn(prompt)
-                }
-            }
             SlashCmd::Cron { args } => {
                 self.reply_text(crate::cron::apply_slash(&self.workspace, &args))
             }
+            other => unreachable!("slash_policy got {other:?}"),
         }
     }
 
@@ -257,12 +313,7 @@ impl SidecarSession {
         let prompt = prompt.filter(|p| !p.trim().is_empty());
         if let Some(prompt) = prompt {
             self.imagine_mode = true;
-            return if self.turn_in_flight {
-                self.enqueue_prompt(prompt, false)
-            } else {
-                self.turn_in_flight = true;
-                Dispatch::turn(prompt)
-            };
+            return self.turn_or_queue(prompt);
         }
         self.reply_text(imagine_text(self.imagine_mode))
     }
@@ -516,5 +567,89 @@ impl SidecarSession {
 
     pub fn steer_slot(&self) -> SteerSlot {
         self.mailbox.steer_slot()
+    }
+}
+
+#[cfg(test)]
+mod slash_dispatch_tests {
+    use super::super::rpc::parse_request_line;
+    use super::super::types::{Dispatch, SidecarOpts};
+    use super::super::SidecarSession;
+    use crate::session::SlashCmd;
+
+    fn open_mem() -> SidecarSession {
+        let mut session = SidecarSession::new(SidecarOpts::default());
+        let open = parse_request_line(
+            r#"{"jsonrpc":"2.0","id":1,"method":"session.open","params":{"session":"s-slash","workspace":"/tmp/ws","mode":"agent"}}"#,
+        )
+        .unwrap();
+        match session.handle(&open) {
+            Dispatch::Result { .. } => {}
+            other => panic!("{other:?}"),
+        }
+        session
+    }
+
+    fn ok_text(d: Dispatch) -> String {
+        match d {
+            Dispatch::Result { result, .. } => result["text"].as_str().unwrap_or("").to_string(),
+            other => panic!("{other:?}"),
+        }
+    }
+
+    #[test]
+    fn inspect_help_and_status() {
+        let mut s = open_mem();
+        let help = ok_text(s.dispatch_slash(SlashCmd::Help));
+        assert!(
+            help.contains("/help") || help.contains("this list"),
+            "{help}"
+        );
+        assert!(!ok_text(s.dispatch_slash(SlashCmd::Status)).is_empty());
+        assert!(ok_text(s.dispatch_slash(SlashCmd::Reload)).contains("config will apply"));
+    }
+
+    #[test]
+    fn stop_is_abort_clear() {
+        let mut s = open_mem();
+        match s.dispatch_slash(SlashCmd::Stop) {
+            Dispatch::AbortClear { cleared } => assert_eq!(cleared, 0),
+            other => panic!("{other:?}"),
+        }
+    }
+
+    #[test]
+    fn think_off_records_policy() {
+        let mut s = open_mem();
+        match s.dispatch_slash(SlashCmd::Off) {
+            Dispatch::Result { result, events } => {
+                assert_eq!(result["ok"], true);
+                assert!(result["text"].as_str().unwrap().contains("off"));
+                assert!(!events.is_empty());
+            }
+            other => panic!("{other:?}"),
+        }
+    }
+
+    #[test]
+    fn invoke_skill_starts_turn_then_queues() {
+        let mut s = open_mem();
+        match s.dispatch_slash(SlashCmd::InvokeSkill {
+            name: "hyper-self".into(),
+            args: String::new(),
+        }) {
+            Dispatch::TurnStart { prompt, .. } => {
+                assert!(prompt.contains("hyper-self"), "{prompt}");
+            }
+            other => panic!("{other:?}"),
+        }
+        s.turn_in_flight = true;
+        match s.dispatch_slash(SlashCmd::InvokeSkill {
+            name: "hyper-self".into(),
+            args: String::new(),
+        }) {
+            Dispatch::Result { result, .. } => assert_eq!(result["queued"], true),
+            other => panic!("{other:?}"),
+        }
     }
 }

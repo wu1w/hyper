@@ -1,0 +1,20 @@
+import assert from "node:assert/strict";
+import { detailsOpenFromStore, isPageId, linkChipClass, linkDotClass, modelLinkLabel, pageFromHash } from "./app-nav.ts";
+
+assert.equal(pageFromHash(""), "chat");
+assert.equal(pageFromHash("#files"), "files");
+assert.equal(pageFromHash("settings"), "settings");
+assert.equal(pageFromHash("#nope"), "chat");
+assert.equal(isPageId("tools"), true);
+assert.equal(isPageId("nope"), false);
+assert.equal(detailsOpenFromStore("1", false), true);
+assert.equal(detailsOpenFromStore("0", true), false);
+assert.equal(detailsOpenFromStore(null, true), true);
+assert.equal(detailsOpenFromStore(null, false), false);
+assert.equal(modelLinkLabel({ linked: true, probing: false, model: "grok-4.6" }), "模型可达 · grok-4.6");
+assert.equal(modelLinkLabel({ linked: false, probing: true, model: "" }), "检测中");
+assert.equal(linkChipClass(false), "chip link-chip bad");
+assert.equal(linkChipClass(true), "chip link-chip");
+assert.equal(linkDotClass(true), "dot");
+assert.equal(linkDotClass(null), "dot wait");
+assert.equal(linkDotClass(false), "dot off");
