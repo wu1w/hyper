@@ -63,7 +63,7 @@ fn load(ep: &ChannelEndpoint) -> Overlay {
         }
     }
     if let Some(path) = overlay_path(&k) {
-        if let Ok(raw) = fs::read_to_string(path) {
+        if let Some(raw) = crate::tools::read_text_if_regular(&path) {
             if let Ok(o) = serde_json::from_str::<Overlay>(&raw) {
                 if let Ok(mut g) = store().lock() {
                     g.insert(k, o.clone());
@@ -81,11 +81,14 @@ fn save(ep: &ChannelEndpoint, o: Overlay) {
         g.insert(k.clone(), o.clone());
     }
     if let Some(path) = overlay_path(&k) {
+        if crate::tools::is_special_file(&path) {
+            return;
+        }
         if let Some(parent) = path.parent() {
             let _ = fs::create_dir_all(parent);
         }
         if let Ok(bytes) = serde_json::to_vec_pretty(&o) {
-            let _ = fs::write(path, bytes);
+            let _ = crate::tools::write_if_regular(&path, bytes);
         }
     }
 }

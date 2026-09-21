@@ -2,7 +2,6 @@
 //! the live window. Rule *bodies* are a sibling `[rules]` card (Cursor injects
 //! alwaysApply + glob-matched `.cursor/rules`, not filenames).
 
-use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -138,7 +137,7 @@ fn load_rules(root: &Path, home: Option<&Path>) -> Vec<RuleFile> {
             if !seen.insert(name.to_string()) {
                 continue;
             }
-            let Ok(raw) = std::fs::read_to_string(&path) else {
+            let Some(raw) = crate::tools::read_text_if_regular(&path) else {
                 continue;
             };
             files.push(parse_rule(name, &raw));
@@ -146,7 +145,7 @@ fn load_rules(root: &Path, home: Option<&Path>) -> Vec<RuleFile> {
     }
     let cursorrules = root.join(".cursorrules");
     if cursorrules.is_file() && seen.insert(".cursorrules".into()) {
-        if let Ok(raw) = std::fs::read_to_string(&cursorrules) {
+        if let Some(raw) = crate::tools::read_text_if_regular(&cursorrules) {
             let mut rule = parse_rule(".cursorrules", &raw);
             rule.always = true;
             files.push(rule);
@@ -439,28 +438,37 @@ fn git_at(root: &Path, args: &[&str]) -> Option<Vec<u8>> {
         .stdout(Stdio::piped())
         .stderr(Stdio::null());
     let mut child = cmd.spawn().ok()?;
+    let stdout = child.stdout.take();
+    let reader = std::thread::spawn(move || {
+        let mut buf = Vec::new();
+        if let Some(mut out) = stdout {
+            crate::proc_spawn::drain_capped(&mut out, &mut buf, MAX_GIT_PIPE);
+        }
+        buf
+    });
     let started = Instant::now();
-    loop {
+    let status = loop {
         match child.try_wait() {
-            Ok(Some(st)) if st.success() => {
-                let mut buf = Vec::new();
-                let _ = child.stdout.as_mut()?.read_to_end(&mut buf);
-                return Some(buf);
-            }
-            Ok(Some(_)) => return None,
+            Ok(Some(st)) => break st,
             Ok(None) if started.elapsed() > GIT_TIMEOUT => {
                 let _ = child.kill();
                 let _ = child.wait();
+                let _ = reader.join();
                 return None;
             }
             Ok(None) => std::thread::sleep(Duration::from_millis(20)),
             Err(_) => {
                 let _ = child.kill();
+                let _ = reader.join();
                 return None;
             }
         }
-    }
+    };
+    let buf = reader.join().ok()?;
+    status.success().then_some(buf)
 }
+
+const MAX_GIT_PIPE: usize = 512 * 1024;
 
 #[cfg(test)]
 mod tests {

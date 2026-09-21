@@ -8,7 +8,7 @@
 
 ## 它是什么
 
-一个本机 grok-4.6 harness：Cursor 形 `tools[]`、可观测轨迹、全栈 rust。控制台有办公入口（频道、定时、文稿目录），编码和工作区编辑是同一套 agent。对话页右侧结果区有工作区树，Write/StrReplace 后会打开该文件预览；编辑结果可带 `[diagnostics]`，Search 对标识符走定义跨度。
+一个本机 grok-4.6 harness：Cursor 形 `tools[]`、可观测轨迹、全栈 rust。控制台有办公入口（频道、定时、文稿目录），编码和工作区编辑是同一套 agent。对话页右侧结果区有工作区树，Write/StrReplace 后会打开该文件预览；编译诊断由模型按需调用 `ReadLints`，Search 对标识符走定义跨度。
 
 主交付面是 **进程内 Web 控制台**（`hyper web`），外加 Electron 壳。
 
@@ -64,7 +64,9 @@ Cron / 心跳 / 频道入站也是 **主机定时器或适配器** 去调 `turn.
 
 `Read` · `Write` · `StrReplace` · `Delete` · `Glob` · `Grep` · `ReadLints` · `EditNotebook` · `Shell` · `WebSearch` · `WebFetch` · `GenerateImage` · `TodoWrite` · `AskQuestion` · `SwitchMode` · `Task` · `AwaitShell` · `recall`
 
-执行层仍接受 Qwen 四件套别名（`read` / `write` / `edit` / `bash`），发给模型的 `function.name` 必须是上表。`Read` 一个目录时先收集名称、排序，再截到 200 条（readdir 顺序下先截断会给出任意子集）。`ToolLimits::default()` 与 `[tools] read_default_lines = 600` 一致。
+`SwitchMode plan` 只放行 `plan.md`；`SwitchMode ask` / `/clarify` 只读（含 `plan.md`），同一跳里先切 ask 再 Write 也会被拦。`SwitchMode agent` 才恢复实现。假图片文件（扩展名对、魔数不对）以及远程 URL（404 / HTML）`Read`/`view` 返回 Error，不把无效 media 交给下一跳。假 `.mp4` / `.wav` 同样 Error，不再把 ffmpeg/whisper 空结果当成成功；本机没有 ffmpeg / whisper-cli 时 `view` 也是 Error，不假装看过/听过。端点 `attach_image`/`attach_video` 为 false 时 `view` 是 Error（cannot perceive），不把能力备注当成成功看过。远程视频/音频 URL 先拉取再验魔数。
+
+执行层仍接受 Qwen 四件套别名（`read` / `write` / `edit` / `bash`），发给模型的 `function.name` 必须是上表。`Read` 一个目录时先收集名称、排序，再截到 200 条（readdir 顺序下先截断会给出任意子集）。目录本身无权限时 Error，不假装空列表。含 NUL 或非法 UTF-8 的文件按二进制拒绝，不把 `\0` 当文本页。Read `limit=0` 回落到默认页长，不交空页。Write 到已有目录返回 `is a directory`。把文件当中间路径写（`keep.txt/oops`）返回 `is not a directory`。Grep/Glob 指到不存在的 path 返回 Error，不假装「No matches」。Grep `head_limit=0` 不当成零命中上限（会假装 No matches），回落到默认 cap。Grep 指到无权限文件或整个目录返回 Error（ripgrep stderr 去掉 `os error N`），不假装 No matches；同树里其它可读文件仍有命中时保留 hits，并附带 permission 脚注。工具 I/O 失败对用户只说 permission denied / file exists 这类话，不带 `os error N`。Glob 会列出文件符号链接名字（含断链）以及 FIFO/socket 名字，不走进目录符号链接。walk 遇到不可读子目录时 Glob 不再假装「No files matching」：全不可读 Error，部分不可读保留其它命中并加脚注。Delete 删除命名路径上的链接，不跟随去删目标。Read 目录把指向目录的符号链接标成 `name/`。Read/Write/StrReplace/Grep/EditNotebook 碰到 FIFO/socket/设备返回 `not a regular file`，不阻塞 hop。超过 8MiB 的文本 Read/StrReplace/Write contents 报太大，不整文件灌内存。Read / Grep walk / EditNotebook 走非阻塞读，FIFO 中途换上也不会卡住。Office/PDF Read 走文档抽取（Office 上限 96MiB，PDF 输入 16MiB、页对象 200、抽出文本 8MiB），不被文本 8MiB 帽误拦。PDF 页对象超限直接 Error，不先让 pdf_extract 扩内存。Shell `cat`/`head`/`tail` 指到 FIFO/socket/设备（含 `cat < fifo`）；`echo > fifo` / `dd if=` / `cp fifo` / `cat fifo | wc` / `wc fifo` 同样立刻 Error立刻 Error，不再卡到 coordinator 24h 墙。Grep 目录扫描 `--max-filesize 8M`；单个大文件仍不受该帽；超长匹配行按 ripgrep `--max-columns` 截断预览；rg 一边跑一边抽 stdout，避免管道撑满后 `wait` 死锁。Shell 活窗口 1MiB 后再丢弃最多 8MiB，截断时正文附 truncated 脚注，不再假装完整输出；无界输出（`yes`）满帽后停读、不掐管道，短 `block_until_ms` 能交给 AwaitShell，不会 SIGPIPE 成 exit -1；子进程堵在满管道上（0 CPU）直到取消或 24h 墙。stdout/stderr 含 NUL 时省略为 binary，不把 `/dev/zero` 灌进下一跳；run_code 丢弃满帽后松开管道（无 AwaitShell offload）；git / rg / ffmpeg 的 cap drain 再丢 8MiB 后松开管道；`--print` 收轮取消后台 Shell。远程媒体与 GenerateImage 拉图无 Content-Length 时按上限流式截断。下一跳内联本地图前跳过 FIFO。开场读 AGENT.md / AGENTS.md / cron.json / MCP overlay 跳过 FIFO，不阻塞 hop。会话 JSONL / CURRENT / `*.official.json` 若是 FIFO 直接 Error，控制台列会话只读 jsonl 前 512KiB。邻座 recap / inspect / blob GC / `recall` seq 打开 jsonl 走非阻塞读；JSONL 追加/重写同样 O_NONBLOCK，FIFO 换上也不卡 hop。官方 compact sidecar 按 32MiB 加载，不被 8MiB 文本帽丢掉。邻座 recap 只读 jsonl 头尾，不整文件 slurp。心跳 HEARTBEAT.md、web-cron.json、IM routes.json、grok auth.json 同样跳过 FIFO/超大文件；工作区 pulse 读 HEARTBEAT.md 不阻塞；config.toml 过大拒绝 load_or_init。子代理 `{id}.task.json`、doc-cache、BlobStore、home 0600 写入、desktop.log / feishu.log 同样跳过 FIFO。IM / probe / compact JSON 与错误页按上限抽流。Read/Grep/Write 等同步工具在 `spawn_blocking` 里跑，不占死 tokio。IM 入站媒体按上限流式截断（含 Telegram 文件）。git ls-files / Tavily 响应同样抽流。Write 执行前快照、GenerateImage dest、MCP downloadPath 同样拒绝特殊文件。未挂进 `tools[]` 的 `GetDynamicTools` / `CallDynamicTool` / `FetchMcpResource` / `mcp` / `memory_search` 幻觉调用返回 unknown（`skill` 仍可在无 schema 时执行）。ComputerUse 截图/列屏前先查 Screen Recording，没有权限立刻 Error，不调用会卡住的 xcap；单跳 12 秒墙。`ToolLimits::default()` 与 `[tools] read_default_lines = 600` 一致。Search 索引单文件上限 8MiB（与 Grep/文本 slurp 对齐）。view 本地媒体与 ffmpeg 抽帧走非阻塞读。IM routes.json 打开与 flush 8MiB 帽、非阻塞。TodoWrite / CURRENT / chat template 走 `read_bytes_regular`。官方 sidecar / vendor / IM 本地附件走 `read_bytes_capped`。Telegram offset / 微信 cursor / 飞书 catchup / pairing overlay / session controls 写入跳过 FIFO，不卡过夜脉冲。Office zip 条目 8MiB、合计 16MiB 抽取帽。PDF 抽取输入 16MiB、抽出文本 8MiB。GenerateImage 拷贝 16MiB。blob GC 扫 64MiB 会话。probe.json 写入跳过 FIFO。
 
 **按配置追加：**
 
@@ -72,7 +74,7 @@ Cron / 心跳 / 频道入站也是 **主机定时器或适配器** 去调 `turn.
 |---|---|
 | `web` | `[web] enabled`（默认开；无 key 走 Bing/DuckDuckGo HTML + 抓取） |
 | `GetDynamicTools` + `CallDynamicTool` + `FetchMcpResource` | 配置里列出了 MCP server；发现 live `tools/list`、调用工具、列出/读取 resources（`downloadPath` 写入工作区） |
-| `skill` | 技能目录存在时 |
+| `skill` | 技能目录存在时；`skills_auto_catalog` 只把工作区技能和最多 24 条名字写进系统提示，不把整份 `~/.cursor/skills` 灌进每一跳 |
 | `view` | 打开图片 / 音视频 |
 | `search` | 代码搜索 |
 | `recall` | 从 agent 会话开始固定挂载；关键词检索、seq 原文展开、blob 完整工具结果 |
@@ -80,19 +82,19 @@ Cron / 心跳 / 频道入站也是 **主机定时器或适配器** 去调 `turn.
 
 `code` 模式是另一组：`run_code`、`read`、`bash`。
 
-`search` 使用函数级 SQLite FTS 索引，只把命中的有限代码片段交给模型。Git 工作区的索引缓存在 `~/.grok-hyper/code-index/`，再次打开时按文件大小和纳秒 mtime 增量刷新；项目目录里不生成索引文件。工具写文件后会即时刷新对应条目。
+`search` 使用函数级 SQLite FTS 索引，只把命中的有限代码片段交给模型。Git 工作区的索引缓存在 `~/.grok-hyper/code-index/`，再次打开时按文件大小和纳秒 mtime 增量刷新；项目目录里不生成索引文件。工具写文件后会即时刷新对应条目。工作区是 home / Desktop / 盘符根时 Search 直接 Error（不会假装 still warming）。空索引是 `No matches.`，索引构建失败是 Error。WebFetch 超过 `fetch_max_bytes` 时正文附 truncated 脚注。Grep 的 rg 管道满 512KiB 同样标明 truncated。
 
 `bash` 对模型保持一个名字和一种常用语法：macOS/Linux 走无 profile Bash，Windows 优先自动发现 Git Bash，没有时才退到无 profile PowerShell。可用 `HYPER_SHELL` 显式覆盖，但正常安装无需给模型增加操作系统判断提示。
 
 模型若发 Qwen 风格的 XML `<tool_call>`，和 OpenAI `tool_calls` 走同一套解析合并。
 
-工作区路径用 `Workspace` 做相对解析。控制台换根目录等于换这个 `Workspace`，并 `refresh_surface` 重载该目录下的技能 / MCP overlay。
+工作区路径用 `Workspace` 做相对解析。控制台换根目录等于换这个 `Workspace`，并 `refresh_surface` 重载该目录下的技能 / MCP overlay。Write/StrReplace 跟随已有文件符号链接，不会把链接 rename 成普通文件。Delete 不跟随。`GenerateImage` 的 `filename`、`FetchMcpResource` 的 `downloadPath` 与 `EditNotebook` 走同一套写围栏。
 
 ## 子代理（Task）
 
 深度 1：孩子不能再 `Task`。explore / plan 只读（plan 可写 `plan.md`）。office / generalPurpose 可写。
 
-`isolation`：`none` 和 `auto`（默认；空字符串也是 auto）共用父 cwd，所以办公目录即使碰巧是 git 仓库，孩子看到的也是用户正在看的未提交稿，Write 也写回那里。`worktree` 必须是 git 仓库，从 **HEAD** 检出到 `~/.grok-hyper/worktrees/<child-id>`（看不见未提交改动），跑完**不拆树**、不 merge；SUMMARY 带 `WORKTREE` 绝对路径。`resume` 用 ChildRecord 里记下的 isolation，漏参数不会掉回 auto。下次 Task 只 prune 崩溃残留（没有 keep 标记的目录）。子代理 registry 写 `{id}.task.json`：进程重启后 `get_or_load` / AwaitShell 能从磁盘找到孩子；当时还在跑的记成 `interrupted: process restarted`，不自动重跑。schema 以外的 isolation 值直接报错。
+`isolation`：`none` 和 `auto`（默认；空字符串也是 auto）共用父 cwd，所以办公目录即使碰巧是 git 仓库，孩子看到的也是用户正在看的未提交稿，Write 也写回那里。`worktree` 必须是 git 仓库，从 **HEAD** 检出到 `~/.grok-hyper/worktrees/<child-id>`（看不见未提交改动），跑完**不拆树**、不 merge；SUMMARY 带 `WORKTREE` 绝对路径。`resume` 用 ChildRecord 里记下的 isolation，漏参数不会掉回 auto。下次 Task 只 prune 崩溃残留（没有 keep 标记的目录）。子代理 registry 写 `{id}.task.json`：进程重启后 `get_or_load` / AwaitShell 能从磁盘找到孩子；当时还在跑的记成 `interrupted: process restarted`，不自动重跑。AwaitShell 等失败孩子是 Error，取消是 Interrupted；`wait_commands_or_subagents` 带 `task_ids` 等整组。schema 以外的 isolation 值直接报错。
 
 孩子接到父的 `permit` / `clarify` / live sink。父是 ask 时，孩子写文件、跑 Shell、AskQuestion 走同一套收件箱，不会 YOLO，也不会报「需要 interactive channel」。孩子不把思考 / 正文 delta 混进父气泡；完成的工具事件会转发到父 live sink。`/fork --worktree` 仍然只拷会话，不建 git worktree。
 
@@ -104,9 +106,9 @@ Cron / 心跳 / 频道入站也是 **主机定时器或适配器** 去调 `turn.
 4. 工具调用按审批模式停或放行；结果写回 messages，直到模型自己收口。`max_steps = 0` 时没有跳数墙。
 5. 事件追加到会话 JSONL；`stop` 结束本轮。WS 广播环只推增量；客户端 `Lagged` 时 **这条 socket** 收到 `resync`（state / permit / clarify / 当前会话 `console_events`，与 hello 相同、已去掉 inline `data:`），立刻重绘，不必等 80ms 的 `GET /history`。不要把整份 JSONL 丢回广播总线（Windows 上会卡死）。
 
-默认 `auto` 对 grok-4.6 映射为 **xhigh**（思考关不掉）；Qwen 仍是官方中性 `medium`。`/think`、`--think`、`/fast` 仍可人工覆盖。grok 走 Responses：不回放思考、不回放 tool-hop 助手正文、不把 QwenPaw 的 `[trajectory]` / `[style]` / `[out]` / `[locate]` / `[oracle]` / `[guard]` 注记当用户消息。同参工具第 6 次只提醒、不停止。控制台和 TUI 不把 tool-hop 旁白画成答案气泡。Qwen 本地权重仍走软干预：同参 6 次提醒一次，dump 延后工具并观察一次。
+默认 `auto` 对 grok-4.6 映射为 **high**（思考关不掉；最高档是 `/think xhigh`）；Qwen 仍是官方中性 `medium`。`/think`、`--think`、`/fast` 仍可人工覆盖。grok 走 Responses：不回放思考、不回放 tool-hop 助手正文、不把 QwenPaw 的 `[trajectory]` / `[style]` / `[out]` / `[locate]` / `[oracle]` / `[guard]` 注记当用户消息。同参工具第 6 次只提醒、不停止。控制台和 TUI 不把 tool-hop 旁白画成答案气泡。Qwen 本地权重仍走软干预：同参 6 次提醒一次，dump 延后工具并观察一次。
 
-轨迹控制：测试转红、修改测试期望和编辑摇摆只作为隐藏事实反馈，不替模型决定停止或回退。思考触及上限时保留模型选择的思考模式；grok 不再追加“collapse to one conclusion”讲义。只有再次触顶、时间、步数或上下文硬上限才终止。控制台/TUI 默认 **500 步**、30 分钟硬墙钟（与 IM / Hermes `max_turns` 对齐）。IM 默认 500 步、**30 分钟墙钟**（`max_wall_unattended_seconds = 1800`）；Shell 未带 `block_until_ms` 时由 coordinator（默认 `code_mode.timeout_s = 60`）offload/取消，bash 内层不再套 120 秒硬杀。出站空正文不发占位句；连接失败会重试，读超时不重试以免 QQ 重复消息。微信 iLink 长轮询独占 cursor，不能和 Hermes weixin 共用同一个 bot。子代理 `Task` 的 registry 写 `{id}.task.json`：进程重启后 `resume` / AwaitShell 能找到孩子；当时还在跑的记成 `interrupted: process restarted`，不自动重跑。
+轨迹控制：测试转红、修改测试期望和编辑摇摆只作为隐藏事实反馈，不替模型决定停止或回退。思考触及上限时保留模型选择的思考模式；grok 不再追加“collapse to one conclusion”讲义。只有再次触顶、时间、步数或上下文硬上限才终止。控制台/TUI 默认 **500 步**、30 分钟硬墙钟（与 IM / Hermes `max_turns` 对齐）。IM 默认 500 步、**30 分钟墙钟**（`max_wall_unattended_seconds = 1800`）；Shell 未带 `block_until_ms` 时由 coordinator（默认 `code_mode.timeout_s = 60`）offload/取消，`block_until_ms=0` 立刻后台。compact 后 RAM 归档工具输出收成 stub，recall 读 JSONL。compact 前活窗口工具输出超过 4MiB 也把最旧的收成 stub，过夜 `working_window=0` 不会把 64MiB jsonl 整表留在 RAM。bash 内层不再套 120 秒硬杀。出站空正文不发占位句；连接失败会重试，读超时不重试以免 QQ 重复消息。微信 iLink 长轮询独占 cursor，不能和 Hermes weixin 共用同一个 bot。子代理 `Task` 的 registry 写 `{id}.task.json`：进程重启后 `resume` / AwaitShell 能找到孩子；当时还在跑的记成 `interrupted: process restarted`，不自动重跑。
 
 上下文窗口默认 **500000**。超过 soft threshold 或 200k 输入阈值时，session/api_key 先对实际上下文调用 `POST /v1/responses/compact`，失败再本地归档；openai_compat 用本地 archive compact。普通工具数量不再触发新一轮压缩，截图仍保留独立阈值。`recall` 从会话开始固定挂载；历史卡按当前问题检索本场旧的用户要求和结论，中文用片段匹配补足 unicode61 的局限。
 
@@ -161,4 +163,4 @@ Web 与 CLI 共用一个 `SessionRouter` + `ChannelManager`：同一会话不会
 
 ## 长会话与工具效率修复
 
-详见 [2026-09-06 设计检查与修复记录](harness-efficiency-review.md)。Grok 路径不再用相似搜索、文件名命中、单轮 Search/Grep 配额替代真实工具结果；用户限制、审批和同参循环保护仍然执行。自动编译诊断在一批修改结束后执行一次，并明确回传成功状态。
+详见 [2026-09-06 设计检查与修复记录](harness-efficiency-review.md)。Grok 路径不再用相似搜索、文件名命中、单轮 Search/Grep 配额替代真实工具结果；用户限制、审批和同参循环保护仍然执行。编译诊断由 `ReadLints` 按需调用，不在每次 Write/StrReplace 后自动 `cargo check`。ReadLints 超时或没跑 checker 是 Error，不把「没查成」说成成功。整树 `git diff` / `find` / `ls -R` 跳过时标 Error（附 hint），不再假装命令成功。工作区根上未过滤的 Glob `**/*` 标 Error（附顶层 sample），不再假装整树列全。PDF `/Length` 声明超过摘录帽时在 pdf_extract 前 Error。 Shell `grep`/`rg`/`vim`/`nano` 打开 FIFO 在 spawn 前 Error。 OAuth `auth.json.tmp` FIFO 用 write_if_regular，不再卡住 persist。 Shell `curl`/`wget` `file://` FIFO 在 spawn 前 Error。 Shell 固定 `PAGER=cat`/`GIT_PAGER=cat`，`git log` 不再挂 less。 PDF 间接 `/Length N 0 R` 会解析 `N 0 obj` 整数，挡 flate 炸弹。 `sqlite3`/`createReadStream` 打开 FIFO 同样预检。`os.system`/`subprocess`+`listdir` 碰到 cwd FIFO 在 spawn 前 Error；旁边 `echo hi` 仍可跑。Grep/Glob walk 扫到时间预算标 Error，空结果不再假装 No matches。python3 -c / run_code 里引号路径若是 FIFO 立刻 Error。xlsx `dimension` 超 25 万格在 calamine 扩 Range 前 Error。`.xls` / `.xlsb` 一律 Error（没有格子预检，禁止进 calamine）。无 `/Length` 的 `/FlateDecode` PDF 在 pdf_extract 前 Error。 只有 FIFO 的目录上 Grep 标 Error，不再假装 No matches。 目录扫描因 8MiB 帽漏掉超大文件时 Grep 标 Error，不再假装 No matches。 解释器 `open('huge.txt')` 超过 8MiB 在 spawn 前 Error，不让子进程整文件灌 RAM。 Glob 命中顶到 200 条、Read 目录列出截断，都标 Error，不再假装列全。 WebFetch 碰到体积帽截断标 Error，不再假装看完整页。 Web 客户端把 127.0.0.1/localhost 留在 NO_PROXY，避免 WebFetch 本机地址被公司代理吸走。 Grep ripgrep 管道顶到 512KiB 标 Error，不再假装搜全。 Grep 旁边有超大文件时，即使小文件命中也标 Error（incomplete），不再假装搜全。 Grep 旁边有 FIFO 时，即使小文件命中也标 Error（incomplete），不再假装搜全。 PDF `/FlateDecode` 在 pdf_extract 前按 8MiB 帽试解压，挡 Length 合法的 zip bomb。 Shell / run_code stdout 顶到 1MiB 活窗标 Error，不再假装命令输出看全。 tarfile.open / cv2.VideoCapture / h5py.File 打开 FIFO 在 spawn 前 Error。 pandas.read_* / shutil.copy 打开 FIFO 在 spawn 前 Error。 WebSearch 引擎页截断标 Error。 Shell `deno eval`/`bun -e`/`ruby File.binread` 打开 FIFO 在 spawn 前 Error。 WebFetch 碰到体积帽截断标 Error，不再假装看完整页。python3 heredoc / `p='fifo'` / `gzip`/`strings` 指到 FIFO 立刻 Error；ODS `number-rows-repeated` 炸弹在 calamine 前 Error。Shell `awk`/`sed`/`jq` 指到 FIFO 同样立刻 Error。xlsx `dimension` 写小、实际 `<c` 很多时按较大值拦截。xlsx 超过 80 张表在 calamine 前 Error。pptx 超过 80 张幻灯片直接 Error。doc-cache 写入走 write_if_regular。Shell `tar`/`zip`/`rsync` 指到 FIFO 立刻 Error。Shell `diff`/`cmp`/`comm` 指到 FIFO 立刻 Error。python/node `open(p)` / `os.listdir` 且 cwd 有 FIFO 时立刻 Error；`open('notes.md')` 仍可跑。Shell `ffmpeg`/`sqlite3`/`openssl` 指到 FIFO 立刻 Error。

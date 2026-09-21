@@ -64,6 +64,9 @@ pub fn write_workspace_file(root: &Path, rel: &str, bytes: &[u8]) -> Result<(Str
     if path.is_dir() {
         bail!("is a directory");
     }
+    if hyper_loop::is_special_file(&path) {
+        bail!("not a regular file");
+    }
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent)?;
     }
@@ -528,6 +531,9 @@ pub fn read_preview(root: &Path, rel: &str, cap: usize) -> Result<(String, Vec<u
     if path.is_dir() {
         bail!("is a directory");
     }
+    if hyper_loop::is_special_file(&path) {
+        bail!("not a regular file");
+    }
     // 有界读:最多 cap+1 字节,多出的 1 字节只用来判断截断,
     // 几 GB 的文件不再整个读进内存
     let f = fs::File::open(&path)?;
@@ -793,6 +799,24 @@ mod tests {
         let (_, body, truncated) = read_preview(&dir, "big.txt", 100).unwrap();
         assert_eq!(body.len(), 100);
         assert!(!truncated);
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn read_preview_fifo_is_error_not_hang() {
+        let dir = std::env::temp_dir().join(format!("hyper-web-fifo-{}", uuid::Uuid::new_v4()));
+        fs::create_dir_all(&dir).unwrap();
+        let fifo = dir.join("pipe.txt");
+        let st = std::process::Command::new("mkfifo")
+            .arg(&fifo)
+            .status()
+            .unwrap();
+        assert!(st.success());
+        let started = std::time::Instant::now();
+        let err = read_preview(&dir, "pipe.txt", 10).unwrap_err();
+        assert!(started.elapsed() < std::time::Duration::from_secs(2));
+        assert!(err.to_string().contains("not a regular file"), "{err}");
         fs::remove_dir_all(&dir).ok();
     }
 

@@ -132,7 +132,9 @@ pub(crate) fn read_session_inner() -> Result<Option<SessionMaterial>> {
     let Some(path) = session_path_if_present() else {
         return Ok(None);
     };
-    let raw = fs::read_to_string(&path).map_err(|_| login_err())?;
+    let Some(raw) = crate::tools::read_text_if_regular(&path) else {
+        return Err(login_err());
+    };
     parse_auth_json(&raw, &path)
 }
 
@@ -295,12 +297,15 @@ pub fn persist_session_tokens_at(path: &Path, tokens: &SessionTokens) -> Result<
     if tokens.access_token.trim().is_empty() {
         return Err(Error::msg("oauth returned an empty access token"));
     }
+    if crate::tools::is_special_file(path) {
+        return Err(Error::msg("grok login session file is not a regular file"));
+    }
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent)?;
     }
-    let mut root = match fs::read_to_string(path) {
-        Ok(raw) => serde_json::from_str::<Value>(&raw).unwrap_or_else(|_| json!({})),
-        Err(_) => json!({}),
+    let mut root = match crate::tools::read_text_if_regular(path) {
+        Some(raw) => serde_json::from_str::<Value>(&raw).unwrap_or_else(|_| json!({})),
+        None => json!({}),
     };
     if !root.is_object() {
         root = json!({});
@@ -314,7 +319,7 @@ pub fn persist_session_tokens_at(path: &Path, tokens: &SessionTokens) -> Result<
     });
     root[SESSION_SLOT] = entry;
     let tmp = path.with_extension("json.tmp");
-    fs::write(
+    crate::tools::write_if_regular(
         &tmp,
         serde_json::to_vec_pretty(&root).map_err(|e| Error::msg(e.to_string()))?,
     )?;
@@ -470,6 +475,71 @@ mod tests {
         let e = expired_err().to_string();
         assert!(e.contains("过期") || e.contains("expired"));
         assert!(!e.contains("eyJ"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn persist_fifo_is_error_not_hang() {
+        let dir = tempfile_dir();
+        let path = dir.join("auth.json");
+        let st = std::process::Command::new("mkfifo")
+            .arg(&path)
+            .status()
+            .unwrap();
+        assert!(st.success());
+        let started = std::time::Instant::now();
+        let err = persist_session_tokens_at(
+            &path,
+            &SessionTokens {
+                access_token: "tok".into(),
+                refresh_token: "ref".into(),
+                expires_at: 9_999_999_999,
+            },
+        )
+        .unwrap_err();
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(2),
+            "FIFO auth.json must not block persist: {:?}",
+            started.elapsed()
+        );
+        let msg = err.to_string();
+        assert!(msg.contains("not a regular file"), "{msg}");
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn persist_tmp_fifo_is_error_not_hang() {
+        let dir = tempfile_dir();
+        let path = dir.join("auth.json");
+        let tmp = path.with_extension("json.tmp");
+        let st = std::process::Command::new("mkfifo")
+            .arg(&tmp)
+            .status()
+            .unwrap();
+        assert!(st.success());
+        let started = std::time::Instant::now();
+        let err = persist_session_tokens_at(
+            &path,
+            &SessionTokens {
+                access_token: "tok".into(),
+                refresh_token: "ref".into(),
+                expires_at: 9_999_999_999,
+            },
+        )
+        .unwrap_err();
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(2),
+            "FIFO auth.json.tmp must not block persist: {:?}",
+            started.elapsed()
+        );
+        let msg = err.to_string();
+        assert!(
+            msg.contains("not a regular file") || msg.contains("regular"),
+            "{msg}"
+        );
+        let _ = fs::remove_file(&tmp);
+        let _ = fs::remove_dir_all(dir);
     }
 
     fn tempfile_dir() -> PathBuf {

@@ -22,8 +22,7 @@ use crate::template::ChatMessage;
 use crate::tool_calls::{CancelFlag, ToolCoordinator, COORDINATOR_OWNED_EXEC_TIMEOUT_SECS};
 use crate::tools::{BlobStore, Workspace};
 use crate::tools_schema::{
-    agent_tools, code_tools, computer_use_tool, dispatch_name, dynamic_mcp_tools, search_tool,
-    view_tool,
+    agent_tools, code_tools, dispatch_name, dynamic_mcp_tools, search_tool, view_tool,
 };
 
 impl<C: Completer> Agent<C> {
@@ -117,14 +116,18 @@ impl<C: Completer> Agent<C> {
                 .and_then(|l| l.policy())
                 .unwrap_or_else(|| wire.clone())
         };
-        // Old JSONL froze medium. Unlocked Agent/Code on grok-4.6 must match
-        // the wire default (xhigh), including IM `Agent::new` each message.
+        // Old JSONL froze medium. Unlocked Agent/Code must match the wire
+        // default (high; xhigh stays opt-in). Do not downgrade a stored xhigh.
         if !opts.effort_locked
             && matches!(
                 opts.session_mode,
                 crate::session::SessionMode::Agent | crate::session::SessionMode::Code
             )
-            && wire.effort == Some(crate::policy::Effort::Xhigh)
+            && matches!(
+                wire.effort,
+                Some(crate::policy::Effort::High) | Some(crate::policy::Effort::Xhigh)
+            )
+            && policy.effort != wire.effort
             && policy.effort != Some(crate::policy::Effort::Xhigh)
         {
             policy = wire;
@@ -224,6 +227,7 @@ impl<C: Completer> Agent<C> {
             watchdog_roomy_tried: false,
             wrap_up_after_tools: false,
             stub_nudged: false,
+            synthesis_nudged: false,
             length_truncations: 0,
             turn_steps: 0,
             turn_prompt_tokens: 0,
@@ -329,6 +333,7 @@ impl<C: Completer> Agent<C> {
             media_max_bytes: self.media_max_bytes,
             child: self.child,
             plan_mode: self.plan_mode,
+            clarify_mode: self.clarify_mode,
             skip_grep: super::notes::forbids_grep(self.last_real_user()),
             skip_glob: super::notes::forbids_glob(self.last_real_user()),
             search_queries: crate::lock_unpoison(&self.search_queries).clone(),
@@ -438,7 +443,7 @@ pub(crate) fn bind_periphery(
     );
     if extra_tools {
         let skills_md = if opts.skills_auto_catalog {
-            skills.catalog_markdown()
+            skills.catalog_markdown_for(Some(workspace.root()))
         } else {
             String::new()
         };
@@ -465,7 +470,7 @@ pub(crate) fn bind_periphery(
         tools.push(view_tool());
     }
     if opts.computer_use && matches!(tool_set, ToolSet::Agent) && opts.child.is_none() {
-        tools.push(computer_use_tool());
+        tools.push(crate::tools::computer::tool_schema());
     }
     if opts.child.is_some() {
         tools.retain(|t| {
@@ -486,7 +491,7 @@ pub(crate) enum AgentsMd {
 
 pub(crate) fn read_agents_md(root: &std::path::Path, max_tokens: u32, head: bool) -> AgentsMd {
     let path = root.join("AGENTS.md");
-    let Ok(raw) = std::fs::read_to_string(path) else {
+    let Some(raw) = crate::tools::read_text_if_regular(&path) else {
         return AgentsMd::Missing;
     };
     if raw.trim().is_empty() {
@@ -505,5 +510,35 @@ pub(crate) fn read_agents_md(root: &std::path::Path, max_tokens: u32, head: bool
         }
     } else {
         AgentsMd::TooLarge
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[cfg(unix)]
+    #[test]
+    fn read_agents_md_fifo_is_missing_not_hang() {
+        let dir = std::env::temp_dir().join(format!(
+            "hyper-agents-fifo-{}",
+            uuid::Uuid::new_v4().simple()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("AGENTS.md");
+        let st = std::process::Command::new("mkfifo")
+            .arg(&path)
+            .status()
+            .unwrap();
+        assert!(st.success());
+        let started = std::time::Instant::now();
+        let loaded = read_agents_md(&dir, 400, true);
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(2),
+            "FIFO AGENTS.md must not block: {:?}",
+            started.elapsed()
+        );
+        assert!(matches!(loaded, AgentsMd::Missing));
+        let _ = std::fs::remove_dir_all(dir);
     }
 }

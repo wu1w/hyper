@@ -37,11 +37,35 @@ impl SessionRouter {
         if let Some(dir) = path.parent() {
             fs::create_dir_all(dir)?;
         }
+        if crate::tools::is_special_file(&path) {
+            return Err(Error::msg(format!(
+                "session routes {} is not a regular file",
+                path.display()
+            )));
+        }
+        if crate::tools::is_oversized_text(&path) {
+            return Err(Error::msg(format!(
+                "session routes {} is too large",
+                path.display()
+            )));
+        }
         let map = if path.is_file() {
-            let raw = fs::read_to_string(&path)?;
-            serde_json::from_str::<RoutesFile>(&raw)
-                .map(|f| f.routes)
-                .unwrap_or_default()
+            match crate::tools::read_bytes_regular(&path) {
+                Ok(b) => {
+                    let raw = String::from_utf8_lossy(&b);
+                    serde_json::from_str::<RoutesFile>(&raw)
+                        .map(|f| f.routes)
+                        .unwrap_or_default()
+                }
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => BTreeMap::new(),
+                Err(e) => {
+                    return Err(Error::msg(format!(
+                        "session routes {}: {}",
+                        path.display(),
+                        crate::tools::io_user_msg(&e)
+                    )))
+                }
+            }
         } else {
             BTreeMap::new()
         };
@@ -90,6 +114,12 @@ impl SessionRouter {
     }
 
     fn flush(&self) -> Result<()> {
+        if crate::tools::is_special_file(&self.path) {
+            return Err(Error::msg(format!(
+                "session routes {} is not a regular file",
+                self.path.display()
+            )));
+        }
         let mut opts = OpenOptions::new();
         opts.create(true).read(true).write(true);
         #[cfg(unix)]
@@ -119,10 +149,16 @@ impl SessionRouter {
     }
 }
 
+const ROUTES_MAX: u64 = 8 * 1024 * 1024;
+
 fn read_routes(file: &mut File) -> Result<BTreeMap<String, String>> {
     file.seek(SeekFrom::Start(0))?;
     let mut raw = String::new();
-    file.read_to_string(&mut raw)?;
+    let n = std::io::Read::take(std::io::Read::by_ref(file), ROUTES_MAX + 1)
+        .read_to_string(&mut raw)?;
+    if n as u64 > ROUTES_MAX {
+        return Err(Error::msg("session routes is too large"));
+    }
     if raw.trim().is_empty() {
         return Ok(BTreeMap::new());
     }
@@ -168,6 +204,29 @@ mod tests {
         assert_eq!(disk.lookup(&wx.route_key()), Some(wx_id.as_str()));
         assert_eq!(disk.lookup(&qq_env.route_key()), Some(qq_id.as_str()));
         assert!(disk.lookup(&wx2.route_key()).is_some());
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn open_fifo_routes_is_error_not_hang() {
+        let dir = std::env::temp_dir().join(format!("hyper-rt-fifo-{}", new_session_id()));
+        fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("routes.json");
+        let st = std::process::Command::new("mkfifo")
+            .arg(&path)
+            .status()
+            .unwrap();
+        assert!(st.success());
+        let started = std::time::Instant::now();
+        let err = SessionRouter::open(&path).unwrap_err();
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(2),
+            "FIFO routes.json must not block: {:?}",
+            started.elapsed()
+        );
+        let msg = err.to_string();
+        assert!(msg.contains("not a regular file"), "{msg}");
         let _ = fs::remove_dir_all(dir);
     }
 

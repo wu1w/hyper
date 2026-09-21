@@ -33,10 +33,12 @@ impl Effort {
         }
     }
 
-    /// `auto` maps to xhigh for Grok 4.6 (Cursor Super Grok), Medium for Qwen.
+    /// `auto` maps to high for Grok 4.6 (Cursor Auto / grok CLI working
+    /// effort). SuperGrok `xhigh` is opt-in via `/think xhigh`. Qwen stays
+    /// official-neutral Medium.
     pub fn auto_for(family: crate::family::Family) -> Self {
         if family.thinking_always_on() {
-            Self::Xhigh
+            Self::High
         } else {
             Self::Medium
         }
@@ -142,13 +144,14 @@ impl ThinkPolicy {
         Self::off()
     }
 
-    /// Session default. Grok `auto` is xhigh. Qwen stays medium (no Jinja
+    /// Session default. Grok `auto` is high. Qwen stays medium (no Jinja
     /// lecture). Low still maps to medium effort so Qwen does not inject the
     /// brief-low sentence; the think cap still uses `max_think_low`.
     pub fn native_with(b: &ThinkBudget) -> Self {
         let max_think_tokens = match b.default_effort {
             Effort::Low => b.max_think_low,
-            Effort::Medium | Effort::High | Effort::Xhigh => b.max_think_xhigh,
+            Effort::Medium | Effort::High => b.max_think_medium,
+            Effort::Xhigh => b.max_think_xhigh,
         };
         let effort = match b.default_effort {
             Effort::Low => Effort::Medium,
@@ -564,7 +567,7 @@ mod tests {
         let locked = ThinkPolicy::agent_default().apply_lossy_think_cap(true);
         assert_eq!(locked.max_think_tokens, 512);
         let native = ThinkPolicy::native_with(&ThinkBudget::default()).apply_lossy_think_cap(false);
-        assert_eq!(native.max_think_tokens, 4096);
+        assert_eq!(native.max_think_tokens, 2048);
         let off = ThinkPolicy::off().apply_lossy_think_cap(false);
         assert_eq!(off.max_think_tokens, 0);
     }
@@ -704,14 +707,14 @@ mod tests {
     }
 
     #[test]
-    fn auto_for_grok46_is_xhigh() {
+    fn auto_for_grok46_is_high() {
         assert_eq!(
             Effort::auto_for(crate::family::Family::Grok46),
-            Effort::Xhigh
+            Effort::High
         );
         assert_eq!(
             Effort::from_config_for_family("auto", crate::family::Family::Grok46),
-            Some(Effort::Xhigh)
+            Some(Effort::High)
         );
         assert_eq!(Effort::from_config("high"), Some(Effort::High));
         assert_eq!(
@@ -726,7 +729,7 @@ mod tests {
         let p = ThinkPolicy::native_with(&b);
         assert!(p.enabled);
         assert_eq!(p.effort, Some(Effort::Medium));
-        assert_eq!(p.max_think_tokens, 4096);
+        assert_eq!(p.max_think_tokens, 2048);
         assert_eq!(p.max_tokens, 0);
         assert!(p.preserve);
     }
@@ -741,6 +744,17 @@ mod tests {
         assert_eq!(p.max_think_tokens, b.max_think_xhigh);
         assert_eq!(p.max_tokens, 0);
         assert!(p.preserve);
+    }
+
+    #[test]
+    fn native_high_default_caps_at_medium_think() {
+        let mut b = ThinkBudget::default();
+        b.default_effort = Effort::High;
+        let p = ThinkPolicy::native_with(&b);
+        assert!(p.enabled);
+        assert_eq!(p.effort, Some(Effort::High));
+        assert_eq!(p.max_think_tokens, b.max_think_medium);
+        assert_ne!(p.max_think_tokens, b.max_think_xhigh);
     }
 
     #[test]

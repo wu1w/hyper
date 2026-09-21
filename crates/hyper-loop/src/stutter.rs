@@ -77,28 +77,90 @@ fn is_verdict_like(t: &str) -> bool {
 /// Grok synthesis hop sometimes narrates Write instead of emitting a native
 /// tool call (`I'll write files`, empty ` ```html ` fences). That is not a
 /// finished answer and must not be archived as a Decision.
+///
+/// A finished answer may *quote* those phrases (this harness's own docs, or
+/// Cursor ` ```startLine:endLine:filepath ` citations). After stripping the
+/// intent boilerplate, leftover substantial prose is a delivery.
 pub fn is_leaked_write_narration(s: &str) -> bool {
-    let l = s.to_ascii_lowercase();
-    const MARKS: &[&str] = &[
-        "i'll write files",
-        "i will write files",
-        "write files with the write",
-        "the write tool is available",
-        "let me actually invoke",
-        "function call format",
-        "i'll call write",
-        "i'll batch writes",
-        "continuing with file writes",
-        "invoke write",
-        "call write now",
-        "接下来写入",
-        "我会调用 write",
-        "我会用 write",
-    ];
-    if MARKS.iter().any(|m| l.contains(m) || s.contains(m)) {
-        return true;
+    if !looks_like_write_intent(s) {
+        return false;
     }
-    empty_html_fence(&l)
+    !is_substantial_reply(&strip_write_intent(s))
+}
+
+const WRITE_INTENT_MARKS: &[&str] = &[
+    "i'll write files",
+    "i will write files",
+    "write files with the write",
+    "the write tool is available",
+    "let me actually invoke",
+    "function call format",
+    "i'll call write",
+    "i'll batch writes",
+    "continuing with file writes",
+    "invoke write",
+    "call write now",
+    "接下来写入",
+    "我会调用 write",
+    "我会用 write",
+];
+
+fn looks_like_write_intent(s: &str) -> bool {
+    let l = s.to_ascii_lowercase();
+    WRITE_INTENT_MARKS
+        .iter()
+        .any(|m| l.contains(m) || s.contains(m))
+        || empty_html_fence(&l)
+}
+
+fn strip_write_intent(s: &str) -> String {
+    let mut t = s.to_string();
+    for m in WRITE_INTENT_MARKS {
+        t = replace_ignore_ascii_case(&t, m, " ");
+    }
+    strip_empty_html_fences(&t)
+}
+
+fn replace_ignore_ascii_case(hay: &str, needle: &str, rep: &str) -> String {
+    if needle.is_empty() {
+        return hay.to_string();
+    }
+    let n = needle.as_bytes();
+    let mut out = String::with_capacity(hay.len());
+    let mut i = 0;
+    while i < hay.len() {
+        if i + n.len() <= hay.len() && hay.as_bytes()[i..i + n.len()].eq_ignore_ascii_case(n) {
+            out.push_str(rep);
+            i += n.len();
+            continue;
+        }
+        let ch = hay[i..].chars().next().expect("utf-8");
+        out.push(ch);
+        i += ch.len_utf8();
+    }
+    out
+}
+
+fn strip_empty_html_fences(s: &str) -> String {
+    let lower = s.to_ascii_lowercase();
+    let mut out = String::with_capacity(s.len());
+    let mut i = 0;
+    while i < s.len() {
+        if lower.as_bytes()[i..].starts_with(b"```html") {
+            let after = i + 7;
+            let rest = lower[after..].trim_start();
+            let pad = lower[after..].len() - rest.len();
+            if rest.starts_with("```") {
+                i = after + pad + 3;
+                out.push(' ');
+                continue;
+            }
+        }
+        let ch = s[i..].chars().next().expect("utf-8");
+        out.push(ch);
+        i += ch.len_utf8();
+    }
+    out
 }
 
 /// Grok paints empty ` ```html ` fences instead of Write. A real HTML
@@ -644,6 +706,26 @@ This is a different task from architecture review and names different files on p
             "Example:\n```html\n<div>hi</div>\n```\nThat snippet is the template."
         ));
         assert!(!is_leaked_write_narration(ESSAY));
+        let citation = format!(
+            "{ESSAY}\n\n```12:18:crates/hyper-loop/src/agent/turn.rs\n\
+    fn hop_is_delivery(turn: &ModelTurn) -> bool {{\n\
+        turn.tool_calls.is_empty()\n\
+    }}\n```\n\n\
+Narration such as `I'll write files` or empty html fences is recovered; \
+this hop is the finished answer covering empty hops, leaked Write-as-prose, \
+inspect streak, and Write-then-Read waves."
+        );
+        assert!(
+            is_substantial_reply(&citation),
+            "fixture must be a real answer"
+        );
+        assert!(
+            !is_leaked_write_narration(&citation),
+            "quoting leak phrases plus a Cursor citation fence is still a delivery"
+        );
+        assert!(!is_leaked_write_narration(
+            "```12:34:crates/hyper-loop/src/agent/turn.rs\nfn adjudicate() {{}}\n```\n"
+        ));
     }
 
     #[test]

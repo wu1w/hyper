@@ -235,8 +235,28 @@ pub fn render(opts: &RenderOpts<'_>) -> Result<RenderedPrompt> {
 
 pub fn load_template_source(family: Family) -> Result<String> {
     let path = vendor::chat_template_path(family);
-    std::fs::read_to_string(&path)
-        .map_err(|e| Error::Template(format!("read {}: {e}", path.display())))
+    if crate::tools::is_special_file(&path) {
+        return Err(Error::Template(format!(
+            "{} is not a regular file",
+            path.display()
+        )));
+    }
+    if crate::tools::is_oversized_text(&path) {
+        return Err(Error::Template(format!(
+            "{} is too large to load as a chat template",
+            path.display()
+        )));
+    }
+    let bytes = crate::tools::read_bytes_regular(&path).map_err(|e| {
+        Error::Template(format!(
+            "read {}: {}",
+            path.display(),
+            crate::tools::io_user_msg(&e)
+        ))
+    })?;
+    String::from_utf8(bytes).map_err(|_| {
+        Error::Template(format!("{} is not valid UTF-8", path.display()))
+    })
 }
 
 /// MiniJinja's `namespace()` ignores Jinja2 kwargs. Expand the official Qwen call sites.

@@ -112,8 +112,11 @@ pub fn drop_workspace_job(workspace: &std::path::Path, id: &str) {
 
 impl CronStore {
     pub fn load() -> Self {
-        let path = store_path();
-        let Ok(raw) = fs::read_to_string(&path) else {
+        Self::load_from_path(&store_path())
+    }
+
+    fn load_from_path(path: &std::path::Path) -> Self {
+        let Some(raw) = hyper_loop::read_text_if_regular(path) else {
             return Self::default();
         };
         serde_json::from_str(&raw).unwrap_or_default()
@@ -248,7 +251,7 @@ pub fn heartbeat_prompt(store: &CronStore, workspace: &std::path::Path) -> Strin
         return format!("[heartbeat] {p}");
     }
     for name in ["HEARTBEAT.md", ".grok-hyper/HEARTBEAT.md"] {
-        if let Ok(body) = fs::read_to_string(workspace.join(name)) {
+        if let Some(body) = hyper_loop::read_text_if_regular(&workspace.join(name)) {
             let body = body.trim();
             if !body.is_empty() {
                 return format!("[heartbeat]\n{body}");
@@ -531,6 +534,42 @@ mod tests {
         assert_eq!(loaded.len(), 1);
         assert_eq!(loaded[0].id, "ui");
         assert_eq!(loaded[0].prompt, "hello");
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn heartbeat_fifo_falls_back_without_hang() {
+        let dir = std::env::temp_dir().join(format!("hyper-web-cron-fifo-{}", now_s()));
+        fs::create_dir_all(&dir).unwrap();
+        let hb = dir.join("HEARTBEAT.md");
+        let st = std::process::Command::new("mkfifo")
+            .arg(&hb)
+            .status()
+            .unwrap();
+        assert!(st.success());
+        let started = std::time::Instant::now();
+        let prompt = heartbeat_prompt(&CronStore::default(), &dir);
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(2),
+            "FIFO HEARTBEAT.md must not block: {:?}",
+            started.elapsed()
+        );
+        assert!(prompt.contains("Check workspace status"), "{prompt}");
+        let cron = dir.join("web-cron.json");
+        let st = std::process::Command::new("mkfifo")
+            .arg(&cron)
+            .status()
+            .unwrap();
+        assert!(st.success());
+        let started = std::time::Instant::now();
+        let store = CronStore::load_from_path(&cron);
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(2),
+            "FIFO web-cron.json must not block: {:?}",
+            started.elapsed()
+        );
+        assert!(store.jobs.is_empty());
         let _ = fs::remove_dir_all(dir);
     }
 }

@@ -55,8 +55,36 @@ pub fn sha256_hex(bytes: &[u8]) -> String {
     h.finalize().iter().map(|b| format!("{b:02x}")).collect()
 }
 
+const VENDOR_MAX_BYTES: u64 = 64 * 1024 * 1024;
+
 pub fn verify_file(path: &Path, expected_hex: &str) -> Result<()> {
-    let bytes = fs::read(path)?;
+    if crate::tools::is_special_file(path) {
+        return Err(Error::Vendor(format!(
+            "{} is not a regular file",
+            path.display()
+        )));
+    }
+    let meta = fs::metadata(path)?;
+    if !meta.is_file() {
+        return Err(Error::Vendor(format!(
+            "{} is not a regular file",
+            path.display()
+        )));
+    }
+    if meta.len() > VENDOR_MAX_BYTES {
+        return Err(Error::Vendor(format!(
+            "{} is too large to verify ({} bytes)",
+            path.display(),
+            meta.len()
+        )));
+    }
+    let bytes = crate::tools::read_bytes_capped(path, VENDOR_MAX_BYTES).map_err(|e| {
+        Error::Vendor(format!(
+            "{}: {}",
+            path.display(),
+            crate::tools::io_user_msg(&e)
+        ))
+    })?;
     let got = sha256_hex(&bytes);
     if got != expected_hex {
         return Err(Error::Vendor(format!(
@@ -106,5 +134,28 @@ mod tests {
         assert_eq!(vendor_dir_near(&bin).as_deref(), Some(vendor.as_path()));
         assert_eq!(vendor_dir_near(&root).as_deref(), Some(vendor.as_path()));
         let _ = fs::remove_dir_all(&root);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn verify_file_fifo_is_error_not_hang() {
+        let dir = std::env::temp_dir().join(format!("hyper-vendor-fifo-{}", uuid::Uuid::new_v4()));
+        fs::create_dir_all(&dir).unwrap();
+        let fifo = dir.join("tokenizer.json");
+        let st = std::process::Command::new("mkfifo")
+            .arg(&fifo)
+            .status()
+            .unwrap();
+        assert!(st.success());
+        let started = std::time::Instant::now();
+        let err = verify_file(&fifo, "abc").unwrap_err();
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(2),
+            "FIFO vendor file must not block: {:?}",
+            started.elapsed()
+        );
+        let msg = err.to_string();
+        assert!(msg.contains("not a regular file"), "{msg}");
+        let _ = fs::remove_dir_all(&dir);
     }
 }

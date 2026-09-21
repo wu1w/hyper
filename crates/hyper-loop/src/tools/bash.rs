@@ -13,6 +13,24 @@ use super::{arg_str, arg_u32, folded_response, BlobStore, ToolLimits, Workspace}
 use crate::tool_calls::{CancelFlag, ToolCall, ToolResponse, ToolState};
 
 const OUTPUT_MAX_BYTES: usize = 1024 * 1024;
+/// After the live cap, keep discarding so a finite oversized writer can
+/// exit. Stop before an unbounded producer (`yes`) burns CPU until the
+/// 24h coordinator kill.
+const DISCARD_MAX_BYTES: usize = 8 * 1024 * 1024;
+
+#[derive(Default)]
+struct CapBuf {
+    data: Vec<u8>,
+    discarded: usize,
+}
+
+fn io_spawn_msg(e: &std::io::Error) -> String {
+    match e.kind() {
+        std::io::ErrorKind::NotFound => "shell executable not found".into(),
+        std::io::ErrorKind::PermissionDenied => "permission denied".into(),
+        _ => super::path::io_user_msg(e),
+    }
+}
 /// shell 退出后管道的收尾读窗口：孙进程（`sleep 30 & echo hi`）继承了
 /// stdout/stderr 写端，EOF 可能永远不来，超时就放弃。
 const DRAIN_TIMEOUT: Duration = Duration::from_secs(2);
@@ -115,7 +133,18 @@ pub async fn bash(
         .or_else(|| arg_str(&call.arguments, "cwd"))
     {
         match ws.resolve(&raw) {
-            Ok(p) => p,
+            Ok(p) => {
+                if !p.is_dir() {
+                    return ToolResponse::text(
+                        &call.id,
+                        format!(
+                            "Error: working_directory `{raw}` does not exist or is not a directory."
+                        ),
+                        ToolState::Error,
+                    );
+                }
+                p
+            }
             Err(e) => return ToolResponse::text(&call.id, e, ToolState::Error),
         }
     } else {
@@ -124,7 +153,11 @@ pub async fn bash(
     let (command, skipped_tree_diff) = match rewrite_skip_whole_tree_git_diff(&command) {
         GitDiffRewrite::Keep => (command, false),
         GitDiffRewrite::SkipAll => {
-            return ToolResponse::text(&call.id, TREE_DIFF_HINT, ToolState::Success);
+            return ToolResponse::text(
+                &call.id,
+                format!("Error: {TREE_DIFF_HINT}"),
+                ToolState::Error,
+            );
         }
         GitDiffRewrite::Rest(rest) => (rest, true),
     };
@@ -133,15 +166,32 @@ pub async fn bash(
             GitDiffRewrite::Keep => (command, false),
             GitDiffRewrite::SkipAll => {
                 let sample = super::shallow_listing(&cwd, ws.root(), 40);
-                let mut text = TREE_LIST_HINT.to_string();
+                let mut text = format!("Error: {TREE_LIST_HINT}");
                 if !sample.is_empty() {
                     text.push_str("\n\nTop-level:\n");
                     text.push_str(&sample.join("\n"));
                 }
-                return ToolResponse::text(&call.id, text, ToolState::Success);
+                return ToolResponse::text(&call.id, text, ToolState::Error);
             }
             GitDiffRewrite::Rest(rest) => (rest, true),
         };
+    if let Some(rel) = first_special_shell_path(&cwd, &command) {
+        return ToolResponse::text(
+            &call.id,
+            format!("Error: {rel} is not a regular file."),
+            ToolState::Error,
+        );
+    }
+    if let Some(rel) = first_oversized_interpreter_path(&cwd, &command) {
+        return ToolResponse::text(
+            &call.id,
+            format!(
+                "Error: {rel} is too large to slurp (max {} bytes).",
+                super::path::MAX_TEXT_SLURP_BYTES
+            ),
+            ToolState::Error,
+        );
+    }
     // Cursor contract: `block_until_ms` waits then backgrounds. Inner bash
     // only dies on cancel; the coordinator offloads at that deadline.
     let mut child = match spawn_shell(&command, &cwd) {
@@ -149,7 +199,7 @@ pub async fn bash(
         Err(e) => {
             return ToolResponse::text(
                 &call.id,
-                format!("Error: failed to spawn shell: {e}"),
+                format!("Error: failed to spawn shell: {}", io_spawn_msg(&e)),
                 ToolState::Error,
             );
         }
@@ -161,8 +211,8 @@ pub async fn bash(
     let _job = child.id().and_then(|pid| WindowsJob::attach(pid).ok());
 
     // 缓冲共享给读取任务：收尾读超时被 abort 时，已读到的部分不丢。
-    let out_buf: Arc<Mutex<Vec<u8>>> = Arc::default();
-    let err_buf: Arc<Mutex<Vec<u8>>> = Arc::default();
+    let out_buf: Arc<Mutex<CapBuf>> = Arc::default();
+    let err_buf: Arc<Mutex<CapBuf>> = Arc::default();
     let out_task = child
         .stdout
         .take()
@@ -191,6 +241,7 @@ pub async fn bash(
         status = child.wait() => {
             drain(out_task).await;
             drain(err_task).await;
+            let discarded = discarded_of(&out_buf) + discarded_of(&err_buf);
             let stdout = take_text(&out_buf);
             let stderr = take_text(&err_buf);
             let code = status.ok().and_then(|s| s.code()).unwrap_or(-1);
@@ -201,11 +252,19 @@ pub async fn bash(
             if skipped_tree_list {
                 text = format!("{TREE_LIST_HINT}\n\n{text}");
             }
-            let state = if code == 0 {
+            let mut state = if code == 0 {
                 ToolState::Success
             } else {
                 ToolState::Error
             };
+            if discarded > 0 {
+                if !text.starts_with("Error:") {
+                    text = format!(
+                        "Error: command output truncated after {OUTPUT_MAX_BYTES} bytes (incomplete).\n{text}"
+                    );
+                }
+                state = ToolState::Error;
+            }
             folded_response(&call.id, text, state, limits, blobs)
         }
     }
@@ -330,6 +389,493 @@ fn cmd_basename(cmd: &str) -> &str {
         .file_name()
         .and_then(|s| s.to_str())
         .unwrap_or(cmd)
+}
+
+fn is_interpreter_cmd(cmd: &str) -> bool {
+    matches!(
+        cmd_basename(cmd),
+        "python"
+            | "python3"
+            | "pypy"
+            | "pypy3"
+            | "node"
+            | "nodejs"
+            | "ruby"
+            | "perl"
+            | "php"
+            | "lua"
+            | "deno"
+            | "bun"
+            | "bash"
+            | "sh"
+            | "zsh"
+    )
+}
+
+fn command_has_interpreter(command: &str) -> bool {
+    for seg in split_cmd_segments(command) {
+        for part in split_on_unquoted(&seg, b'|') {
+            let tokens = ws_tokens(&part);
+            if let Some((_, cmd)) = first_shell_cmd(&tokens) {
+                if is_interpreter_cmd(cmd) {
+                    return true;
+                }
+            }
+        }
+    }
+    false
+}
+
+fn first_special_shell_path(cwd: &Path, command: &str) -> Option<String> {
+    for seg in split_cmd_segments(command) {
+        for part in split_on_unquoted(&seg, b'|') {
+            let part = part.trim();
+            if part.is_empty() {
+                continue;
+            }
+            for rel in simple_cmd_io_paths(part) {
+                let candidate = {
+                    let p = Path::new(&rel);
+                    if p.is_absolute() {
+                        p.to_path_buf()
+                    } else {
+                        cwd.join(p)
+                    }
+                };
+                if super::path::is_special_file(&candidate) {
+                    return Some(rel);
+                }
+            }
+        }
+    }
+    if command_has_interpreter(command) {
+        for blob in interpreter_open_blobs(cwd, command) {
+            if let Some(rel) = super::path::first_special_unquoted_open(cwd, &blob) {
+                return Some(rel);
+            }
+        }
+    }
+    None
+}
+
+fn first_oversized_interpreter_path(cwd: &Path, command: &str) -> Option<String> {
+    if !command_has_interpreter(command) {
+        return None;
+    }
+    for blob in interpreter_open_blobs(cwd, command) {
+        if let Some(rel) = super::path::first_oversized_quoted_path(cwd, &blob) {
+            return Some(rel);
+        }
+    }
+    None
+}
+
+fn interpreter_open_blobs(cwd: &Path, command: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    for seg in split_cmd_segments(command) {
+        for part in split_on_unquoted(&seg, b'|') {
+            let part = part.trim();
+            if part.is_empty() {
+                continue;
+            }
+            let tokens = ws_tokens(part);
+            let Some((i, cmd)) = first_shell_cmd(&tokens) else {
+                continue;
+            };
+            if !is_interpreter_cmd(cmd) {
+                continue;
+            }
+            let args = tokens.get(i + 1..).unwrap_or(&[]);
+            let mut j = 0usize;
+            let mut saw_inline = false;
+            while j < args.len() {
+                let a = args[j].as_str();
+                if a == "--" {
+                    break;
+                }
+                if a == "-c" || a == "-e" || a == "-r" || a == "-p" || a == "eval" {
+                    if let Some(code) = args.get(j + 1) {
+                        out.push(code.clone());
+                        saw_inline = true;
+                    }
+                    j += 2;
+                    continue;
+                }
+                if a.starts_with('-') {
+                    j += 1;
+                    continue;
+                }
+                let script = {
+                    let p = Path::new(a);
+                    if p.is_absolute() {
+                        p.to_path_buf()
+                    } else {
+                        cwd.join(p)
+                    }
+                };
+                if let Some(body) = super::path::read_text_if_regular(&script) {
+                    out.push(body);
+                    saw_inline = true;
+                }
+                break;
+            }
+            if !saw_inline {
+                out.push(part.to_string());
+            }
+        }
+    }
+    out
+}
+
+fn simple_cmd_io_paths(part: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    if let Some(p) = cat_like_path(part) {
+        out.push(p);
+    }
+    if let Some(p) = dump_like_path(part) {
+        out.push(p);
+    }
+    if let Some(p) = stdin_redirect_path(part) {
+        out.push(p);
+    }
+    out.extend(redirect_io_paths(part));
+    out.extend(dd_io_paths(part));
+    out.extend(copy_like_paths(part));
+    out.extend(interpreter_io_paths(part));
+    out.extend(curl_like_paths(part));
+    out
+}
+
+fn split_on_unquoted(s: &str, sep: u8) -> Vec<String> {
+    let bytes = s.as_bytes();
+    let mut out = Vec::new();
+    let mut start = 0usize;
+    let mut i = 0usize;
+    let mut in_s = false;
+    let mut in_d = false;
+    while i < bytes.len() {
+        let c = bytes[i];
+        if c == b'\'' && !in_d {
+            in_s = !in_s;
+        } else if c == b'"' && !in_s {
+            in_d = !in_d;
+        } else if !in_s && !in_d && c == sep {
+            out.push(s[start..i].to_string());
+            start = i + 1;
+        }
+        i += 1;
+    }
+    out.push(s[start..].to_string());
+    out
+}
+
+fn take_unquoted_path(raw: &str, bytes: &[u8], i: &mut usize) -> Option<String> {
+    while *i < bytes.len() && bytes[*i].is_ascii_whitespace() {
+        *i += 1;
+    }
+    if *i >= bytes.len() {
+        return None;
+    }
+    if bytes[*i] == b'\'' || bytes[*i] == b'"' {
+        let q = bytes[*i];
+        *i += 1;
+        let start = *i;
+        while *i < bytes.len() && bytes[*i] != q {
+            *i += 1;
+        }
+        return Some(raw[start..*i].to_string());
+    }
+    let start = *i;
+    while *i < bytes.len() && !bytes[*i].is_ascii_whitespace() {
+        *i += 1;
+    }
+    Some(raw[start..*i].to_string())
+}
+
+fn redirect_io_paths(command: &str) -> Vec<String> {
+    let bytes = command.as_bytes();
+    let mut out = Vec::new();
+    let mut i = 0usize;
+    let mut in_squote = false;
+    let mut in_dquote = false;
+    while i < bytes.len() {
+        let c = bytes[i];
+        if c == b'\'' && !in_dquote {
+            in_squote = !in_squote;
+            i += 1;
+            continue;
+        }
+        if c == b'"' && !in_squote {
+            in_dquote = !in_dquote;
+            i += 1;
+            continue;
+        }
+        if !in_squote && !in_dquote && c == b'<' {
+            if bytes.get(i + 1) == Some(&b'<') {
+                break;
+            }
+            i += 1;
+            if let Some(p) = take_unquoted_path(command, bytes, &mut i) {
+                if !p.is_empty() && !p.starts_with('&') {
+                    out.push(p);
+                }
+            }
+            continue;
+        }
+        if !in_squote && !in_dquote && c == b'>' {
+            if bytes.get(i + 1) == Some(&b'>') {
+                i += 1;
+            }
+            i += 1;
+            if let Some(p) = take_unquoted_path(command, bytes, &mut i) {
+                if !p.is_empty() && !p.starts_with('&') {
+                    out.push(p);
+                }
+            }
+            continue;
+        }
+        i += 1;
+    }
+    out
+}
+
+fn ws_tokens(command: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut cur = String::new();
+    let mut quote: Option<char> = None;
+    for c in command.chars() {
+        match quote {
+            Some(q) if c == q => quote = None,
+            Some(_) => cur.push(c),
+            None if c == '\'' || c == '"' => quote = Some(c),
+            None if c.is_whitespace() => {
+                if !cur.is_empty() {
+                    out.push(std::mem::take(&mut cur));
+                }
+            }
+            None => cur.push(c),
+        }
+    }
+    if !cur.is_empty() {
+        out.push(cur);
+    }
+    out
+}
+
+fn dd_io_paths(part: &str) -> Vec<String> {
+    let tokens = ws_tokens(part);
+    if !tokens.iter().any(|t| cmd_basename(t) == "dd") {
+        return Vec::new();
+    }
+    let mut out = Vec::new();
+    for t in &tokens {
+        if let Some(r) = t.strip_prefix("if=") {
+            if !r.is_empty() {
+                out.push(r.to_string());
+            }
+        }
+        if let Some(r) = t.strip_prefix("of=") {
+            if !r.is_empty() {
+                out.push(r.to_string());
+            }
+        }
+    }
+    out
+}
+
+fn copy_like_paths(part: &str) -> Vec<String> {
+    let tokens = ws_tokens(part);
+    let Some((i, cmd)) = first_shell_cmd(&tokens) else {
+        return Vec::new();
+    };
+    if !matches!(
+        cmd_basename(cmd),
+        "cp" | "rsync" | "scp" | "tar" | "zip" | "unzip" | "7z" | "7za" | "diff" | "cmp"
+            | "comm" | "ffmpeg" | "ffprobe" | "sqlite3" | "sqlite" | "openssl"
+    ) {
+        return Vec::new();
+    }
+    tokens
+        .get(i + 1..)
+        .unwrap_or(&[])
+        .iter()
+        .filter(|a| !a.starts_with('-'))
+        .cloned()
+        .collect()
+}
+
+/// `curl file://fifo` / `wget file://fifo` open the path.
+fn curl_like_paths(part: &str) -> Vec<String> {
+    let tokens = ws_tokens(part);
+    let Some((i, cmd)) = first_shell_cmd(&tokens) else {
+        return Vec::new();
+    };
+    if !matches!(cmd_basename(cmd), "curl" | "wget" | "fetch") {
+        return Vec::new();
+    }
+    tokens
+        .get(i + 1..)
+        .unwrap_or(&[])
+        .iter()
+        .filter_map(|a| {
+            let a = a.trim();
+            let path = a
+                .strip_prefix("file://")
+                .or_else(|| a.strip_prefix("FILE://"))
+                .unwrap_or(a);
+            if path.starts_with("http://")
+                || path.starts_with("https://")
+                || path.starts_with("ftp://")
+                || path.starts_with('-')
+            {
+                return None;
+            }
+            if path.is_empty() {
+                return None;
+            }
+            Some(path.to_string())
+        })
+        .collect()
+}
+
+fn interpreter_io_paths(part: &str) -> Vec<String> {
+    let tokens = ws_tokens(part);
+    let Some((i, cmd)) = first_shell_cmd(&tokens) else {
+        return Vec::new();
+    };
+    if !is_interpreter_cmd(cmd) {
+        return Vec::new();
+    }
+    let args = tokens.get(i + 1..).unwrap_or(&[]);
+    let mut out = Vec::new();
+    let mut j = 0usize;
+    while j < args.len() {
+        let a = args[j].as_str();
+        if a == "--" {
+            if let Some(p) = args.get(j + 1) {
+                out.push(p.clone());
+            }
+            break;
+        }
+        if a == "-c" || a == "-e" || a == "-r" || a == "-p" || a == "eval" {
+            if let Some(code) = args.get(j + 1) {
+                out.extend(super::path::quoted_path_literals(code));
+            }
+            j += 2;
+            continue;
+        }
+        if a.starts_with('-') {
+            j += 1;
+            continue;
+        }
+        out.push(a.to_string());
+        break;
+    }
+    // Heredoc / `p='pipe.txt'; open(p)` bodies sit in the same command
+    // string; scan quoted paths so a FIFO name cannot hide behind a var.
+    out.extend(super::path::quoted_path_literals(part));
+    out
+}
+
+fn dump_like_path(command: &str) -> Option<String> {
+    let segs: Vec<String> = split_cmd_segments(command)
+        .into_iter()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .collect();
+    if segs.len() != 1 {
+        return None;
+    }
+    let raw = &segs[0];
+    if raw.contains('|') || raw.contains('>') || raw.contains('<') {
+        return None;
+    }
+    let tokens = shell_tokens(raw);
+    let Some((i, cmd)) = first_shell_cmd(&tokens) else {
+        return None;
+    };
+    let args = tokens.get(i + 1..).unwrap_or(&[]);
+    match cmd_basename(cmd) {
+        "wc" | "od" | "hexdump" | "xxd" | "sha256sum" | "md5" | "md5sum" | "shasum" | "cksum"
+        | "gzip" | "gunzip" | "xz" | "unxz" | "bzip2" | "bunzip2" | "sort" | "uniq" | "cut"
+        | "paste" | "tee" | "base64" | "jq" | "file" | "source" | "." | "strings" | "tac"
+        | "rev" => single_dump_file(args),
+        "awk" | "gawk" | "nawk" | "sed" | "gsed" | "grep" | "egrep" | "fgrep" | "rg" | "ag"
+        | "ack" => last_file_arg(args),
+        "pv" | "iconv" | "vim" | "vi" | "nano" | "emacs" | "ed" | "pico" | "micro" => {
+            single_dump_file(args)
+        }
+        _ => None,
+    }
+}
+
+fn last_file_arg(args: &[String]) -> Option<String> {
+    args.iter()
+        .rev()
+        .find(|a| *a != "--" && !a.starts_with('-'))
+        .cloned()
+}
+
+/// `cmd < file` with no pipes/heredoc. `cat < fifo` would otherwise hang
+/// the hop because `cat_like_path` stops at `<`.
+fn stdin_redirect_path(command: &str) -> Option<String> {
+    let segs: Vec<String> = split_cmd_segments(command)
+        .into_iter()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .collect();
+    if segs.len() != 1 {
+        return None;
+    }
+    let raw = &segs[0];
+    if raw.contains('|') || raw.contains('>') {
+        return None;
+    }
+    let bytes = raw.as_bytes();
+    let mut i = 0usize;
+    let mut in_squote = false;
+    let mut in_dquote = false;
+    while i < bytes.len() {
+        let c = bytes[i];
+        if c == b'\'' && !in_dquote {
+            in_squote = !in_squote;
+            i += 1;
+            continue;
+        }
+        if c == b'"' && !in_squote {
+            in_dquote = !in_dquote;
+            i += 1;
+            continue;
+        }
+        if !in_squote && !in_dquote && c == b'<' {
+            if bytes.get(i + 1) == Some(&b'<') {
+                return None;
+            }
+            i += 1;
+            while i < bytes.len() && bytes[i].is_ascii_whitespace() {
+                i += 1;
+            }
+            if i >= bytes.len() {
+                return None;
+            }
+            if bytes[i] == b'\'' || bytes[i] == b'"' {
+                let q = bytes[i];
+                i += 1;
+                let start = i;
+                while i < bytes.len() && bytes[i] != q {
+                    i += 1;
+                }
+                return Some(raw[start..i].to_string());
+            }
+            let start = i;
+            while i < bytes.len() && !bytes[i].is_ascii_whitespace() {
+                i += 1;
+            }
+            return Some(raw[start..i].to_string());
+        }
+        i += 1;
+    }
+    None
 }
 
 /// `cat` / `head` / `tail` / `nl` / `sed -n Np` of a single file, no pipes.
@@ -955,6 +1501,9 @@ fn spawn_shell(command: &str, cwd: &Path) -> std::io::Result<tokio::process::Chi
     }
     cmd.current_dir(cwd)
         .env("PATH", tool_path())
+        .env("PAGER", "cat")
+        .env("GIT_PAGER", "cat")
+        .env("GIT_TERMINAL_PROMPT", "0")
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -1239,9 +1788,26 @@ async fn drain(task: Option<tokio::task::JoinHandle<()>>) {
     }
 }
 
-fn take_text(buf: &Arc<Mutex<Vec<u8>>>) -> String {
-    let b = buf.lock().unwrap_or_else(|e| e.into_inner());
-    String::from_utf8_lossy(&b).into_owned()
+fn discarded_of(buf: &Arc<Mutex<CapBuf>>) -> usize {
+    buf.lock()
+        .map(|g| g.discarded)
+        .unwrap_or_else(|e| e.into_inner().discarded)
+}
+
+fn take_text(buf: &Arc<Mutex<CapBuf>>) -> String {
+    let g = buf.lock().unwrap_or_else(|e| e.into_inner());
+    let mut text = if g.data.contains(&0) {
+        format!("[binary output omitted: {} bytes contain NUL]", g.data.len())
+    } else {
+        String::from_utf8_lossy(&g.data).into_owned()
+    };
+    if g.discarded > 0 {
+        text.push_str(&format!(
+            "\n… truncated after {OUTPUT_MAX_BYTES} bytes ({} more discarded).",
+            g.discarded
+        ));
+    }
+    text
 }
 
 fn format_shell(code: i32, stdout: &str, stderr: &str) -> String {
@@ -1268,16 +1834,29 @@ fn format_shell(code: i32, stdout: &str, stderr: &str) -> String {
     }
 }
 
-async fn read_capped_into<R: AsyncRead + Unpin>(mut pipe: R, buf: Arc<Mutex<Vec<u8>>>) {
+async fn read_capped_into<R: AsyncRead + Unpin>(mut pipe: R, buf: Arc<Mutex<CapBuf>>) {
     let mut chunk = [0u8; 8192];
     loop {
         match pipe.read(&mut chunk).await {
             Ok(0) => break,
             Ok(n) => {
-                let mut b = buf.lock().unwrap_or_else(|e| e.into_inner());
-                let room = OUTPUT_MAX_BYTES.saturating_sub(b.len());
-                if room > 0 {
-                    b.extend_from_slice(&chunk[..n.min(room)]);
+                let cap_hit = {
+                    let mut b = buf.lock().unwrap_or_else(|e| e.into_inner());
+                    let room = OUTPUT_MAX_BYTES.saturating_sub(b.data.len());
+                    if room > 0 {
+                        b.data.extend_from_slice(&chunk[..n.min(room)]);
+                        b.discarded = b.discarded.saturating_add(n.saturating_sub(room));
+                    } else {
+                        b.discarded = b.discarded.saturating_add(n);
+                    }
+                    b.discarded >= DISCARD_MAX_BYTES
+                };
+                if cap_hit {
+                    // Unbounded producers (`yes`) would SIGPIPE if we drop the
+                    // pipe here, finishing the hop before coordinator offload.
+                    // Hold the reader so the child blocks on a full pipe (0 CPU)
+                    // until cancel or process exit.
+                    std::future::pending::<()>().await;
                 }
             }
             Err(_) => break,
@@ -1386,7 +1965,7 @@ mod tests {
             "whole-tree git diff must not run: {:?}",
             started.elapsed()
         );
-        assert_eq!(out.state, ToolState::Success, "{}", out.joined_text());
+        assert_eq!(out.state, ToolState::Error, "{}", out.joined_text());
         let text = out.joined_text();
         assert!(text.contains("Whole-tree"), "{text}");
         let _ = std::fs::remove_dir_all(dir);
@@ -1528,6 +2107,227 @@ mod tests {
         assert!(cat_like_path("sed -i -n '1p' src/lib.rs").is_none());
         assert!(cat_like_path("sed -n 's/foo/bar/p' src/lib.rs").is_none());
         assert!(cat_like_path("sed '1,20p' src/lib.rs").is_none());
+        assert_eq!(
+            stdin_redirect_path("cat < pipe.txt").as_deref(),
+            Some("pipe.txt")
+        );
+        assert_eq!(
+            stdin_redirect_path("cat <'pipe.txt'").as_deref(),
+            Some("pipe.txt")
+        );
+        assert!(stdin_redirect_path("cat <<EOF").is_none());
+        assert!(stdin_redirect_path("cat src/lib.rs | wc").is_none());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn cat_fifo_is_error_not_hang() {
+        let (ws, dir) = scratch();
+        let fifo = dir.join("pipe.txt");
+        let st = std::process::Command::new("mkfifo")
+            .arg(&fifo)
+            .status()
+            .unwrap();
+        assert!(st.success());
+        let started = std::time::Instant::now();
+        let out = bash(
+            &ws,
+            &call(json!({"command": "cat pipe.txt"})),
+            CancelFlag::new(),
+            ToolLimits::default(),
+            None,
+        )
+        .await;
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(2),
+            "cat FIFO must not block: {:?}",
+            started.elapsed()
+        );
+        assert_eq!(out.state, ToolState::Error, "{}", out.joined_text());
+        assert!(
+            out.joined_text().contains("regular"),
+            "{}",
+            out.joined_text()
+        );
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn cat_stdin_redirect_fifo_is_error_not_hang() {
+        let (ws, dir) = scratch();
+        let fifo = dir.join("pipe.txt");
+        let st = std::process::Command::new("mkfifo")
+            .arg(&fifo)
+            .status()
+            .unwrap();
+        assert!(st.success());
+        let started = std::time::Instant::now();
+        let out = bash(
+            &ws,
+            &call(json!({"command": "cat < pipe.txt"})),
+            CancelFlag::new(),
+            ToolLimits::default(),
+            None,
+        )
+        .await;
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(2),
+            "cat < FIFO must not block: {:?}",
+            started.elapsed()
+        );
+        assert_eq!(out.state, ToolState::Error, "{}", out.joined_text());
+        assert!(
+            out.joined_text().contains("regular"),
+            "{}",
+            out.joined_text()
+        );
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn special_file_shell_shapes_error_not_hang() {
+        let (ws, dir) = scratch();
+        let fifo = dir.join("pipe.txt");
+        let st = std::process::Command::new("mkfifo")
+            .arg(&fifo)
+            .status()
+            .unwrap();
+        assert!(st.success());
+        for cmd in [
+            "cat pipe.txt && echo ok",
+            "echo hi > pipe.txt",
+            "dd if=pipe.txt of=out.bin",
+            "cp pipe.txt dest.txt",
+            "cat pipe.txt | wc",
+            "wc pipe.txt",
+            "python3 pipe.txt",
+            "python3 -c \"open('pipe.txt').read()\"",
+            "awk '{print}' pipe.txt",
+            "sed -n '1p' pipe.txt",
+            "tar -tf pipe.txt",
+            "gzip -c pipe.txt",
+            "strings pipe.txt",
+            "python3 -c \"p='pipe.txt'; open(p).read()\"",
+            "python3 - <<'PY'\nopen('pipe.txt').read()\nPY",
+            "unzip pipe.txt",
+            "diff pipe.txt /dev/null",
+            "ffmpeg -i pipe.txt out.mp4",
+            "python3 -c \"open(p)\"",
+            "grep hi pipe.txt",
+            "rg hi pipe.txt",
+            "vim pipe.txt",
+            "nano pipe.txt",
+            "curl file://pipe.txt",
+            "wget file://pipe.txt",
+            "python3 -c \"import os; os.system('cat '+os.listdir('.')[0])\"",
+            "sqlite3 pipe.txt",
+            "node -e \"require('fs').createReadStream('pipe.txt')\"",
+            "ruby -e \"File.binread('pipe.txt')\"",
+            "deno eval \"Deno.readFile('pipe.txt')\"",
+            "bun -e \"Bun.file('pipe.txt')\"",
+            "python3 -c \"import pandas as pd; pd.read_csv('pipe.txt')\"",
+            "python3 -c \"import shutil; shutil.copy('pipe.txt','x')\"",
+            "python3 -c \"import tarfile; tarfile.open('pipe.txt')\"",
+        ] {
+            let started = std::time::Instant::now();
+            let out = bash(
+                &ws,
+                &call(json!({"command": cmd})),
+                CancelFlag::new(),
+                ToolLimits::default(),
+                None,
+            )
+            .await;
+            assert!(
+                started.elapsed() < std::time::Duration::from_secs(2),
+                "{cmd} FIFO must not block: {:?}",
+                started.elapsed()
+            );
+            assert_eq!(out.state, ToolState::Error, "{cmd}: {}", out.joined_text());
+            assert!(
+                out.joined_text().contains("regular"),
+                "{cmd}: {}",
+                out.joined_text()
+            );
+        }
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn python_print_beside_fifo_still_runs() {
+        let (ws, dir) = scratch();
+        let fifo = dir.join("pipe.txt");
+        let st = std::process::Command::new("mkfifo")
+            .arg(&fifo)
+            .status()
+            .unwrap();
+        assert!(st.success());
+        std::fs::write(dir.join("notes.md"), "ok\n").unwrap();
+        let out = bash(
+            &ws,
+            &call(json!({"command": "python3 -c \"print(1)\""})),
+            CancelFlag::new(),
+            ToolLimits::default(),
+            None,
+        )
+        .await;
+        assert_eq!(out.state, ToolState::Success, "{}", out.joined_text());
+        assert!(out.joined_text().contains('1'), "{}", out.joined_text());
+        let named = bash(
+            &ws,
+            &call(json!({"command": "python3 -c \"print(open('notes.md').read())\""})),
+            CancelFlag::new(),
+            ToolLimits::default(),
+            None,
+        )
+        .await;
+        assert_eq!(named.state, ToolState::Success, "{}", named.joined_text());
+        assert!(named.joined_text().contains("ok"), "{}", named.joined_text());
+        let echo = bash(
+            &ws,
+            &call(json!({"command": "python3 -c \"import os; os.system('echo hi')\""})),
+            CancelFlag::new(),
+            ToolLimits::default(),
+            None,
+        )
+        .await;
+        assert_eq!(echo.state, ToolState::Success, "{}", echo.joined_text());
+        assert!(echo.joined_text().contains("hi"), "{}", echo.joined_text());
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[tokio::test]
+    async fn python_open_oversized_is_error_not_slurp() {
+        let (ws, dir) = scratch();
+        std::fs::write(
+            dir.join("huge.txt"),
+            vec![b'x'; (super::super::path::MAX_TEXT_SLURP_BYTES as usize) + 1],
+        )
+        .unwrap();
+        let started = std::time::Instant::now();
+        let out = bash(
+            &ws,
+            &call(json!({"command": "python3 -c \"open('huge.txt').read()\""})),
+            CancelFlag::new(),
+            ToolLimits::default(),
+            None,
+        )
+        .await;
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(2),
+            "python open oversized must not slurp: {:?}",
+            started.elapsed()
+        );
+        assert_eq!(out.state, ToolState::Error, "{}", out.joined_text());
+        assert!(
+            out.joined_text().contains("too large") || out.joined_text().contains("slurp"),
+            "{}",
+            out.joined_text()
+        );
+        let _ = std::fs::remove_dir_all(dir);
     }
 
     #[tokio::test]
@@ -1547,7 +2347,7 @@ mod tests {
             "workspace-root find must not run: {:?}",
             started.elapsed()
         );
-        assert_eq!(out.state, ToolState::Success, "{}", out.joined_text());
+        assert_eq!(out.state, ToolState::Error, "{}", out.joined_text());
         let text = out.joined_text();
         assert!(text.contains("`find`"), "{text}");
         let _ = std::fs::remove_dir_all(dir);
@@ -1568,6 +2368,14 @@ mod tests {
         assert_eq!(
             resolved_block_until(&json!({"timeout_ms": 80})),
             Some(std::time::Duration::from_millis(80))
+        );
+        assert_eq!(
+            resolved_block_until(&json!({"block_until_ms": 1500.0})),
+            Some(std::time::Duration::from_millis(1500))
+        );
+        assert_eq!(
+            resolved_block_until(&json!({"block_until_ms": "400"})),
+            Some(std::time::Duration::from_millis(400))
         );
     }
 
@@ -1608,7 +2416,7 @@ mod tests {
     #[tokio::test]
     async fn read_capped_drains_past_cap_to_eof() {
         let (mut writer, reader) = tokio::io::duplex(8192);
-        let buf: Arc<Mutex<Vec<u8>>> = Arc::default();
+        let buf: Arc<Mutex<CapBuf>> = Arc::default();
         let reader_task = tokio::spawn(read_capped_into(reader, buf.clone()));
         let writer_task = tokio::spawn(async move {
             let first = vec![b'a'; OUTPUT_MAX_BYTES + 256 * 1024];
@@ -1625,9 +2433,36 @@ mod tests {
             .expect("writer join")
             .expect("follow-on write must complete (pipe drained to EOF)");
         let out = take_text(&buf);
-        assert_eq!(out.len(), OUTPUT_MAX_BYTES);
         assert!(out.starts_with("aaaa"));
         assert!(!out.contains("TAIL"));
+        assert!(out.contains("truncated after"), "{out}");
+        let live_len = buf.lock().unwrap().data.len();
+        assert_eq!(live_len, OUTPUT_MAX_BYTES);
+    }
+
+    #[tokio::test]
+    async fn read_capped_pauses_unbounded_writer_without_sigpipe() {
+        let (mut writer, reader) = tokio::io::duplex(8192);
+        let buf: Arc<Mutex<CapBuf>> = Arc::default();
+        let reader_task = tokio::spawn(read_capped_into(reader, buf.clone()));
+        let writer_task = tokio::spawn(async move {
+            let chunk = vec![b'y'; 8192];
+            loop {
+                if writer.write_all(&chunk).await.is_err() {
+                    break;
+                }
+            }
+        });
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        assert_eq!(buf.lock().unwrap().data.len(), OUTPUT_MAX_BYTES);
+        assert!(take_text(&buf).contains("truncated after"));
+        assert!(
+            !reader_task.is_finished(),
+            "unbounded producer must stay blocked, not SIGPIPE the child"
+        );
+        reader_task.abort();
+        let _ = reader_task.await;
+        drop(writer_task);
     }
 
     #[tokio::test]
@@ -1731,6 +2566,101 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn missing_working_directory_is_error() {
+        let (ws, dir) = scratch();
+        let out = bash(
+            &ws,
+            &call(json!({"command": "pwd", "working_directory": "nosuchdir"})),
+            CancelFlag::new(),
+            ToolLimits::default(),
+            None,
+        )
+        .await;
+        let text = out.joined_text();
+        assert_eq!(out.state, ToolState::Error, "{text}");
+        assert!(text.contains("working_directory"), "{text}");
+        assert!(text.contains("nosuchdir"), "{text}");
+        assert!(!text.contains("os error"), "{text}");
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[tokio::test]
+    async fn file_working_directory_is_error() {
+        let (ws, dir) = scratch();
+        std::fs::write(dir.join("keep.txt"), "x\n").unwrap();
+        let out = bash(
+            &ws,
+            &call(json!({"command": "pwd", "working_directory": "keep.txt"})),
+            CancelFlag::new(),
+            ToolLimits::default(),
+            None,
+        )
+        .await;
+        let text = out.joined_text();
+        assert_eq!(out.state, ToolState::Error, "{text}");
+        assert!(text.contains("working_directory"), "{text}");
+        assert!(text.contains("keep.txt"), "{text}");
+        assert!(!text.contains("os error"), "{text}");
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[tokio::test]
+    async fn empty_command_is_error() {
+        let (ws, dir) = scratch();
+        let out = bash(
+            &ws,
+            &call(json!({"command": "   "})),
+            CancelFlag::new(),
+            ToolLimits::default(),
+            None,
+        )
+        .await;
+        let text = out.joined_text();
+        assert_eq!(out.state, ToolState::Error, "{text}");
+        assert!(text.contains("command"), "{text}");
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn spawn_msg_strips_os_error() {
+        let missing = std::io::Error::from_raw_os_error(2);
+        let s = io_spawn_msg(&missing);
+        assert_eq!(s, "shell executable not found");
+        assert!(!s.contains("os error"));
+        let other = std::io::Error::from_raw_os_error(13);
+        let s = io_spawn_msg(&other);
+        assert!(!s.contains("os error"), "{s}");
+    }
+
+    #[test]
+    fn take_text_omits_nul_bytes() {
+        let buf: Arc<Mutex<CapBuf>> = Arc::new(Mutex::new(CapBuf {
+            data: vec![0, 0, b'x'],
+            discarded: 0,
+        }));
+        let s = take_text(&buf);
+        assert!(!s.contains('\0'), "{s:?}");
+        assert!(s.contains("binary") && s.contains("NUL"), "{s}");
+    }
+
+    #[tokio::test]
+    async fn bash_nul_stdout_is_omitted() {
+        let (ws, dir) = scratch();
+        let out = bash(
+            &ws,
+            &call(json!({"command": "printf '\\0\\0\\0hello'"})),
+            CancelFlag::new(),
+            ToolLimits::default(),
+            None,
+        )
+        .await;
+        let text = out.joined_text();
+        assert!(!text.contains('\0'), "{text:?}");
+        assert!(text.contains("binary") || text.contains("NUL"), "{text}");
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[tokio::test]
     async fn bash_large_stdout_returns_prefix_without_hang() {
         let (ws, dir) = scratch();
         std::fs::write(dir.join("big.txt"), "a".repeat(2_000_000)).unwrap();
@@ -1746,10 +2676,61 @@ mod tests {
         )
         .await
         .expect("bash hung on large stdout");
-        assert_eq!(out.state, ToolState::Success, "{}", out.joined_text());
+        assert_eq!(out.state, ToolState::Error, "{}", out.joined_text());
         let live = out.joined_text();
+        assert!(live.starts_with("Error:"), "{live}");
         assert!(live.contains("aaa"), "{live}");
+        assert!(live.contains("truncated after"), "{live}");
         assert!(!live.contains("Command failed"), "{live}");
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[tokio::test]
+    async fn git_log_does_not_hang_on_pager() {
+        let (ws, dir) = scratch();
+        for cmd in [
+            "git init",
+            "git config user.email t@t",
+            "git config user.name t",
+            "git add -A",
+        ] {
+            let _ = std::process::Command::new("bash")
+                .args(["-lc", cmd])
+                .current_dir(&dir)
+                .status();
+        }
+        std::fs::write(dir.join("n.txt"), "x\n").unwrap();
+        let _ = std::process::Command::new("git")
+            .args(["-C", dir.to_str().unwrap(), "add", "n.txt"])
+            .status();
+        let _ = std::process::Command::new("git")
+            .args([
+                "-C",
+                dir.to_str().unwrap(),
+                "-c",
+                "user.email=t@t",
+                "-c",
+                "user.name=t",
+                "commit",
+                "-m",
+                "t",
+                "--no-gpg-sign",
+            ])
+            .status();
+        let started = std::time::Instant::now();
+        let _out = bash(
+            &ws,
+            &call(json!({"command": "git log -1"})),
+            CancelFlag::new(),
+            ToolLimits::default(),
+            None,
+        )
+        .await;
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(3),
+            "git log must not wait on a pager: {:?}",
+            started.elapsed()
+        );
         let _ = std::fs::remove_dir_all(dir);
     }
 

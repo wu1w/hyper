@@ -163,7 +163,7 @@ impl HttpCompleter {
         let status = resp.status();
         if !status.is_success() {
             let headers = resp.headers().clone();
-            let text = resp.text().await.unwrap_or_default();
+            let text = crate::media::text_prefix(resp, crate::media::HTTP_ERROR_BODY_CAP).await;
             let snippet = crate::llm_http::attach_retry_after(
                 crate::transport::http_error_snippet(status, &text),
                 &headers,
@@ -198,7 +198,9 @@ impl Completer for HttpCompleter {
                 .and_then(|v| v.to_str().ok())
                 .unwrap_or("");
             if ct.contains("application/json") {
-                let v: Value = resp.json().await?;
+                let v: Value = crate::media::json_result_capped(resp, crate::media::LLM_JSON_CAP)
+                    .await
+                    .map_err(Error::Http)?;
                 let turn = turn_from_json(&v, false)?;
                 paint_clean(sink, &turn);
                 offer_turn(self.speculate(), &turn);
@@ -220,7 +222,9 @@ impl Completer for HttpCompleter {
                 Err(e) => return Err(e),
             }
         }
-        let v: Value = resp.json().await?;
+        let v: Value = crate::media::json_result_capped(resp, crate::media::LLM_JSON_CAP)
+            .await
+            .map_err(Error::Http)?;
         let turn = turn_from_json(&v, false)?;
         paint_clean(sink, &turn);
         offer_turn(self.speculate(), &turn);
@@ -287,7 +291,7 @@ impl Completer for HttpCompleter {
 
 fn caps_for(cfg: &Config, model: &str, owned: Option<&str>) -> EndpointCaps {
     if let Ok(path) = Config::probe_path() {
-        if let Ok(raw) = std::fs::read_to_string(path) {
+        if let Some(raw) = crate::tools::read_text_if_regular(&path) {
             if let Ok(report) = serde_json::from_str::<ProbeReport>(&raw) {
                 if report.red.is_empty() {
                     return report.to_caps();

@@ -251,7 +251,7 @@ pub async fn poll_device(device_code: &str) -> Result<DevicePoll> {
         .await
         .map_err(|e| Error::Http(redact_err(&e.to_string())))?;
     let status = resp.status();
-    let text = resp.text().await.unwrap_or_default();
+    let text = crate::media::text_or_empty(resp).await;
     if status.is_success() {
         return Ok(DevicePoll::Tokens(tokens_from_json(&parse_json_obj(
             &text,
@@ -339,7 +339,7 @@ async fn post_form(url: &str, fields: &[(&str, &str)]) -> Result<Value> {
         .await
         .map_err(|e| Error::Http(redact_err(&e.to_string())))?;
     let status = resp.status();
-    let text = resp.text().await.unwrap_or_default();
+    let text = crate::media::text_or_empty(resp).await;
     if !status.is_success() {
         return Err(Error::Http(format!(
             "oauth token {status}: {}",

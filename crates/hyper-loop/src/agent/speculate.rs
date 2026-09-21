@@ -41,6 +41,8 @@ pub struct SpeculateCtx {
     pub media_max_bytes: usize,
     pub child: Option<ChildCtx>,
     pub plan_mode: bool,
+    /// `/clarify` / SwitchMode ask without plan: skip prefetch of blocked mutations.
+    pub clarify_mode: bool,
     /// User forbade Grep this turn — do not prefetch rg.
     pub skip_grep: bool,
     /// User forbade Glob this turn — do not prefetch directory listings.
@@ -76,9 +78,8 @@ impl SpeculativeSlot {
                 continue;
             }
             if !is_parallel_safe(&call.name) {
-                // Mixed batches run serially. Prefetching a Read behind Shell
-                // would mark it Started before the slow tool, and a steer
-                // could not skip it.
+                // Do not prefetch Reads behind a mutation; they must see
+                // the write, and a steer must still be able to skip them.
                 behind_serial = true;
                 continue;
             }
@@ -89,6 +90,12 @@ impl SpeculativeSlot {
                 continue;
             }
             if self.ctx.plan_mode && crate::permit::plan_mode_blocks(&call.name, &call.arguments) {
+                continue;
+            }
+            if self.ctx.clarify_mode
+                && !self.ctx.plan_mode
+                && crate::permit::ask_mode_blocks(&call.name, &call.arguments)
+            {
                 continue;
             }
             if dispatch_name(&call.name) == "search" && self.ctx.code_index.is_none() {
@@ -178,7 +185,7 @@ impl SpeculateCtx {
             "search" => match &self.code_index {
                 Some(idx) => run_search(idx, &self.workspace, &call, self.limits),
                 None => {
-                    ToolResponse::text(&call.id, crate::tools::SEARCH_WARMING, ToolState::Success)
+                    ToolResponse::text(&call.id, crate::tools::SEARCH_FAILED, ToolState::Error)
                 }
             },
             "view" if !self.view_mounted => ToolResponse::text(
@@ -474,6 +481,7 @@ mod tests {
             media_max_bytes: 1024,
             child: None,
             plan_mode: false,
+            clarify_mode: false,
             skip_grep: false,
             skip_glob: false,
             search_queries: Vec::new(),
@@ -513,6 +521,7 @@ mod tests {
             media_max_bytes: 1024,
             child: None,
             plan_mode: false,
+            clarify_mode: false,
             skip_grep: true,
             skip_glob: false,
             search_queries: Vec::new(),
@@ -554,6 +563,7 @@ mod tests {
             media_max_bytes: 1024,
             child: None,
             plan_mode: false,
+            clarify_mode: false,
             skip_grep: false,
             skip_glob: false,
             search_queries: vec!["forbids_glob".into()],
@@ -611,6 +621,7 @@ mod tests {
             media_max_bytes: 1024,
             child: None,
             plan_mode: false,
+            clarify_mode: false,
             skip_grep: false,
             skip_glob: false,
             search_queries: Vec::new(),

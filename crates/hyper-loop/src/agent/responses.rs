@@ -134,7 +134,7 @@ impl Completer for ResponsesCompleter {
         let status = resp.status();
         if !status.is_success() {
             let headers = resp.headers().clone();
-            let text = resp.text().await.unwrap_or_default();
+            let text = crate::media::text_prefix(resp, crate::media::HTTP_ERROR_BODY_CAP).await;
             let err = if status.as_u16() == 401 || status.as_u16() == 403 {
                 auth_or_status(status, &text)
             } else {
@@ -154,7 +154,9 @@ impl Completer for ResponsesCompleter {
             offer_turn(self.speculate(), &turn);
             return Ok(turn);
         }
-        let v: Value = resp.json().await.map_err(|e| Error::Http(e.to_string()))?;
+        let v: Value = crate::media::json_result_capped(resp, crate::media::LLM_JSON_CAP)
+            .await
+            .map_err(Error::Http)?;
         if let Some(err) = crate::llm_http::json_api_error(&v) {
             return Err(Error::Http(format_api_error(err)));
         }

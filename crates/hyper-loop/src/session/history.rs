@@ -6,6 +6,7 @@
 
 use std::collections::HashSet;
 use std::fs;
+use std::io::{Read, Seek, SeekFrom};
 use std::path::Path;
 
 use crate::memory::MemoryStore;
@@ -357,7 +358,7 @@ fn recap_clip(store: Option<&MemoryStore>, session_id: &str) -> Option<String> {
         .root()
         .join("memory/chats")
         .join(format!("{session_id}.md"));
-    let text = fs::read_to_string(path).ok()?;
+    let text = crate::tools::read_text_if_regular(&path)?;
     let body = text
         .split("## Assistant\n")
         .nth(1)
@@ -376,10 +377,20 @@ struct TailPlain {
 }
 
 fn tail_plain(path: &Path) -> Option<TailPlain> {
-    let data = fs::read(path).ok()?;
-    let start = data.len().saturating_sub(TAIL_BYTES);
-    let slice = &data[start..];
-    let text = std::str::from_utf8(slice).ok()?;
+    if crate::tools::is_special_file(path) {
+        return None;
+    }
+    let mut f = crate::tools::open_read_nonblock(path).ok()?;
+    let len = f.metadata().ok()?.len();
+    let start = len.saturating_sub(TAIL_BYTES as u64);
+    if start > 0 {
+        f.seek(SeekFrom::Start(start)).ok()?;
+    }
+    let mut data = Vec::new();
+    f.take(TAIL_BYTES as u64 + 4096)
+        .read_to_end(&mut data)
+        .ok()?;
+    let text = std::str::from_utf8(&data).ok()?;
     let text = if start > 0 {
         text.find('\n').map(|i| &text[i + 1..]).unwrap_or(text)
     } else {
@@ -409,8 +420,14 @@ fn tail_plain(path: &Path) -> Option<TailPlain> {
 }
 
 fn peek_start(path: &Path) -> Option<SessionStart> {
-    let data = fs::read(path).ok()?;
-    let text = std::str::from_utf8(&data[..data.len().min(8 * 1024)]).ok()?;
+    if crate::tools::is_special_file(path) {
+        return None;
+    }
+    let mut f = crate::tools::open_read_nonblock(path).ok()?;
+    let mut data = vec![0u8; 8 * 1024];
+    let n = f.read(&mut data).ok()?;
+    data.truncate(n);
+    let text = std::str::from_utf8(&data).ok()?;
     for line in text.lines() {
         if let Ok(SessionEvent::Start(s)) = serde_json::from_str(line) {
             return Some(s);
@@ -835,5 +852,45 @@ mod tests {
         assert!(card.contains("Shell 不是沙箱"), "{card}");
         assert!(!card.contains("投机只读"), "{card}");
         let _ = std::fs::remove_dir_all(empty);
+    }
+
+    #[test]
+    fn history_peek_does_not_slurp_huge_jsonl() {
+        let dir = tmp();
+        let path = dir.join("huge.jsonl");
+        {
+            let f = std::fs::File::create(&path).unwrap();
+            f.set_len(32 * 1024 * 1024).unwrap();
+        }
+        let started = std::time::Instant::now();
+        let _ = tail_plain(&path);
+        let _ = peek_start(&path);
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(2),
+            "history peek must not slurp a 32MiB jsonl: {:?}",
+            started.elapsed()
+        );
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn history_peek_fifo_does_not_hang() {
+        let dir = tmp();
+        let path = dir.join("pipe.jsonl");
+        let st = std::process::Command::new("mkfifo")
+            .arg(&path)
+            .status()
+            .unwrap();
+        assert!(st.success());
+        let started = std::time::Instant::now();
+        assert!(tail_plain(&path).is_none());
+        assert!(peek_start(&path).is_none());
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(2),
+            "FIFO session jsonl must not block history peek: {:?}",
+            started.elapsed()
+        );
+        let _ = std::fs::remove_dir_all(dir);
     }
 }

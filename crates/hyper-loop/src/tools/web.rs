@@ -196,19 +196,23 @@ impl WebRunner {
             // Fall through to the builtin fetcher on API error or empty body.
         }
         match self.builtin_fetch(url).await {
-            Ok((title, body)) => {
+            Ok((title, body, truncated)) => {
                 let head = if title.is_empty() {
                     format!("[web] {url}")
                 } else {
                     format!("[web] {title} — {url}")
                 };
-                folded_response(
-                    &call.id,
-                    format!("{head}\n\n{body}"),
-                    ToolState::Success,
-                    limits,
-                    blobs,
-                )
+                let mut text = format!("{head}\n\n{body}");
+                let state = if truncated {
+                    text = format!(
+                        "Error: page truncated after {} bytes (incomplete).\n{text}",
+                        self.cfg.fetch_max_bytes.max(64 * 1024)
+                    );
+                    ToolState::Error
+                } else {
+                    ToolState::Success
+                };
+                folded_response(&call.id, text, state, limits, blobs)
             }
             Err(e) => ToolResponse::text(&call.id, format!("Error: {e}"), ToolState::Error),
         }
@@ -233,23 +237,35 @@ impl WebRunner {
             .and_then(|v| v.to_str().ok())
             .unwrap_or("")
             .to_string();
-        let bytes = self.read_capped(resp).await?;
+        let (bytes, truncated) = self.read_capped(resp).await?;
+        if truncated {
+            return Err(format!(
+                "page truncated after {} bytes (incomplete)",
+                self.cfg.fetch_max_bytes.max(64 * 1024)
+            ));
+        }
         Ok(decode_body(&bytes, &ct))
     }
 
-    /// Stream the body up to `fetch_max_bytes`; a page cut mid-tag still
-    /// extracts fine, so oversize is truncation, not an error.
-    async fn read_capped(&self, mut resp: reqwest::Response) -> Result<Vec<u8>, String> {
+    /// Stream the body up to `fetch_max_bytes`. Returns `(bytes, truncated)`.
+    async fn read_capped(&self, mut resp: reqwest::Response) -> Result<(Vec<u8>, bool), String> {
         let cap = self.cfg.fetch_max_bytes.max(64 * 1024);
         let mut out: Vec<u8> = Vec::new();
+        let mut truncated = false;
         while let Some(chunk) = resp.chunk().await.map_err(|e| short_err(&e.to_string()))? {
             let room = cap.saturating_sub(out.len());
             if room == 0 {
+                truncated = true;
                 break;
             }
-            out.extend_from_slice(&chunk[..chunk.len().min(room)]);
+            if chunk.len() > room {
+                out.extend_from_slice(&chunk[..room]);
+                truncated = true;
+                break;
+            }
+            out.extend_from_slice(&chunk);
         }
-        Ok(out)
+        Ok((out, truncated))
     }
 
     async fn bing_search(&self, query: &str, n: usize) -> Result<Vec<Hit>, String> {
@@ -271,7 +287,7 @@ impl WebRunner {
         Ok(parse_ddg(&html, n))
     }
 
-    async fn builtin_fetch(&self, url: &str) -> Result<(String, String), String> {
+    async fn builtin_fetch(&self, url: &str) -> Result<(String, String, bool), String> {
         let resp = self
             .client
             .get(url)
@@ -290,7 +306,13 @@ impl WebRunner {
             .and_then(|v| v.to_str().ok())
             .unwrap_or("")
             .to_ascii_lowercase();
-        let bytes = self.read_capped(resp).await?;
+        let (bytes, truncated) = self.read_capped(resp).await?;
+        let cap = self.cfg.fetch_max_bytes.max(64 * 1024);
+        let note = if truncated {
+            format!("\n… truncated after {cap} bytes.")
+        } else {
+            String::new()
+        };
         if ct.contains("text/html") || ct.contains("application/xhtml") || ct.is_empty() {
             let html = decode_body(&bytes, &ct);
             let title = html_title(&html);
@@ -298,10 +320,14 @@ impl WebRunner {
             if body.trim().is_empty() {
                 return Err("no extractable page text (may need JS rendering)".into());
             }
-            return Ok((title, body));
+            return Ok((title, format!("{body}{note}"), truncated));
         }
         if ct.starts_with("text/") || ct.contains("json") || ct.contains("xml") {
-            return Ok((String::new(), decode_body(&bytes, &ct)));
+            return Ok((
+                String::new(),
+                format!("{}{note}", decode_body(&bytes, &ct)),
+                truncated,
+            ));
         }
         Err(format!(
             "unsupported content type {ct}; for binary, Shell curl -o"
@@ -332,7 +358,8 @@ impl WebRunner {
         if !resp.status().is_success() {
             return Err(format!("tavily HTTP {}", resp.status().as_u16()));
         }
-        let v: Value = resp.json().await.map_err(|e| short_err(&e.to_string()))?;
+        let (bytes, _) = self.read_capped(resp).await?;
+        let v: Value = serde_json::from_slice(&bytes).map_err(|e| short_err(&e.to_string()))?;
         let mut hits = Vec::new();
         if let Some(results) = v.get("results").and_then(|r| r.as_array()) {
             for r in results.iter().take(n) {
@@ -361,7 +388,8 @@ impl WebRunner {
         if !resp.status().is_success() {
             return Err(format!("tavily HTTP {}", resp.status().as_u16()));
         }
-        let v: Value = resp.json().await.map_err(|e| short_err(&e.to_string()))?;
+        let (bytes, _) = self.read_capped(resp).await?;
+        let v: Value = serde_json::from_slice(&bytes).map_err(|e| short_err(&e.to_string()))?;
         let text = v["results"][0]["raw_content"].as_str().unwrap_or("");
         Ok(text.to_string())
     }
@@ -1119,5 +1147,60 @@ mod tests {
             text.contains("search_term") && text.contains("query"),
             "{text}"
         );
+    }
+
+    #[tokio::test]
+    async fn webfetch_truncated_body_is_error() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let body = "a".repeat(80_000);
+        let len = body.len();
+        tokio::spawn(async move {
+            let (mut sock, _) = listener.accept().await.unwrap();
+            let mut buf = vec![0u8; 2048];
+            let _ = tokio::io::AsyncReadExt::read(&mut sock, &mut buf).await;
+            let head = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: {len}\r\nConnection: close\r\n\r\n"
+            );
+            let _ = tokio::io::AsyncWriteExt::write_all(&mut sock, head.as_bytes()).await;
+            let _ = tokio::io::AsyncWriteExt::write_all(&mut sock, body.as_bytes()).await;
+        });
+        let mut cfg = WebConfig::default();
+        cfg.provider = "builtin".into();
+        cfg.fetch_max_bytes = 64 * 1024;
+        let r = WebRunner::new(cfg, &McpRegistry::default());
+        let call = ToolCall {
+            id: "t1".into(),
+            name: "WebFetch".into(),
+            arguments: json!({"url": format!("http://{addr}/")}),
+        };
+        let resp = r.run(&call, ToolLimits::default(), None).await;
+        let text = resp.joined_text();
+        assert_eq!(resp.state, ToolState::Error, "{text}");
+        assert!(text.starts_with("Error:"), "{text}");
+        assert!(text.contains("truncated"), "{text}");
+    }
+
+    #[tokio::test]
+    async fn webfetch_rejects_non_http_url() {
+        let r = WebRunner::new(WebConfig::default(), &McpRegistry::default());
+        for url in [
+            "file:///etc/passwd",
+            "javascript:alert(1)",
+            "data:text/html,hi",
+        ] {
+            let call = ToolCall {
+                id: "t1".into(),
+                name: "WebFetch".into(),
+                arguments: json!({"url": url}),
+            };
+            let resp = r.run(&call, ToolLimits::default(), None).await;
+            assert_eq!(resp.state, ToolState::Error, "{url}");
+            let text = resp.joined_text();
+            assert!(
+                text.contains("http://") && text.contains("https://"),
+                "{url}: {text}"
+            );
+        }
     }
 }

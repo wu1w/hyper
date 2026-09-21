@@ -208,7 +208,7 @@ impl SidecarSession {
     }
 
     /// Old JSONL often froze `effort: medium`. Unlocked Agent/Code on grok-4.6
-    /// must run xhigh or the desktop loop looks like a cheap hop.
+    /// must run the config default (high). Do not downgrade a stored xhigh.
     pub(crate) fn lift_stale_medium_effort(&mut self) {
         if self.effort_locked {
             return;
@@ -217,7 +217,10 @@ impl SidecarSession {
             return;
         }
         let budget = self.caps.think_budget();
-        if budget.default_effort != Effort::Xhigh {
+        if !matches!(budget.default_effort, Effort::High | Effort::Xhigh) {
+            return;
+        }
+        if self.policy.effort == Some(budget.default_effort) {
             return;
         }
         if self.policy.effort == Some(Effort::Xhigh) {
@@ -523,16 +526,21 @@ mod tests {
     }
 
     #[test]
-    fn unlocked_agent_lifts_stale_medium_to_xhigh() {
+    fn unlocked_agent_lifts_stale_medium_to_high() {
         let mut session = SidecarSession::new(SidecarOpts::default());
         session.policy.effort = Some(Effort::Medium);
         session.lift_stale_medium_effort();
-        assert_eq!(session.policy.effort, Some(Effort::Xhigh));
+        assert_eq!(session.policy.effort, Some(Effort::High));
 
         session.effort_locked = true;
         session.policy.effort = Some(Effort::Medium);
         session.lift_stale_medium_effort();
         assert_eq!(session.policy.effort, Some(Effort::Medium));
+
+        session.effort_locked = false;
+        session.policy.effort = Some(Effort::Xhigh);
+        session.lift_stale_medium_effort();
+        assert_eq!(session.policy.effort, Some(Effort::Xhigh));
     }
 
     #[test]
@@ -650,10 +658,10 @@ mod tests {
     }
 
     #[test]
-    fn unlocked_session_open_uses_xhigh_default() {
+    fn unlocked_session_open_uses_high_default() {
         let mut session = SidecarSession::new(SidecarOpts::default());
         let open = parse_request_line(
-            r#"{"jsonrpc":"2.0","id":1,"method":"session.open","params":{"session":"s-xhigh","workspace":"/tmp/ws","mode":"agent"}}"#,
+            r#"{"jsonrpc":"2.0","id":1,"method":"session.open","params":{"session":"s-high","workspace":"/tmp/ws","mode":"agent"}}"#,
         )
         .unwrap();
         match session.handle(&open) {
@@ -661,8 +669,8 @@ mod tests {
             other => panic!("{other:?}"),
         }
         let snap = session.snapshot();
-        assert_eq!(snap.policy.effort, Some(Effort::Xhigh));
-        assert_eq!(snap.policy.max_think_tokens, 4096);
+        assert_eq!(snap.policy.effort, Some(Effort::High));
+        assert_eq!(snap.policy.max_think_tokens, 2048);
         assert!(!snap.effort_locked);
     }
 

@@ -340,8 +340,8 @@ mod tests {
             Some(crate::policy::Effort::Medium)
         );
         assert_ne!(
-            log.policy().unwrap().max_think_tokens,
-            log.start().unwrap().policy.max_think_tokens
+            log.policy().unwrap().effort,
+            log.start().unwrap().policy.effort
         );
         assert!(log
             .append(SessionEvent::Start(start("nope", SessionMode::Chat, "x")))
@@ -668,6 +668,234 @@ mod tests {
         fs::write(&p, &corrupt).unwrap();
         assert!(SessionLog::open_in(&dir, "torn").is_err());
         assert_eq!(fs::read(&p).unwrap(), corrupt);
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn open_fifo_session_is_error_not_hang() {
+        let dir = tmp_dir();
+        let fifo = dir.join("pipe.jsonl");
+        let st = std::process::Command::new("mkfifo")
+            .arg(&fifo)
+            .status()
+            .unwrap();
+        assert!(st.success());
+        let started = std::time::Instant::now();
+        let err = match SessionLog::open_in(&dir, "pipe") {
+            Err(e) => e,
+            Ok(_) => panic!("FIFO session opened"),
+        };
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(2),
+            "FIFO session must not block: {:?}",
+            started.elapsed()
+        );
+        let msg = err.to_string();
+        assert!(msg.contains("not a regular file"), "{msg}");
+        let mut log = SessionLog::create_in(&dir, start("ok", SessionMode::Agent, "sys")).unwrap();
+        log.append(SessionEvent::user("hi")).unwrap();
+        drop(log);
+        let listed = catalog::list(&dir).unwrap();
+        assert!(listed.iter().any(|s| s.id == "ok"), "{listed:?}");
+        assert!(!listed.iter().any(|s| s.id == "pipe"), "{listed:?}");
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn save_official_fifo_is_error_not_hang() {
+        let dir = tmp_dir();
+        let log = SessionLog::create_in(&dir, start("off", SessionMode::Agent, "sys")).unwrap();
+        let fifo = dir.join("off.official.json");
+        let st = std::process::Command::new("mkfifo")
+            .arg(&fifo)
+            .status()
+            .unwrap();
+        assert!(st.success());
+        let item = OfficialCompaction::from_persist(OfficialPersist {
+            id: "c1".into(),
+            model: "grok-4.6".into(),
+            encrypted_content: "blob".into(),
+            skip: 1,
+        });
+        let started = std::time::Instant::now();
+        let err = log.save_official(&item, 1).unwrap_err();
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(2),
+            "FIFO official.json must not block: {:?}",
+            started.elapsed()
+        );
+        assert!(err.to_string().contains("not a regular file"), "{err}");
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn load_official_larger_than_text_slurp_still_loads() {
+        let dir = tmp_dir();
+        let log = SessionLog::create_in(&dir, start("offbig", SessionMode::Agent, "sys")).unwrap();
+        let blob = "B".repeat(8 * 1024 * 1024 + 2048);
+        let item = OfficialCompaction::from_persist(OfficialPersist {
+            id: "c-big".into(),
+            model: "grok-4.6".into(),
+            encrypted_content: blob.clone(),
+            skip: 4,
+        });
+        log.save_official(&item, 4).unwrap();
+        let (loaded, skip) = log
+            .load_official()
+            .expect("official sidecar above 8MiB must still load");
+        assert_eq!(skip, 4);
+        assert_eq!(loaded.encrypted_content(), blob);
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn open_oversized_session_is_error_not_oom() {
+        let dir = tmp_dir();
+        let path = dir.join("huge.jsonl");
+        let f = fs::File::create(&path).unwrap();
+        f.set_len(65 * 1024 * 1024).unwrap();
+        let started = std::time::Instant::now();
+        let err = match SessionLog::open_in(&dir, "huge") {
+            Err(e) => e,
+            Ok(_) => panic!("oversized session opened"),
+        };
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(2),
+            "oversized session must fail before a full slurp: {:?}",
+            started.elapsed()
+        );
+        let msg = err.to_string();
+        assert!(msg.contains("too large"), "{msg}");
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn open_session_record_over_eight_mib_is_error() {
+        let dir = tmp_dir();
+        let path = dir.join("fat.jsonl");
+        fs::write(&path, vec![b'x'; 9 * 1024 * 1024]).unwrap();
+        let started = std::time::Instant::now();
+        let err = match SessionLog::open_in(&dir, "fat") {
+            Err(e) => e,
+            Ok(_) => panic!("oversized record session opened"),
+        };
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(3),
+            "8MiB record cap must not slurp the rest: {:?}",
+            started.elapsed()
+        );
+        let msg = err.to_string();
+        assert!(
+            msg.contains("8 MiB") || msg.contains("too large") || msg.contains("exceeds"),
+            "{msg}"
+        );
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn compact_stubs_archived_tool_in_ram_not_jsonl() {
+        let dir = tmp_dir();
+        let mut log = SessionLog::create_in(&dir, start("stub", SessionMode::Agent, "sys")).unwrap();
+        log.append(SessionEvent::user("fix it")).unwrap();
+        let dump = format!("UNIQUE_STUB_{}", "Z".repeat(400));
+        log.append(SessionEvent::tool("c1", "read", dump.clone()))
+            .unwrap();
+        log.append(SessionEvent::user("continue")).unwrap();
+        log.append(SessionEvent::compact(CompactEvent {
+            until_seq: 2,
+            keep_user_seq: 1,
+            summary: "s".into(),
+            index: "i".into(),
+            official_id: None,
+            official_model: None,
+            official_blob: None,
+        }))
+        .unwrap();
+
+        let ram = match &log.events()[2] {
+            SessionEvent::Tool(t) => t.output.clone(),
+            other => panic!("expected tool, got {}", other.type_name()),
+        };
+        assert!(
+            ram.starts_with("[archived seq=2"),
+            "RAM must drop archived dump: {ram}"
+        );
+        assert!(!ram.contains("UNIQUE_STUB_"), "{ram}");
+        let raw = fs::read_to_string(log.path()).unwrap();
+        assert!(raw.contains("UNIQUE_STUB_"), "JSONL must keep the dump");
+        let recalled = log.event_at(2).expect("seq 2");
+        match recalled {
+            SessionEvent::Tool(t) => assert!(t.output.contains("UNIQUE_STUB_"), "{}", t.output),
+            other => panic!("{}", other.type_name()),
+        }
+
+        log.set_workspace("/tmp/ws-stubbed").unwrap();
+        let raw = fs::read_to_string(log.path()).unwrap();
+        assert!(
+            raw.contains("UNIQUE_STUB_"),
+            "set_workspace must not rewrite stubs onto JSONL"
+        );
+
+        let forked = log
+            .fork(start("stub-fork", SessionMode::Agent, "sys"))
+            .unwrap();
+        let fork_raw = fs::read_to_string(forked.path()).unwrap();
+        assert!(
+            fork_raw.contains("UNIQUE_STUB_"),
+            "fork must copy real JSONL, not RAM stubs"
+        );
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn live_tool_ram_stubs_oldest_without_compact() {
+        let dir = tmp_dir();
+        let mut log =
+            SessionLog::create_in(&dir, start("live-ram", SessionMode::Agent, "sys")).unwrap();
+        log.append(SessionEvent::user("go")).unwrap();
+        let dump = format!("UNIQUE_LIVE_RAM_{}", "Y".repeat(1_000_000));
+        for i in 0..5 {
+            log.append(SessionEvent::tool(format!("c{i}"), "read", dump.clone()))
+                .unwrap();
+        }
+        let first = match &log.events()[2] {
+            SessionEvent::Tool(t) => t.output.clone(),
+            other => panic!("{}", other.type_name()),
+        };
+        assert!(
+            first.starts_with("[archived seq=2"),
+            "oldest live dump must leave RAM before compact: {first}"
+        );
+        let last = match log.events().last() {
+            Some(SessionEvent::Tool(t)) => t.output.clone(),
+            other => panic!("{other:?}"),
+        };
+        assert!(
+            last.contains("UNIQUE_LIVE_RAM_"),
+            "newest dumps stay in the live window: {last}"
+        );
+        let raw = fs::read_to_string(log.path()).unwrap();
+        assert!(
+            raw.matches("UNIQUE_LIVE_RAM_").count() >= 5,
+            "JSONL keeps every dump"
+        );
+        match log.event_at(2).expect("seq 2") {
+            SessionEvent::Tool(t) => {
+                assert!(t.output.contains("UNIQUE_LIVE_RAM_"), "{}", t.output)
+            }
+            other => panic!("{}", other.type_name()),
+        }
+        let reopened = SessionLog::open_in(&dir, "live-ram").unwrap();
+        let ram = match &reopened.events()[2] {
+            SessionEvent::Tool(t) => t.output.clone(),
+            other => panic!("{}", other.type_name()),
+        };
+        assert!(
+            ram.starts_with("[archived seq=2"),
+            "reopen must re-stub excess live dumps: {ram}"
+        );
         let _ = fs::remove_dir_all(dir);
     }
 }

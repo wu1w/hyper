@@ -26,10 +26,27 @@ pub fn edit_notebook(ws: &Workspace, call: &ToolCall) -> ToolResponse {
             ToolState::Error,
         );
     }
-    let path = match ws.resolve(&raw) {
+    let path = match ws.resolve_write(&raw) {
         Ok(p) => p,
         Err(e) => return ToolResponse::text(&call.id, e, ToolState::Error),
     };
+    if let Some(err) = fs::special_file_error(&raw, &path, &call.id) {
+        return err;
+    }
+    if let Some(err) = fs::file_parent_error(&raw, &path, &call.id) {
+        return err;
+    }
+    if super::path::is_oversized_text(&path) {
+        let len = std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
+        return ToolResponse::text(
+            &call.id,
+            format!(
+                "Error: {raw} is too large to edit as text ({len} bytes; max {} bytes).",
+                super::path::MAX_TEXT_SLURP_BYTES
+            ),
+            ToolState::Error,
+        );
+    }
     let new_cell = arg_bool(&call.arguments, "is_new_cell").unwrap_or(false);
     let Some(idx) = arg_u32(&call.arguments, "cell_idx").map(|n| n as usize) else {
         return ToolResponse::text(
@@ -43,19 +60,35 @@ pub fn edit_notebook(ws: &Workspace, call: &ToolCall) -> ToolResponse {
     let new = arg_str(&call.arguments, "new_string").unwrap_or_default();
 
     let mut nb = if path.exists() {
-        match std::fs::read_to_string(&path) {
-            Ok(s) => match serde_json::from_str::<Value>(&s) {
-                Ok(v) => v,
-                Err(e) => {
-                    return ToolResponse::text(
-                        &call.id,
-                        format!("Error: notebook JSON: {e}"),
-                        ToolState::Error,
-                    );
+        match super::path::read_bytes_regular(&path) {
+            Ok(bytes) => {
+                let s = match String::from_utf8(bytes) {
+                    Ok(s) => s,
+                    Err(_) => {
+                        return ToolResponse::text(
+                            &call.id,
+                            "Error: notebook is not valid UTF-8 text.",
+                            ToolState::Error,
+                        );
+                    }
+                };
+                match serde_json::from_str::<Value>(&s) {
+                    Ok(v) => v,
+                    Err(e) => {
+                        return ToolResponse::text(
+                            &call.id,
+                            format!("Error: notebook JSON: {e}"),
+                            ToolState::Error,
+                        );
+                    }
                 }
-            },
+            }
             Err(e) => {
-                return ToolResponse::text(&call.id, format!("Error: {e}"), ToolState::Error);
+                return ToolResponse::text(
+                    &call.id,
+                    format!("Error: {}", super::path::io_user_msg(&e)),
+                    ToolState::Error,
+                );
             }
         }
     } else if new_cell {
@@ -142,7 +175,11 @@ pub fn edit_notebook(ws: &Workspace, call: &ToolCall) -> ToolResponse {
             ),
             ToolState::Success,
         ),
-        Err(e) => ToolResponse::text(&call.id, format!("Error: {e}"), ToolState::Error),
+        Err(e) => ToolResponse::text(
+            &call.id,
+            format!("Error: {}", super::path::io_user_msg(&e)),
+            ToolState::Error,
+        ),
     }
 }
 
@@ -315,5 +352,98 @@ mod tests {
             Some("a.ipynb")
         );
         assert_eq!(arg_str(&v, "path").as_deref(), Some("b.ipynb"));
+    }
+
+    #[test]
+    fn confined_rejects_outside_notebook() {
+        let (ws, dir) = scratch();
+        let r = edit_notebook(
+            &ws,
+            &call(json!({
+                "target_notebook": "../escape.ipynb",
+                "cell_idx": 0,
+                "is_new_cell": true,
+                "cell_language": "python",
+                "old_string": "",
+                "new_string": "x"
+            })),
+        );
+        assert_eq!(r.state, ToolState::Error, "{}", r.joined_text());
+        assert!(r.joined_text().contains("workspace"), "{}", r.joined_text());
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn notebook_through_existing_file_is_not_os_error() {
+        let (ws, dir) = scratch();
+        std::fs::write(dir.join("keep.txt"), "x\n").unwrap();
+        let r = edit_notebook(
+            &ws,
+            &call(json!({
+                "target_notebook": "keep.txt/oops.ipynb",
+                "cell_idx": 0,
+                "is_new_cell": true,
+                "new_string": "print(1)"
+            })),
+        );
+        let t = r.joined_text();
+        assert_eq!(r.state, ToolState::Error, "{t}");
+        assert!(t.contains("not a directory"), "{t}");
+        assert!(!t.contains("os error"), "{t}");
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn missing_notebook_without_new_cell_is_error() {
+        let (ws, dir) = scratch();
+        let r = edit_notebook(
+            &ws,
+            &call(json!({
+                "target_notebook": "missing.ipynb",
+                "cell_idx": 0,
+                "old_string": "print(1)",
+                "new_string": "print(2)"
+            })),
+        );
+        assert_eq!(r.state, ToolState::Error, "{}", r.joined_text());
+        assert!(
+            r.joined_text().contains("does not exist"),
+            "{}",
+            r.joined_text()
+        );
+        assert!(!dir.join("missing.ipynb").exists());
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn fifo_notebook_is_error_not_hang() {
+        let (ws, dir) = scratch();
+        let fifo = dir.join("pipe.ipynb");
+        let st = std::process::Command::new("mkfifo")
+            .arg(&fifo)
+            .status()
+            .unwrap();
+        assert!(st.success());
+        let started = std::time::Instant::now();
+        let r = edit_notebook(
+            &ws,
+            &call(json!({
+                "target_notebook": "pipe.ipynb",
+                "cell_idx": 0,
+                "is_new_cell": false,
+                "cell_language": "python",
+                "old_string": "x",
+                "new_string": "y"
+            })),
+        );
+        assert!(started.elapsed() < std::time::Duration::from_secs(2));
+        assert_eq!(r.state, ToolState::Error, "{}", r.joined_text());
+        assert!(
+            r.joined_text().contains("not a regular file"),
+            "{}",
+            r.joined_text()
+        );
+        let _ = std::fs::remove_dir_all(dir);
     }
 }

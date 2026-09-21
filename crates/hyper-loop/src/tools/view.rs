@@ -3,7 +3,8 @@
 //! Shape from QwenPaw `view_media.py`: return a media block + short text, never
 //! a pixel dump. This llama.cpp box has vision and no native video/audio, so
 //! video is 3 JPEG stills via `ffmpeg` and audio is a `whisper-cli` transcript.
-//! HTTP image URLs pass through. Helpers are resolved on PATH (Windows / Linux /
+//! HTTP images are fetched and sniffed before attach so a 404 HTML page cannot
+//! 400 the next Grok hop. Helpers are resolved on PATH (Windows / Linux /
 //! macOS); the model must not `bash` to install them.
 
 use std::io::Read;
@@ -17,7 +18,8 @@ use super::media_exec::{
 use super::{arg_path, arg_str, Workspace};
 use crate::media::{
     fallback_hint, is_http_url, kind_from_ext, kind_from_magic, mime_for, native_image_mime,
-    path_ext, MediaBins, MediaCaps, MediaKind, MediaPart, MAX_INLINE_MEDIA_BYTES,
+    path_ext, sniff_known_audio_mime, sniff_known_video_mime, MediaBins, MediaCaps, MediaKind,
+    MediaPart, MAX_INLINE_MEDIA_BYTES,
 };
 use crate::tool_calls::{ToolCall, ToolResponse, ToolState};
 
@@ -48,6 +50,13 @@ pub async fn view(
         Ok(p) => p,
         Err(e) => return ToolResponse::text(&call.id, e, ToolState::Error),
     };
+    if super::path::is_special_file(&path) {
+        return ToolResponse::text(
+            &call.id,
+            format!("Error: {raw} is not a regular file."),
+            ToolState::Error,
+        );
+    }
     if !path.is_file() {
         return ToolResponse::text(
             &call.id,
@@ -61,7 +70,11 @@ pub async fn view(
         Err(e) => {
             return ToolResponse::text(
                 &call.id,
-                format!("Error: {} is not readable: {e}", raw),
+                format!(
+                    "Error: {} is not readable: {}",
+                    raw,
+                    super::path::io_user_msg(&e)
+                ),
                 ToolState::Error,
             )
         }
@@ -90,23 +103,47 @@ pub async fn view(
 
     match kind {
         MediaKind::Image => {
-            let bytes = match std::fs::read(&path) {
+            let bytes = match crate::tools::read_bytes_regular(&path) {
                 Ok(b) => b,
                 Err(e) => {
                     return ToolResponse::text(
                         &call.id,
-                        format!("Error: failed to read {}: {e}", raw),
+                        format!(
+                            "Error: failed to read {}: {}",
+                            raw,
+                            super::path::io_user_msg(&e)
+                        ),
                         ToolState::Error,
                     )
                 }
             };
-            view_local_image(&call.id, &name, &ext, &bytes, caps)
+            view_local_image(&call.id, &name, &bytes, caps)
         }
         MediaKind::Video => {
-            view_local_video(&call.id, &path, &name, &ext, meta.len(), caps, bins).await
+            view_local_video(
+                &call.id,
+                &path,
+                &name,
+                &ext,
+                meta.len(),
+                caps,
+                bins,
+                head.as_deref(),
+            )
+            .await
         }
         MediaKind::Audio => {
-            view_local_audio(&call.id, &path, &name, &ext, meta.len(), caps, bins).await
+            view_local_audio(
+                &call.id,
+                &path,
+                &name,
+                &ext,
+                meta.len(),
+                caps,
+                bins,
+                head.as_deref(),
+            )
+            .await
         }
     }
 }
@@ -119,11 +156,16 @@ fn sniff_kind(path: &Path, hint: Option<MediaKind>, head: Option<&[u8]>) -> Opti
 }
 
 fn read_head(path: &Path, n: usize) -> Option<Vec<u8>> {
-    let mut f = std::fs::File::open(path).ok()?;
+    let mut f = super::path::open_read_nonblock(path).ok()?;
     let mut buf = vec![0u8; n];
-    let got = f.read(&mut buf).ok()?;
-    buf.truncate(got);
-    Some(buf)
+    match f.read(&mut buf) {
+        Ok(got) => {
+            buf.truncate(got);
+            Some(buf)
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => None,
+        Err(_) => None,
+    }
 }
 
 async fn view_url(
@@ -138,29 +180,34 @@ async fn view_url(
         .or_else(|| kind_from_ext(&ext))
         .unwrap_or(MediaKind::Image);
     match kind {
-        MediaKind::Image if caps.attach_image() => ok_media(
-            id,
-            format!("Image loaded from URL: {url}"),
-            vec![MediaPart::image_url(url)],
-        ),
-        MediaKind::Video if caps.attach_video() => ok_media(
-            id,
-            format!("Video loaded from URL: {url}"),
-            vec![MediaPart::video_url(url)],
-        ),
+        MediaKind::Image if caps.attach_image() => {
+            match fetch_capped(url, MAX_INLINE_MEDIA_BYTES, caps).await {
+                Ok((bytes, _)) => view_local_image(id, url, &bytes, caps),
+                Err(e) => ToolResponse::text(id, e, ToolState::Error),
+            }
+        }
+        MediaKind::Video if caps.attach_video() => {
+            match fetch_capped(url, VIDEO_FETCH_MAX_BYTES, caps).await {
+                Ok((bytes, _)) => video_from_bytes(id, url, &ext, &bytes, true, bins).await,
+                Err(e) => ToolResponse::text(id, e, ToolState::Error),
+            }
+        }
         MediaKind::Video if caps.attach_image() => {
             match fetch_capped(url, VIDEO_FETCH_MAX_BYTES, caps).await {
-                Ok((bytes, _)) => video_from_bytes(id, url, &ext, &bytes, bins).await,
-                Err(e) => ToolResponse::text(
-                    id,
-                    no_watch_msg(url, &e.trim_start_matches("Error: ")),
-                    ToolState::Success,
-                ),
+                Ok((bytes, _)) => video_from_bytes(id, url, &ext, &bytes, false, bins).await,
+                Err(e) => ToolResponse::text(id, e, ToolState::Error),
             }
         }
         MediaKind::Audio if caps.attach_audio() => {
             match fetch_capped(url, MAX_INLINE_MEDIA_BYTES, caps).await {
                 Ok((bytes, mime)) => {
+                    if sniff_known_audio_mime(&bytes).is_none() {
+                        return ToolResponse::text(
+                            id,
+                            format!("Error: {url} is not a valid WAV, FLAC, Ogg, MP3, or M4A audio file."),
+                            ToolState::Error,
+                        );
+                    }
                     let ext = ext_from_mime(&mime, &ext);
                     ok_media(
                         id,
@@ -172,26 +219,26 @@ async fn view_url(
                         )],
                     )
                 }
-                Err(_) => transcribe_url(id, url, caps, bins).await,
+                Err(e) => ToolResponse::text(id, e, ToolState::Error),
             }
         }
         MediaKind::Audio => transcribe_url(id, url, caps, bins).await,
         other => ToolResponse::text(
             id,
-            fallback_hint(other, url, missing_reason(other, caps)),
-            ToolState::Success,
+            format!("Error: {}", fallback_hint(other, url, missing_reason(other, caps))),
+            ToolState::Error,
         ),
     }
 }
 
-fn view_local_image(
-    id: &str,
-    name: &str,
-    ext: &str,
-    bytes: &[u8],
-    caps: &MediaCaps,
-) -> ToolResponse {
-    let mime = mime_for(MediaKind::Image, ext, Some(bytes));
+fn view_local_image(id: &str, name: &str, bytes: &[u8], caps: &MediaCaps) -> ToolResponse {
+    let Some(mime) = crate::media::sniff_known_image_mime(bytes) else {
+        return ToolResponse::text(
+            id,
+            format!("Error: {name} is not a valid JPG, PNG, WebP, or GIF image."),
+            ToolState::Error,
+        );
+    };
     if !native_image_mime(mime) {
         return ToolResponse::text(
             id,
@@ -204,12 +251,15 @@ fn view_local_image(
     if !caps.attach_image() {
         return ToolResponse::text(
             id,
-            fallback_hint(
-                MediaKind::Image,
-                name,
-                missing_reason(MediaKind::Image, caps),
+            format!(
+                "Error: {}",
+                fallback_hint(
+                    MediaKind::Image,
+                    name,
+                    missing_reason(MediaKind::Image, caps),
+                )
             ),
-            ToolState::Success,
+            ToolState::Error,
         );
     }
     ok_media(
@@ -227,7 +277,15 @@ async fn view_local_video(
     size: u64,
     caps: &MediaCaps,
     bins: &MediaBins,
+    head: Option<&[u8]>,
 ) -> ToolResponse {
+    if sniff_known_video_mime(head.unwrap_or(&[])).is_none() {
+        return ToolResponse::text(
+            id,
+            format!("Error: {name} is not a valid MP4, WebM, or AVI video."),
+            ToolState::Error,
+        );
+    }
     if caps.attach_video() {
         if size as usize > MAX_INLINE_MEDIA_BYTES {
             return ToolResponse::text(
@@ -239,12 +297,15 @@ async fn view_local_video(
                 ToolState::Error,
             );
         }
-        let bytes = match std::fs::read(path) {
+        let bytes = match crate::tools::read_bytes_regular(path) {
             Ok(b) => b,
             Err(e) => {
                 return ToolResponse::text(
                     id,
-                    format!("Error: failed to read {name}: {e}"),
+                    format!(
+                        "Error: failed to read {name}: {}",
+                        super::path::io_user_msg(&e)
+                    ),
                     ToolState::Error,
                 )
             }
@@ -261,12 +322,15 @@ async fn view_local_video(
     }
     ToolResponse::text(
         id,
-        fallback_hint(
-            MediaKind::Video,
-            name,
-            missing_reason(MediaKind::Video, caps),
+        format!(
+            "Error: {}",
+            fallback_hint(
+                MediaKind::Video,
+                name,
+                missing_reason(MediaKind::Video, caps),
+            )
         ),
-        ToolState::Success,
+        ToolState::Error,
     )
 }
 
@@ -275,18 +339,34 @@ async fn video_from_bytes(
     name: &str,
     ext: &str,
     bytes: &[u8],
+    attach_inline: bool,
     bins: &MediaBins,
 ) -> ToolResponse {
+    if sniff_known_video_mime(bytes).is_none() {
+        return ToolResponse::text(
+            id,
+            format!("Error: {name} is not a valid MP4, WebM, or AVI video."),
+            ToolState::Error,
+        );
+    }
+    if attach_inline && bytes.len() <= MAX_INLINE_MEDIA_BYTES {
+        let mime = mime_for(MediaKind::Video, ext, Some(bytes));
+        return ok_media(
+            id,
+            format!("Video loaded from URL: {name}"),
+            vec![MediaPart::data_uri(MediaKind::Video, mime, bytes)],
+        );
+    }
     let tmp = std::env::temp_dir().join(format!(
         "hyper-vid-{}.{}",
         uuid::Uuid::new_v4().simple(),
         if ext.is_empty() { "mp4" } else { ext }
     ));
-    if let Err(e) = std::fs::write(&tmp, bytes) {
+    if let Err(e) = crate::tools::write_if_regular(&tmp, bytes) {
         return ToolResponse::text(
             id,
-            no_watch_msg(name, &format!("could not buffer download ({e})")),
-            ToolState::Success,
+            format!("Error: could not buffer download ({e})"),
+            ToolState::Error,
         );
     }
     let r = video_stills(id, &tmp, name, bins).await;
@@ -304,7 +384,16 @@ async fn video_stills(id: &str, path: &Path, name: &str, bins: &MediaBins) -> To
                 sampled.parts,
             )
         }
-        Err(e) => ToolResponse::text(id, no_watch_msg(name, &e), ToolState::Success),
+        Err(e) if e.contains("ffmpeg is not on PATH") => ToolResponse::text(
+            id,
+            format!("Error: {}", no_watch_msg(name, &e)),
+            ToolState::Error,
+        ),
+        Err(e) => ToolResponse::text(
+            id,
+            format!("Error: {}", no_watch_msg(name, &e)),
+            ToolState::Error,
+        ),
     }
 }
 
@@ -316,14 +405,25 @@ async fn view_local_audio(
     size: u64,
     caps: &MediaCaps,
     bins: &MediaBins,
+    head: Option<&[u8]>,
 ) -> ToolResponse {
+    if sniff_known_audio_mime(head.unwrap_or(&[])).is_none() {
+        return ToolResponse::text(
+            id,
+            format!("Error: {name} is not a valid WAV, FLAC, Ogg, MP3, or M4A audio file."),
+            ToolState::Error,
+        );
+    }
     if caps.attach_audio() && (size as usize) <= MAX_INLINE_MEDIA_BYTES {
-        let bytes = match std::fs::read(path) {
+        let bytes = match crate::tools::read_bytes_regular(path) {
             Ok(b) => b,
             Err(e) => {
                 return ToolResponse::text(
                     id,
-                    format!("Error: failed to read {name}: {e}"),
+                    format!(
+                        "Error: failed to read {name}: {}",
+                        super::path::io_user_msg(&e)
+                    ),
                     ToolState::Error,
                 )
             }
@@ -341,28 +441,31 @@ async fn view_local_audio(
 async fn transcribe_url(id: &str, url: &str, caps: &MediaCaps, bins: &MediaBins) -> ToolResponse {
     match fetch_capped(url, AUDIO_FETCH_MAX_BYTES, caps).await {
         Ok((bytes, mime)) => {
+            if sniff_known_audio_mime(&bytes).is_none() {
+                return ToolResponse::text(
+                    id,
+                    format!("Error: {url} is not a valid WAV, FLAC, Ogg, MP3, or M4A audio file."),
+                    ToolState::Error,
+                );
+            }
             let ext = ext_from_mime(&mime, &path_ext(url));
             let tmp = std::env::temp_dir().join(format!(
                 "hyper-aud-{}.{}",
                 uuid::Uuid::new_v4().simple(),
                 if ext.is_empty() { "wav" } else { ext.as_str() }
             ));
-            if let Err(e) = std::fs::write(&tmp, bytes) {
+            if let Err(e) = crate::tools::write_if_regular(&tmp, bytes) {
                 return ToolResponse::text(
                     id,
-                    no_hear_msg(url, &format!("could not buffer download ({e})")),
-                    ToolState::Success,
+                    format!("Error: could not buffer download ({e})"),
+                    ToolState::Error,
                 );
             }
             let r = transcribe_path(id, &tmp, url, caps, bins).await;
             let _ = std::fs::remove_file(&tmp);
             r
         }
-        Err(e) => ToolResponse::text(
-            id,
-            no_hear_msg(url, &e.trim_start_matches("Error: ")),
-            ToolState::Success,
-        ),
+        Err(e) => ToolResponse::text(id, e, ToolState::Error),
     }
 }
 
@@ -393,7 +496,11 @@ async fn transcribe_path(
                         return r;
                     }
                 }
-                return ToolResponse::text(id, no_hear_msg(name, &e), ToolState::Success);
+                return ToolResponse::text(
+                    id,
+                    format!("Error: {}", no_hear_msg(name, &e)),
+                    ToolState::Error,
+                );
             }
         }
     }
@@ -407,7 +514,11 @@ async fn transcribe_path(
     } else {
         "transcription failed"
     };
-    ToolResponse::text(id, no_hear_msg(name, why), ToolState::Success)
+    ToolResponse::text(
+        id,
+        format!("Error: {}", no_hear_msg(name, why)),
+        ToolState::Error,
+    )
 }
 
 async fn transcribe_http(
@@ -417,7 +528,27 @@ async fn transcribe_http(
     caps: &MediaCaps,
 ) -> Option<ToolResponse> {
     let (base, key) = caps.origin.clone()?;
-    let bytes = std::fs::read(path).ok()?;
+    if super::path::is_special_file(path) {
+        return Some(ToolResponse::text(
+            id,
+            format!("Error: {name} is not a regular file."),
+            ToolState::Error,
+        ));
+    }
+    let len = std::fs::metadata(path).ok()?.len() as usize;
+    if len > AUDIO_FETCH_MAX_BYTES {
+        return Some(ToolResponse::text(
+            id,
+            format!(
+                "Error: {name} is {len} bytes and exceeds the {AUDIO_FETCH_MAX_BYTES}-byte audio limit."
+            ),
+            ToolState::Error,
+        ));
+    }
+    let bytes = match crate::tools::read_bytes_regular(path) {
+        Ok(b) => b,
+        Err(_) => return None,
+    };
     let ext = path_ext(&path.to_string_lossy());
     let url = format!("{}/audio/transcriptions", base.trim_end_matches('/'));
     let mime = mime_for(MediaKind::Audio, &ext, Some(&bytes));
@@ -447,9 +578,12 @@ async fn transcribe_http(
         req = req.bearer_auth(key);
     }
     match req.send().await {
-        Ok(resp) => {
+        Ok(mut resp) => {
             let status = resp.status();
-            let body = resp.text().await.unwrap_or_default();
+            let body = match crate::media::take_body_capped(&mut resp, 1024 * 1024).await {
+                Ok(b) => String::from_utf8_lossy(&b).into_owned(),
+                Err(_) => return None,
+            };
             if !status.is_success() {
                 return None;
             }
@@ -484,7 +618,7 @@ async fn fetch_capped(
             req = req.bearer_auth(key);
         }
     }
-    let resp = req
+    let mut resp = req
         .send()
         .await
         .map_err(|e| format!("Error: download failed: {e}"))?;
@@ -507,17 +641,22 @@ async fn fetch_capped(
         .next()
         .unwrap_or("application/octet-stream")
         .to_string();
-    let bytes = resp
-        .bytes()
-        .await
-        .map_err(|e| format!("Error: download body: {e}"))?;
-    if bytes.len() > max_bytes {
-        return Err(format!(
-            "Error: remote media is {} bytes and exceeds the {max_bytes}-byte limit.",
-            bytes.len()
-        ));
+    let mut bytes: Vec<u8> = Vec::new();
+    loop {
+        match resp.chunk().await {
+            Ok(Some(chunk)) => {
+                if bytes.len().saturating_add(chunk.len()) > max_bytes {
+                    return Err(format!(
+                        "Error: remote media exceeds the {max_bytes}-byte limit."
+                    ));
+                }
+                bytes.extend_from_slice(&chunk);
+            }
+            Ok(None) => break,
+            Err(e) => return Err(format!("Error: download body: {e}")),
+        }
     }
-    Ok((bytes.to_vec(), mime))
+    Ok((bytes, mime))
 }
 
 fn url_is_same_host(url: &str, base: &str) -> bool {
@@ -649,6 +788,31 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn garbage_png_bytes_are_not_attached() {
+        let (ws, dir) = scratch();
+        std::fs::write(dir.join("x.png"), b"not-a-png").unwrap();
+        let mut caps = MediaCaps::default();
+        caps.image = Some(true);
+        let r = view(
+            &ws,
+            &ToolCall {
+                id: "t1".into(),
+                name: "view".into(),
+                arguments: json!({"path": "x.png", "kind": "image"}),
+            },
+            &caps,
+            &MediaBins::none(),
+            MAX_INLINE_MEDIA_BYTES,
+        )
+        .await;
+        let t = r.joined_text();
+        assert_eq!(r.state, ToolState::Error, "{t}");
+        assert!(t.contains("not a valid"), "{t}");
+        assert!(r.media.is_empty(), "{t}");
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[tokio::test]
     async fn no_attach_when_probe_says_no() {
         let (ws, dir) = scratch();
         let png = base64::Engine::decode(
@@ -660,7 +824,7 @@ mod tests {
         let mut caps = MediaCaps::default();
         caps.image = Some(false);
         let r = run(&ws, "red.png", &caps).await;
-        assert_eq!(r.state, ToolState::Success);
+        assert_eq!(r.state, ToolState::Error);
         assert!(r.media.is_empty());
         assert!(
             r.joined_text().contains("cannot perceive"),
@@ -671,13 +835,23 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn http_image_passes_url_through() {
+    async fn http_image_fetch_error_is_not_attached() {
         let (ws, dir) = scratch();
         let mut caps = MediaCaps::default();
         caps.image = Some(true);
-        let r = run(&ws, "https://example.com/cat.png", &caps).await;
-        assert_eq!(r.media.len(), 1);
-        assert_eq!(r.media[0].url, "https://example.com/cat.png");
+        let r = tokio::time::timeout(
+            Duration::from_secs(8),
+            run(&ws, "http://127.0.0.1:1/x.png", &caps),
+        )
+        .await
+        .expect("http image fetch hung");
+        let t = r.joined_text();
+        assert_eq!(r.state, ToolState::Error, "{t}");
+        assert!(r.media.is_empty(), "{t}");
+        assert!(
+            t.contains("download") || t.contains("HTTP") || t.contains("failed"),
+            "{t}"
+        );
         let _ = std::fs::remove_dir_all(dir);
     }
 
@@ -689,20 +863,45 @@ mod tests {
         caps.video = Some(false);
         caps.image = Some(false);
         let r = run(&ws, "clip.mp4", &caps).await;
-        assert!(r.joined_text().contains("video"), "{}", r.joined_text());
+        let t = r.joined_text();
+        assert_eq!(r.state, ToolState::Error, "{t}");
+        assert!(t.contains("not a valid"), "{t}");
         assert!(r.media.is_empty());
         let _ = std::fs::remove_dir_all(dir);
     }
 
     #[tokio::test]
+    async fn garbage_mp4_bytes_are_not_attached() {
+        let (ws, dir) = scratch();
+        std::fs::write(dir.join("x.mp4"), b"not a video at all").unwrap();
+        let mut caps = MediaCaps::default();
+        caps.video = Some(true);
+        caps.image = Some(true);
+        let r = run(&ws, "x.mp4", &caps).await;
+        let t = r.joined_text();
+        assert_eq!(r.state, ToolState::Error, "{t}");
+        assert!(t.contains("not a valid"), "{t}");
+        assert!(r.media.is_empty(), "{t}");
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    fn ftyp_header() -> Vec<u8> {
+        let mut b = vec![0, 0, 0, 24];
+        b.extend_from_slice(b"ftypisom");
+        b.extend_from_slice(&[0u8; 12]);
+        b
+    }
+
+    #[tokio::test]
     async fn video_without_ffmpeg_does_not_suggest_bash() {
         let (ws, dir) = scratch();
-        std::fs::write(dir.join("clip.mp4"), b"not-really-mp4").unwrap();
+        std::fs::write(dir.join("clip.mp4"), ftyp_header()).unwrap();
         let mut caps = MediaCaps::default();
         caps.video = Some(false);
         caps.image = Some(true);
         let r = run(&ws, "clip.mp4", &caps).await;
         let t = r.joined_text();
+        assert_eq!(r.state, ToolState::Error, "{t}");
         assert!(t.contains("Cannot watch"), "{t}");
         assert!(!t.contains("Do not install"), "{t}");
         assert!(!t.to_ascii_lowercase().contains("brew"), "{t}");
@@ -720,10 +919,25 @@ mod tests {
         caps.transcription = Some(false);
         let r = run(&ws, "speak.wav", &caps).await;
         let t = r.joined_text();
+        assert_eq!(r.state, ToolState::Error, "{t}");
         assert!(t.contains("Cannot hear"), "{t}");
         assert!(!t.contains("Do not install"), "{t}");
         assert!(!t.to_ascii_lowercase().contains("brew"), "{t}");
         assert!(r.media.is_empty());
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[tokio::test]
+    async fn garbage_wav_bytes_are_not_attached() {
+        let (ws, dir) = scratch();
+        std::fs::write(dir.join("x.wav"), b"not audio at all").unwrap();
+        let mut caps = MediaCaps::default();
+        caps.audio = Some(true);
+        let r = run(&ws, "x.wav", &caps).await;
+        let t = r.joined_text();
+        assert_eq!(r.state, ToolState::Error, "{t}");
+        assert!(t.contains("not a valid"), "{t}");
+        assert!(r.media.is_empty(), "{t}");
         let _ = std::fs::remove_dir_all(dir);
     }
 
@@ -747,6 +961,63 @@ mod tests {
         assert_eq!(r.media.len(), 3, "{}", r.joined_text());
         assert!(r.media.iter().all(|p| p.kind == MediaKind::Image));
         assert!(r.joined_text().contains("stills"), "{}", r.joined_text());
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[tokio::test]
+    async fn fetch_capped_stops_unbounded_http_body() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let (mut sock, _) = listener.accept().await.unwrap();
+            let mut buf = vec![0u8; 2048];
+            let _ = tokio::io::AsyncReadExt::read(&mut sock, &mut buf).await;
+            let _ = tokio::io::AsyncWriteExt::write_all(
+                &mut sock,
+                b"HTTP/1.1 200 OK\r\nContent-Type: image/png\r\n\r\n",
+            )
+            .await;
+            let chunk = vec![0u8; 64 * 1024];
+            for _ in 0..80 {
+                if tokio::io::AsyncWriteExt::write_all(&mut sock, &chunk)
+                    .await
+                    .is_err()
+                {
+                    break;
+                }
+            }
+        });
+        let url = format!("http://{addr}/x.png");
+        let started = std::time::Instant::now();
+        let r = fetch_capped(&url, 256 * 1024, &MediaCaps::default()).await;
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(4),
+            "unbounded HTTP body must not slurp: {:?}",
+            started.elapsed()
+        );
+        let err = r.expect_err("must cap");
+        assert!(err.contains("exceeds") || err.contains("limit"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn view_fifo_png_is_error_not_hang() {
+        let (ws, dir) = scratch();
+        let fifo = dir.join("pipe.png");
+        let st = std::process::Command::new("mkfifo")
+            .arg(&fifo)
+            .status()
+            .unwrap();
+        assert!(st.success());
+        let started = std::time::Instant::now();
+        let r = run(&ws, "pipe.png", &MediaCaps::default()).await;
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(2),
+            "FIFO view must not block: {:?}",
+            started.elapsed()
+        );
+        let t = r.joined_text();
+        assert_eq!(r.state, ToolState::Error, "{t}");
+        assert!(t.contains("not a regular file"), "{t}");
         let _ = std::fs::remove_dir_all(dir);
     }
 }

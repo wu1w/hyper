@@ -1,6 +1,6 @@
 //! IM liveness without changing the agent loop.
 //!
-//! The coding hop still runs xhigh / tools / compact. Live `EventSink` deltas
+//! The coding hop still runs the session effort / tools / compact. Live `EventSink` deltas
 //! (the same stream the console think panel uses) are coalesced into a few
 //! chat lines so WeChat/QQ do not look frozen.
 

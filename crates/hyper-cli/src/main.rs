@@ -27,8 +27,7 @@ mod vscode_install;
 #[command(
     name = "hyper",
     about = "grok-hyper CLI — grok-4.6 agent harness. `hyper web` is the console; a TTY with no prompt opens the TUI; --print is oneshot.",
-    version,
-    args_conflicts_with_subcommands = true
+    version
 )]
 struct Cli {
     #[command(subcommand)]
@@ -45,7 +44,7 @@ struct Cli {
     #[arg(long, value_name = "MODE")]
     mode: Option<String>,
 
-    #[arg(long, value_name = "ID")]
+    #[arg(long, value_name = "ID", global = true)]
     session: Option<String>,
 
     /// Resume the most recent session JSONL.
@@ -81,15 +80,15 @@ struct Cli {
     channels: bool,
 
     /// Load workspace AGENTS.md (on by default).
-    #[arg(long)]
+    #[arg(long, global = true)]
     agents_md: bool,
 
     /// Disable loading workspace AGENTS.md.
-    #[arg(long)]
+    #[arg(long, global = true)]
     no_agents_md: bool,
 
     /// Clip AGENTS.md to the token cap. Default omits the file if it is over the cap.
-    #[arg(long)]
+    #[arg(long, global = true)]
     agents_md_head: bool,
 
     #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
@@ -756,5 +755,82 @@ mod clap_tests {
             Some(Command::Login { device_auth }) => assert!(device_auth),
             other => panic!("expected Login, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn workspace_before_web_is_the_console() {
+        let cli = Cli::try_parse_from([
+            "hyper",
+            "--workspace",
+            "/tmp/ws",
+            "web",
+            "--no-open",
+            "--bind",
+            "127.0.0.1:0",
+        ])
+        .expect("parse");
+        match cli.command {
+            Some(Command::Web { no_open, bind, .. }) => {
+                assert!(no_open);
+                assert_eq!(bind, "127.0.0.1:0");
+            }
+            other => panic!("expected Web, got {other:?} prompt={:?}", cli.prompt),
+        }
+        assert_eq!(
+            cli.workspace.as_deref(),
+            Some(std::path::Path::new("/tmp/ws"))
+        );
+        assert!(cli.prompt.is_empty());
+    }
+
+    #[test]
+    fn session_before_web_is_the_console() {
+        let cli =
+            Cli::try_parse_from(["hyper", "--session", "abc", "web", "--no-open"]).expect("parse");
+        match cli.command {
+            Some(Command::Web { no_open, .. }) => assert!(no_open),
+            other => panic!("expected Web, got {other:?} prompt={:?}", cli.prompt),
+        }
+        assert_eq!(cli.session.as_deref(), Some("abc"));
+        assert!(cli.prompt.is_empty());
+    }
+
+    #[test]
+    fn print_oneshot_is_not_a_subcommand() {
+        let cli = Cli::try_parse_from(["hyper", "--print", "hello"]).expect("parse");
+        assert!(cli.command.is_none(), "{:?}", cli.command);
+        assert_eq!(cli.prompt, vec!["hello"]);
+        assert!(cli.print);
+    }
+
+    #[test]
+    fn workspace_print_stays_oneshot() {
+        let cli = Cli::try_parse_from(["hyper", "--workspace", "/tmp/ws", "--print", "hello"])
+            .expect("parse");
+        assert!(cli.command.is_none(), "{:?}", cli.command);
+        assert_eq!(cli.prompt, vec!["hello"]);
+    }
+
+    #[test]
+    fn new_before_web_is_the_console() {
+        let cli = Cli::try_parse_from(["hyper", "--new", "web", "--no-open"]).expect("parse");
+        match cli.command {
+            Some(Command::Web { no_open, .. }) => assert!(no_open),
+            other => panic!("expected Web, got {other:?} prompt={:?}", cli.prompt),
+        }
+        assert!(cli.new);
+        assert!(cli.prompt.is_empty());
+    }
+
+    #[test]
+    fn think_before_web_is_the_console() {
+        let cli =
+            Cli::try_parse_from(["hyper", "--think", "high", "web", "--no-open"]).expect("parse");
+        match cli.command {
+            Some(Command::Web { no_open, .. }) => assert!(no_open),
+            other => panic!("expected Web, got {other:?} prompt={:?}", cli.prompt),
+        }
+        assert_eq!(cli.think.as_deref(), Some("high"));
+        assert!(cli.prompt.is_empty());
     }
 }

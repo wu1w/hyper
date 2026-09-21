@@ -227,7 +227,7 @@ struct McpBundle {
 }
 
 fn read_bundle(path: &Path) -> Option<McpBundle> {
-    let raw = std::fs::read_to_string(path).ok()?;
+    let raw = crate::tools::read_text_if_regular(path)?;
     parse_mcp_toml(&raw, path.file_stem().and_then(|s| s.to_str()))
 }
 
@@ -371,8 +371,8 @@ pub async fn run_mcp(
         if registry.servers.is_empty() {
             return ToolResponse::text(
                 &call.id,
-                "No MCP servers configured. Add [[mcp.servers]] in config.toml.",
-                ToolState::Success,
+                "Error: No MCP servers configured. Add [[mcp.servers]] in config.toml.",
+                ToolState::Error,
             );
         }
         let names: Vec<&str> = registry.servers.iter().map(|s| s.name.as_str()).collect();
@@ -457,8 +457,8 @@ pub async fn get_dynamic_tools(
     if registry.servers.is_empty() {
         return ToolResponse::text(
             &call.id,
-            "No MCP servers configured. Add [[mcp.servers]] in config.toml.",
-            ToolState::Success,
+            "Error: No MCP servers configured. Add [[mcp.servers]] in config.toml.",
+            ToolState::Error,
         );
     }
     let requested = arg_str_any(&call.arguments, &["server", "namespace"]);
@@ -571,8 +571,8 @@ pub async fn fetch_mcp_resource(
     if registry.servers.is_empty() {
         return ToolResponse::text(
             &call.id,
-            "No MCP servers configured. Add [[mcp.servers]] in config.toml.",
-            ToolState::Success,
+            "Error: No MCP servers configured. Add [[mcp.servers]] in config.toml.",
+            ToolState::Error,
         );
     }
     let Some(server) = arg_str_any(&call.arguments, &["server", "namespace"]) else {
@@ -619,7 +619,7 @@ pub async fn fetch_mcp_resource(
             ToolState::Success,
         );
     };
-    let dest = match ws.resolve(&rel) {
+    let dest = match ws.resolve_write(&rel) {
         Ok(p) => p,
         Err(e) => return ToolResponse::text(&call.id, e, ToolState::Error),
     };
@@ -634,11 +634,17 @@ pub async fn fetch_mcp_resource(
 }
 
 fn write_resource_file(path: &std::path::Path, raw: &str) -> Result<usize> {
+    if crate::tools::is_special_file(path) {
+        return Err(Error::msg(format!(
+            "{} is not a regular file.",
+            path.display()
+        )));
+    }
     let bytes = resource_bytes(raw)?;
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent).map_err(Error::msg)?;
     }
-    std::fs::write(path, &bytes).map_err(Error::msg)?;
+    crate::tools::write_if_regular(path, &bytes).map_err(Error::msg)?;
     Ok(bytes.len())
 }
 
@@ -1043,6 +1049,53 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn empty_mcp_registry_is_error_not_success() {
+        let registry = McpRegistry::default();
+        let listed = get_dynamic_tools(
+            &registry,
+            &ToolCall {
+                id: "e1".into(),
+                name: "GetDynamicTools".into(),
+                arguments: json!({}),
+            },
+            ToolLimits::default(),
+            None,
+        )
+        .await;
+        assert_eq!(listed.state, ToolState::Error, "{}", listed.joined_text());
+        assert!(
+            listed.joined_text().starts_with("Error:"),
+            "{}",
+            listed.joined_text()
+        );
+        let fetched = fetch_mcp_resource(
+            &registry,
+            &ToolCall {
+                id: "e2".into(),
+                name: "FetchMcpResource".into(),
+                arguments: json!({}),
+            },
+            ToolLimits::default(),
+            None,
+            None,
+        )
+        .await;
+        assert_eq!(fetched.state, ToolState::Error, "{}", fetched.joined_text());
+        let mcp = run_mcp(
+            &registry,
+            &ToolCall {
+                id: "e3".into(),
+                name: "mcp".into(),
+                arguments: json!({"method": "list"}),
+            },
+            ToolLimits::default(),
+            None,
+        )
+        .await;
+        assert_eq!(mcp.state, ToolState::Error, "{}", mcp.joined_text());
+    }
+
+    #[tokio::test]
     async fn fake_stdio_server_tools_call() {
         let dir = std::env::temp_dir().join(format!("hyper-mcp-{}", uuid::Uuid::new_v4().simple()));
         std::fs::create_dir_all(&dir).unwrap();
@@ -1270,6 +1323,47 @@ while True:
             std::fs::read_to_string(ws_dir.join("copied.txt")).unwrap(),
             "resource-body"
         );
+        let escaped = fetch_mcp_resource(
+            &registry,
+            &crate::tool_calls::ToolCall {
+                id: "r4".into(),
+                name: "FetchMcpResource".into(),
+                arguments: json!({
+                    "server": "echo",
+                    "uri": "echo://pong",
+                    "downloadPath": "../escape.txt"
+                }),
+            },
+            crate::tools::ToolLimits::default(),
+            None,
+            Some(&ws),
+        )
+        .await;
+        assert_eq!(escaped.state, ToolState::Error, "{}", escaped.joined_text());
+        assert!(
+            escaped.joined_text().contains("workspace"),
+            "{}",
+            escaped.joined_text()
+        );
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn write_resource_file_refuses_fifo() {
+        let dir =
+            std::env::temp_dir().join(format!("hyper-mcp-fifo-{}", uuid::Uuid::new_v4().simple()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let fifo = dir.join("pipe.txt");
+        let st = std::process::Command::new("mkfifo")
+            .arg(&fifo)
+            .status()
+            .unwrap();
+        assert!(st.success());
+        let started = std::time::Instant::now();
+        let err = write_resource_file(&fifo, "hello").unwrap_err();
+        assert!(started.elapsed() < std::time::Duration::from_secs(2));
+        assert!(err.to_string().contains("not a regular file"), "{err}");
         let _ = std::fs::remove_dir_all(dir);
     }
 

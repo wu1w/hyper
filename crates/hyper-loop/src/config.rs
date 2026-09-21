@@ -208,7 +208,7 @@ impl Default for PolicyConfig {
     fn default() -> Self {
         Self {
             default_mode: "agent".into(),
-            // `auto` → xhigh on grok-4.6, medium on Qwen.
+            // `auto` → high on grok-4.6 (Cursor Auto); xhigh is `/think xhigh`.
             default_effort: "auto".into(),
             max_think_tokens_low: 512,
             max_think_tokens_medium: 2048,
@@ -551,7 +551,22 @@ impl Config {
     }
 
     pub fn load_from(path: &Path) -> Result<Self> {
-        let raw = fs::read_to_string(path)?;
+        if crate::tools::is_special_file(path) {
+            return Err(Error::Config(format!(
+                "{} is not a regular file",
+                path.display()
+            )));
+        }
+        if crate::tools::is_oversized_text(path) {
+            return Err(Error::Config(format!(
+                "{} is too large to load as config",
+                path.display()
+            )));
+        }
+        let bytes = crate::tools::read_bytes_regular(path)?;
+        let raw = String::from_utf8(bytes).map_err(|_| {
+            Error::Config(format!("{} is not valid UTF-8", path.display()))
+        })?;
         let mut cfg: Self = toml::from_str(&raw)?;
         let _ = cfg.migrate_overnight_defaults();
         Ok(cfg)
@@ -600,14 +615,28 @@ impl Config {
     /// Does not apply `HYPER_*` — use [`load_or_init`] for CLI/tests that want the overlay.
     pub fn load_or_init_file() -> Result<(Self, PathBuf)> {
         let dir = Self::home_dir()?;
-        fs::create_dir_all(&dir)?;
+        crate::fs_mode::ensure_private_dir(&dir)?;
+        crate::fs_mode::tighten_hyper_home(&dir);
         let path = dir.join("config.toml");
         let cfg = if !path.exists() {
             let cfg = Self::default();
             cfg.save_to(&path)?;
             cfg
+        } else if crate::tools::is_special_file(&path) {
+            return Err(Error::Config(format!(
+                "{} is not a regular file",
+                path.display()
+            )));
+        } else if crate::tools::is_oversized_text(&path) {
+            return Err(Error::Config(format!(
+                "{} is too large to load as config",
+                path.display()
+            )));
         } else {
-            let raw = fs::read_to_string(&path)?;
+            let bytes = crate::tools::read_bytes_regular(&path)?;
+            let raw = String::from_utf8(bytes).map_err(|_| {
+                Error::Config(format!("{} is not valid UTF-8", path.display()))
+            })?;
             let mut cfg: Self = toml::from_str(&raw)?;
             if cfg.migrate_overnight_defaults() {
                 backup_commented_original(&path);
@@ -700,12 +729,15 @@ impl Config {
             fs::create_dir_all(dir)?;
         }
         let tmp = path.with_extension("toml.tmp");
-        if let Err(e) = fs::write(&tmp, self.to_toml()) {
+        if let Err(e) = crate::tools::write_if_regular(&tmp, self.to_toml().as_bytes()) {
             let _ = fs::remove_file(&tmp);
             return Err(e.into());
         }
         match replace_tmp(&tmp, path) {
-            Ok(()) => Ok(()),
+            Ok(()) => {
+                crate::fs_mode::tighten_file(path);
+                Ok(())
+            }
             Err(e) => {
                 let _ = fs::remove_file(&tmp);
                 Err(e.into())
@@ -722,7 +754,7 @@ impl Config {
 /// 尚无备份」的 config.toml 前，把原文件留一份 config.toml.orig；已存在
 /// 则不覆盖。失败只静默放弃，不阻塞保存。
 fn backup_commented_original(path: &Path) {
-    let Ok(raw) = fs::read_to_string(path) else {
+    let Some(raw) = crate::tools::read_text_if_regular(path) else {
         return;
     };
     if !raw.lines().any(|l| l.trim_start().starts_with('#')) {
@@ -785,10 +817,7 @@ mod tests {
         assert!((c.context.compact_ratio - 0.80).abs() < f64::EPSILON);
         assert_eq!(c.server.model, "grok-4.6");
         assert_eq!(c.server.family, Family::Grok46);
-        assert_eq!(
-            c.think_budget().default_effort,
-            crate::policy::Effort::Xhigh
-        );
+        assert_eq!(c.think_budget().default_effort, crate::policy::Effort::High);
         assert!(c.server.base_url.is_empty());
         assert_eq!(c.policy.max_steps, 0);
         assert!(!c.policy.low_precision);
@@ -804,7 +833,6 @@ mod tests {
         assert!(c.features.workspace_write_only);
     }
 
-    
     #[test]
     fn migrate_overnight_walls_only_legacy_values() {
         let mut c = Config::default();
@@ -1103,6 +1131,51 @@ mod tests {
         let _ = std::fs::remove_dir_all(dir);
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn load_from_fifo_is_error_not_hang() {
+        let dir =
+            std::env::temp_dir().join(format!("hyper-cfg-fifo-{}", uuid::Uuid::new_v4().simple()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("config.toml");
+        let st = std::process::Command::new("mkfifo")
+            .arg(&path)
+            .status()
+            .unwrap();
+        assert!(st.success());
+        let started = std::time::Instant::now();
+        let err = Config::load_from(&path).unwrap_err();
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(2),
+            "FIFO config must not block: {:?}",
+            started.elapsed()
+        );
+        let msg = err.to_string();
+        assert!(msg.contains("not a regular file"), "{msg}");
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn load_from_oversized_is_error_not_slurp() {
+        let dir =
+            std::env::temp_dir().join(format!("hyper-cfg-big-{}", uuid::Uuid::new_v4().simple()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("config.toml");
+        let f = fs::File::create(&path).unwrap();
+        f.set_len(8 * 1024 * 1024 + 1).unwrap();
+        drop(f);
+        let started = std::time::Instant::now();
+        let err = Config::load_from(&path).unwrap_err();
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(2),
+            "oversized config must not slurp: {:?}",
+            started.elapsed()
+        );
+        let msg = err.to_string();
+        assert!(msg.contains("too large"), "{msg}");
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
     #[test]
     fn replace_tmp_keeps_dest_when_rename_cannot_complete() {
         let dir = std::env::temp_dir().join(format!("hyper-cfg-{}", uuid::Uuid::new_v4().simple()));
@@ -1138,10 +1211,7 @@ mod tests {
     fn think_budget_follows_server_family_honors_xhigh() {
         let mut c = Config::default();
         assert_eq!(c.server.family, Family::Grok46);
-        assert_eq!(
-            c.think_budget().default_effort,
-            crate::policy::Effort::Xhigh
-        );
+        assert_eq!(c.think_budget().default_effort, crate::policy::Effort::High);
         c.server.family = Family::Qwen38;
         assert_eq!(
             c.think_budget().default_effort,

@@ -130,9 +130,12 @@ impl DoomLoopGate {
                 }
 
                 let poll = state.history.back().is_some_and(is_poll_tool);
-                let Some(stage) = self.stages.iter().rev().find(|s| {
-                    state.consecutive_hits >= s.after
-                }) else {
+                let Some(stage) = self
+                    .stages
+                    .iter()
+                    .rev()
+                    .find(|s| state.consecutive_hits >= s.after)
+                else {
                     return GateDecision::Bypass;
                 };
 
@@ -306,7 +309,6 @@ mod tests {
             }
         }
     }
-
 
     #[test]
     fn grok_non_poll_bash_does_not_halt() {

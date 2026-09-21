@@ -20,6 +20,18 @@ const CACHE_VERSION: u32 = 2;
 const CHUNK_CHARS: usize = 4000;
 const SHEET_SPLIT_CHARS: usize = 4000;
 const MAX_DOC_BYTES: u64 = 96 * 1024 * 1024;
+/// pdf_extract loads the whole file then expands text. Keep the input
+/// smaller than Office zip so a text-bomb PDF cannot OOM the hop.
+const MAX_PDF_BYTES: u64 = 16 * 1024 * 1024;
+/// Page objects before extract. A 16MiB PDF of empty pages still explodes
+/// inside pdf_extract; refuse that class instead of allocating first.
+const MAX_PDF_PAGES: usize = 200;
+/// Spreadsheet dimension / cell count before calamine expands a Range.
+const MAX_SHEET_CELLS: usize = 250_000;
+const MAX_SHEETS: usize = 80;
+const MAX_PPTX_SLIDES: usize = 80;
+/// Legacy BIFF `.xls` has no zip dimension to precheck; same class as `.xlsb`.
+const MAX_EXTRACT_TEXT_BYTES: usize = 8 * 1024 * 1024;
 const DOC_CHUNK_LIMIT_CAP: usize = 16;
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -166,20 +178,31 @@ pub fn grep_extracted(
 }
 
 fn load_or_extract(ws: &Workspace, shown: &str, abs: &Path) -> Result<CachedDoc, String> {
+    if crate::tools::is_special_file(abs) {
+        return Err(format!("Error: {shown} is not a regular file."));
+    }
     let meta = fs::metadata(abs).map_err(|e| io_err(shown, e))?;
-    if meta.len() > MAX_DOC_BYTES {
+    if !meta.is_file() {
+        return Err(format!("Error: {shown} is not a regular file."));
+    }
+    let kind = ext_of(shown);
+    let cap = if kind == "pdf" {
+        MAX_PDF_BYTES
+    } else {
+        MAX_DOC_BYTES
+    };
+    if meta.len() > cap {
         return Err(format!(
-            "Error: {shown} is too large to extract (max {MAX_DOC_BYTES} bytes)."
+            "Error: {shown} is too large to extract (max {cap} bytes)."
         ));
     }
-    let bytes = fs::read(abs).map_err(|e| io_err(shown, e))?;
+    let bytes = crate::tools::read_bytes_capped(abs, cap).map_err(|e| io_err(shown, e))?;
     let sha = sha256_hex(&bytes);
     if let Some(cached) = read_cache(ws, &sha) {
         if cached.v == CACHE_VERSION && cached.sha256 == sha {
             return Ok(cached);
         }
     }
-    let kind = ext_of(shown);
     let mut doc = extract_bytes(&kind, &bytes)?;
     doc.v = CACHE_VERSION;
     doc.kind = kind;
@@ -197,7 +220,10 @@ fn io_err(shown: &str, e: std::io::Error) -> String {
         std::io::ErrorKind::IsADirectory => {
             format!("Error: The path {shown} is not a file.")
         }
-        _ => format!("Error: Read file failed due to \n{e}"),
+        _ => format!(
+            "Error: Read file failed due to \n{}",
+            super::path::io_user_msg(&e)
+        ),
     }
 }
 
@@ -205,16 +231,19 @@ fn extract_bytes(kind: &str, bytes: &[u8]) -> Result<CachedDoc, String> {
     match kind {
         "docx" | "docm" | "dotx" | "dotm" => extract_docx(bytes),
         "pptx" | "pptm" | "potx" | "potm" | "ppsx" | "ppsm" => extract_pptx(bytes),
-        "xlsx" | "xlsm" | "xltx" | "xltm" | "xlsb" | "xls" | "ods" => extract_sheet(bytes),
+        "xlsx" | "xlsm" | "xltx" | "xltm" | "xlsb" | "xls" | "ods" => {
+            extract_sheet_kind(kind, bytes)
+        }
         "pdf" => extract_pdf(bytes),
         _ => Err(format!("Error: unsupported document kind .{kind}.")),
     }
 }
 
 fn extract_docx(bytes: &[u8]) -> Result<CachedDoc, String> {
-    let xml = zip_file_text(bytes, "word/document.xml")
+    reject_zip_members(bytes)?;
+    let xml = zip_file_text(bytes, "word/document.xml")?
         .ok_or_else(|| "Error: not a valid docx (missing word/document.xml).".to_string())?;
-    let heading_ids = zip_file_text(bytes, "word/styles.xml")
+    let heading_ids = zip_file_text(bytes, "word/styles.xml")?
         .map(|s| heading_style_ids(&s))
         .unwrap_or_default();
     let paras = word_paragraphs(&xml, &heading_ids);
@@ -444,10 +473,15 @@ fn xml_attr(hay: &str, local: &str) -> Option<String> {
 }
 
 fn extract_pptx(bytes: &[u8]) -> Result<CachedDoc, String> {
-    let mut slides = zip_files_matching(bytes, |name| {
-        let n = name.replace('\\', "/");
-        n.starts_with("ppt/slides/slide") && n.ends_with(".xml") && !n.contains("/_rels/")
-    })?;
+    reject_zip_members(bytes)?;
+    let mut slides = zip_files_matching(
+        bytes,
+        |name| {
+            let n = name.replace('\\', "/");
+            n.starts_with("ppt/slides/slide") && n.ends_with(".xml") && !n.contains("/_rels/")
+        },
+        MAX_PPTX_SLIDES,
+    )?;
     if slides.is_empty() {
         return Err("Error: not a valid pptx (no slides).".into());
     }
@@ -485,7 +519,165 @@ fn slide_num(name: &str) -> u32 {
         .unwrap_or(0)
 }
 
+fn reject_sheet_bomb(bytes: &[u8]) -> Result<(), String> {
+    let mut zip = match zip::ZipArchive::new(Cursor::new(bytes)) {
+        Ok(z) => z,
+        Err(_) => return Ok(()),
+    };
+    let mut sheets = 0usize;
+    let mut cells = 0usize;
+    for i in 0..zip.len() {
+        let mut f = match zip.by_index(i) {
+            Ok(f) => f,
+            Err(_) => continue,
+        };
+        let name = f.name().replace('\\', "/").to_ascii_lowercase();
+        let in_sheets = name.contains("/worksheets/")
+            || name.starts_with("xl/worksheets/")
+            || name.starts_with("worksheets/");
+        if !in_sheets || !name.ends_with(".xml") || name.contains("/_rels/") {
+            continue;
+        }
+        sheets += 1;
+        if sheets > MAX_SHEETS {
+            return Err(format!(
+                "Error: spreadsheet has {sheets} sheets (max {MAX_SHEETS}). Split it."
+            ));
+        }
+        let xml = read_zip_text_capped(&mut f, MAX_ZIP_ENTRY_BYTES)?;
+        cells = cells.saturating_add(sheet_xml_cell_budget(&xml));
+        if cells > MAX_SHEET_CELLS {
+            return Err(format!(
+                "Error: spreadsheet declares {cells} cells (max {MAX_SHEET_CELLS}). Split it."
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn reject_ods_bomb(bytes: &[u8]) -> Result<(), String> {
+    let xml = zip_file_text(bytes, "content.xml")?
+        .ok_or_else(|| "Error: not a valid ods (missing content.xml).".to_string())?;
+    let cells = ods_repeated_cells(&xml);
+    if cells > MAX_SHEET_CELLS {
+        return Err(format!(
+            "Error: spreadsheet declares {cells} cells (max {MAX_SHEET_CELLS}). Split it."
+        ));
+    }
+    Ok(())
+}
+
+fn ods_repeated_cells(xml: &str) -> usize {
+    let rows = max_attr_u(xml, "number-rows-repeated=\"").max(1);
+    let cols = max_attr_u(xml, "number-columns-repeated=\"").max(1);
+    let marked = xml
+        .matches("<table:table-cell")
+        .count()
+        .saturating_add(xml.matches("<table:covered-table-cell").count());
+    rows.saturating_mul(cols).max(marked)
+}
+
+fn max_attr_u(xml: &str, key: &str) -> usize {
+    let mut max = 0usize;
+    let mut i = 0usize;
+    while let Some(at) = xml[i..].find(key) {
+        let start = i + at + key.len();
+        let rest = &xml[start..];
+        let end = rest.find('"').unwrap_or(0);
+        if let Ok(n) = rest[..end].parse::<usize>() {
+            max = max.max(n);
+        }
+        i = start + end + 1;
+        if i >= xml.len() {
+            break;
+        }
+    }
+    max
+}
+
+fn sheet_xml_cell_budget(xml: &str) -> usize {
+    let marked = xml
+        .matches("<c ")
+        .count()
+        .saturating_add(xml.matches("<c>").count());
+    let declared = sheet_dimension_ref(xml)
+        .and_then(|d| dimension_cell_count(&d))
+        .unwrap_or(0);
+    declared.max(marked)
+}
+
+fn sheet_dimension_ref(xml: &str) -> Option<String> {
+    let dim = xml.find("dimension")?;
+    let rest = &xml[dim..];
+    let key = "ref=\"";
+    let at = rest.find(key)? + key.len();
+    let end = rest[at..].find('"')?;
+    Some(rest[at..at + end].to_string())
+}
+
+fn dimension_cell_count(r: &str) -> Option<usize> {
+    let (a, b) = match r.split_once(':') {
+        Some((l, r)) => (parse_a1(l)?, parse_a1(r)?),
+        None => {
+            let p = parse_a1(r)?;
+            (p, p)
+        }
+    };
+    let rows = a.0.abs_diff(b.0).saturating_add(1);
+    let cols = a.1.abs_diff(b.1).saturating_add(1);
+    Some((rows as usize).saturating_mul(cols as usize))
+}
+
+fn parse_a1(s: &str) -> Option<(u32, u32)> {
+    let s = s.trim();
+    let bytes = s.as_bytes();
+    let mut i = 0usize;
+    while i < bytes.len() && bytes[i].is_ascii_alphabetic() {
+        i += 1;
+    }
+    if i == 0 {
+        return None;
+    }
+    let mut col = 0u32;
+    for &b in &bytes[..i] {
+        let c = (b as char).to_ascii_uppercase();
+        if !('A'..='Z').contains(&c) {
+            return None;
+        }
+        col = col.saturating_mul(26).saturating_add((c as u8 - b'A' + 1) as u32);
+    }
+    let row: u32 = s[i..].parse().ok()?;
+    if row == 0 {
+        return None;
+    }
+    Some((row, col))
+}
+
 fn extract_sheet(bytes: &[u8]) -> Result<CachedDoc, String> {
+    extract_sheet_kind("xlsx", bytes)
+}
+
+fn extract_sheet_kind(kind: &str, bytes: &[u8]) -> Result<CachedDoc, String> {
+    match kind {
+        "xls" => {
+            return Err(
+                "Error: .xls cannot be extracted (no cell-count precheck). Save as .xlsx.".into(),
+            );
+        }
+        "xlsb" => {
+            return Err(
+                "Error: .xlsb cannot be extracted (no cell-count precheck). Save as .xlsx.".into(),
+            );
+        }
+        "ods" => {
+            reject_zip_members(bytes)?;
+            reject_ods_bomb(bytes)?;
+        }
+        _ => {
+            reject_zip_members(bytes)?;
+            reject_sheet_bomb(bytes)?;
+        }
+    }
     let cursor = Cursor::new(bytes.to_vec());
     let mut wb = calamine::open_workbook_auto_from_rs(cursor)
         .map_err(|e| format!("Error: spreadsheet extract failed ({e})."))?;
@@ -495,6 +687,7 @@ fn extract_sheet(bytes: &[u8]) -> Result<CachedDoc, String> {
     }
     let mut chunks = Vec::new();
     let mut outline = Vec::new();
+    let mut total = 0usize;
     for name in names {
         let range = match wb.worksheet_range(&name) {
             Ok(r) => r,
@@ -506,6 +699,12 @@ fn extract_sheet(bytes: &[u8]) -> Result<CachedDoc, String> {
         for row in range.rows() {
             let line = row.iter().map(cell_text).collect::<Vec<_>>().join("\t");
             if line.chars().any(|c| !c.is_whitespace() && c != '\t') {
+                total = total.saturating_add(line.len());
+                if total > MAX_EXTRACT_TEXT_BYTES {
+                    return Err(format!(
+                        "Error: spreadsheet extract exceeds the {MAX_EXTRACT_TEXT_BYTES}-byte text cap."
+                    ));
+                }
                 rows.push(line);
             }
         }
@@ -674,9 +873,34 @@ fn extract_pdf(bytes: &[u8]) -> Result<CachedDoc, String> {
 }
 
 fn pdf_pages(bytes: &[u8]) -> Result<Vec<String>, String> {
+    let pages_hint = pdf_page_objects(bytes);
+    if pages_hint > MAX_PDF_PAGES {
+        return Err(format!(
+            "Error: PDF has {pages_hint} page objects (max {MAX_PDF_PAGES}). Split it, or Read a smaller file."
+        ));
+    }
+    let stream_bytes = pdf_declared_stream_bytes(bytes);
+    if stream_bytes > MAX_EXTRACT_TEXT_BYTES as u64 {
+        return Err(format!(
+            "Error: PDF streams declare {stream_bytes} bytes (max {MAX_EXTRACT_TEXT_BYTES}). Split it."
+        ));
+    }
+    if pdf_unresolved_flate(bytes) {
+        return Err(
+            "Error: PDF uses compressed streams without a resolvable /Length. Split it, or Save as a simpler PDF."
+                .into(),
+        );
+    }
+    if pdf_flate_inflates_past_cap(bytes) {
+        return Err(format!(
+            "Error: PDF compressed stream inflates past the {MAX_EXTRACT_TEXT_BYTES}-byte text cap. Split it."
+        ));
+    }
     let by_pages = std::panic::catch_unwind(|| pdf_extract::extract_text_from_mem_by_pages(bytes));
     match by_pages {
-        Ok(Ok(pages)) if pages.iter().any(|p| !p.trim().is_empty()) => return Ok(pages),
+        Ok(Ok(pages)) if pages.iter().any(|p| !p.trim().is_empty()) => {
+            return cap_extracted_text(pages)
+        }
         Ok(Err(e)) => {
             return fallback_pdf(bytes, Some(format!("{e}")));
         }
@@ -685,13 +909,223 @@ fn pdf_pages(bytes: &[u8]) -> Result<Vec<String>, String> {
     }
 }
 
+/// Count `/Type /Page` objects, not `/Type /Pages` trees.
+fn pdf_page_objects(bytes: &[u8]) -> usize {
+    let mut n = 0usize;
+    let mut i = 0usize;
+    while i + 10 < bytes.len() {
+        if bytes[i] != b'/' || !bytes[i..].starts_with(b"/Type") {
+            i += 1;
+            continue;
+        }
+        i += 5;
+        while i < bytes.len() && bytes[i].is_ascii_whitespace() {
+            i += 1;
+        }
+        // PDF names: `/Type /Page` or `/Type/Page`. `/Type /Pages` is the tree.
+        if bytes[i..].starts_with(b"/Page") {
+            let after = i + 5;
+            let next = bytes.get(after).copied().unwrap_or(0);
+            if next != b's' && !next.is_ascii_alphabetic() {
+                n += 1;
+            }
+            i = after;
+        }
+    }
+    n
+}
+
+/// Sum `/Length N` stream declarations. Indirect `/Length 12 0 R` is
+/// resolved via `12 0 obj` so a tiny PDF cannot hide a flate bomb.
+fn pdf_declared_stream_bytes(bytes: &[u8]) -> u64 {
+    let mut total = 0u64;
+    let mut i = 0usize;
+    while i + 8 < bytes.len() {
+        if !bytes[i..].starts_with(b"/Length") {
+            i += 1;
+            continue;
+        }
+        i += 7;
+        while i < bytes.len() && bytes[i].is_ascii_whitespace() {
+            i += 1;
+        }
+        let start = i;
+        while i < bytes.len() && bytes[i].is_ascii_digit() {
+            i += 1;
+        }
+        if start == i {
+            continue;
+        }
+        let Ok(first) = std::str::from_utf8(&bytes[start..i])
+            .unwrap_or("")
+            .parse::<u64>()
+        else {
+            continue;
+        };
+        let mut j = i;
+        while j < bytes.len() && bytes[j].is_ascii_whitespace() {
+            j += 1;
+        }
+        let gen_start = j;
+        while j < bytes.len() && bytes[j].is_ascii_digit() {
+            j += 1;
+        }
+        let mut k = j;
+        while k < bytes.len() && bytes[k].is_ascii_whitespace() {
+            k += 1;
+        }
+        if gen_start < j && bytes.get(k) == Some(&b'R') {
+            if let Some(n) = pdf_object_int(bytes, first) {
+                total = total.saturating_add(n);
+            }
+            i = k + 1;
+            continue;
+        }
+        total = total.saturating_add(first);
+    }
+    total
+}
+
+/// Integer payload of `id 0 obj` (the usual `/Length N 0 R` target).
+fn pdf_object_int(bytes: &[u8], id: u64) -> Option<u64> {
+    let needle = format!("{id} 0 obj");
+    let n = needle.as_bytes();
+    let mut i = 0usize;
+    while i + n.len() < bytes.len() {
+        if bytes[i..].starts_with(n) {
+            let prev = if i == 0 { b' ' } else { bytes[i - 1] };
+            if prev.is_ascii_digit() {
+                i += 1;
+                continue;
+            }
+            let mut j = i + n.len();
+            while j < bytes.len() && bytes[j].is_ascii_whitespace() {
+                j += 1;
+            }
+            let start = j;
+            while j < bytes.len() && bytes[j].is_ascii_digit() {
+                j += 1;
+            }
+            if start < j {
+                return std::str::from_utf8(&bytes[start..j]).ok()?.parse().ok();
+            }
+            return None;
+        }
+        i += 1;
+    }
+    None
+}
+
+/// `/FlateDecode` with no resolvable `/Length` — pdf_extract would expand first.
+fn pdf_unresolved_flate(bytes: &[u8]) -> bool {
+    if pdf_declared_stream_bytes(bytes) > 0 {
+        return false;
+    }
+    bytes.windows(12).any(|w| w == b"/FlateDecode")
+        || bytes.windows(6).any(|w| w == b"/Flate")
+}
+
+/// `/Length` under the extract cap can still be a zip bomb. Inflate each
+/// Flate stream ourselves and refuse before `pdf_extract` allocates.
+fn pdf_flate_inflates_past_cap(bytes: &[u8]) -> bool {
+    let mut i = 0usize;
+    while i + 6 < bytes.len() {
+        if !bytes[i..].starts_with(b"stream") {
+            i += 1;
+            continue;
+        }
+        let prev = if i == 0 { b'\n' } else { bytes[i - 1] };
+        if prev.is_ascii_alphabetic() {
+            i += 1;
+            continue;
+        }
+        let back = i.saturating_sub(400);
+        let dict = &bytes[back..i];
+        let is_flate = dict.windows(12).any(|w| w == b"/FlateDecode")
+            || dict.windows(6).any(|w| w == b"/Flate");
+        let mut s = i + 6;
+        if bytes.get(s) == Some(&b'\r') {
+            s += 1;
+        }
+        if bytes.get(s) == Some(&b'\n') {
+            s += 1;
+        }
+        if is_flate {
+            if let Some(end) = find_pdf_endstream(bytes, s) {
+                if inflate_exceeds(&bytes[s..end], MAX_EXTRACT_TEXT_BYTES) {
+                    return true;
+                }
+                i = end;
+                continue;
+            }
+        }
+        i += 6;
+    }
+    false
+}
+
+fn find_pdf_endstream(bytes: &[u8], from: usize) -> Option<usize> {
+    let mut i = from;
+    while i + 9 <= bytes.len() {
+        if bytes[i..].starts_with(b"endstream") {
+            let prev = if i == 0 { b'\n' } else { bytes[i - 1] };
+            if prev.is_ascii_whitespace() || i == from {
+                return Some(i);
+            }
+        }
+        i += 1;
+    }
+    None
+}
+
+fn inflate_exceeds(src: &[u8], cap: usize) -> bool {
+    use flate2::read::{DeflateDecoder, ZlibDecoder};
+    fn run<R: Read>(mut dec: R, cap: usize) -> Option<bool> {
+        let mut buf = [0u8; 16 * 1024];
+        let mut n = 0usize;
+        loop {
+            match dec.read(&mut buf) {
+                Ok(0) => return Some(false),
+                Ok(k) => {
+                    n = n.saturating_add(k);
+                    if n > cap {
+                        return Some(true);
+                    }
+                }
+                Err(_) => return None,
+            }
+        }
+    }
+    match run(ZlibDecoder::new(src), cap) {
+        Some(true) => true,
+        Some(false) => false,
+        None => matches!(run(DeflateDecoder::new(src), cap), Some(true)),
+    }
+}
+
+fn cap_extracted_text(pages: Vec<String>) -> Result<Vec<String>, String> {
+    let mut total = 0usize;
+    let mut out = Vec::new();
+    for p in pages {
+        let n = p.len();
+        if total.saturating_add(n) > MAX_EXTRACT_TEXT_BYTES {
+            return Err(format!(
+                "Error: document extract exceeds the {MAX_EXTRACT_TEXT_BYTES}-byte text cap."
+            ));
+        }
+        total += n;
+        out.push(p);
+    }
+    Ok(out)
+}
+
 fn fallback_pdf(bytes: &[u8], prior: Option<String>) -> Result<Vec<String>, String> {
     let one = std::panic::catch_unwind(|| pdf_extract::extract_text_from_mem(bytes));
     match one {
-        Ok(Ok(text)) if text.contains('\u{c}') => {
-            Ok(text.split('\u{c}').map(|s| s.to_string()).collect())
-        }
-        Ok(Ok(text)) if !text.trim().is_empty() => Ok(vec![text]),
+        Ok(Ok(text)) if text.contains('\u{c}') => cap_extracted_text(
+            text.split('\u{c}').map(|s| s.to_string()).collect(),
+        ),
+        Ok(Ok(text)) if !text.trim().is_empty() => cap_extracted_text(vec![text]),
         Ok(Ok(_)) => Err(pdf_fail(prior)),
         Ok(Err(e)) => Err(pdf_fail(Some(format!("{e}")))),
         Err(_) => Err(pdf_fail(prior)),
@@ -736,7 +1170,7 @@ fn cache_dir(ws: &Workspace) -> std::path::PathBuf {
 
 fn read_cache(ws: &Workspace, sha: &str) -> Option<CachedDoc> {
     let path = cache_dir(ws).join(format!("{sha}.json"));
-    let raw = fs::read_to_string(path).ok()?;
+    let raw = crate::tools::read_text_if_regular(&path)?;
     serde_json::from_str(&raw).ok()
 }
 
@@ -746,26 +1180,105 @@ fn write_cache(ws: &Workspace, sha: &str, doc: &CachedDoc) {
         return;
     }
     let path = dir.join(format!("{sha}.json"));
+    if crate::tools::is_special_file(&path) {
+        return;
+    }
     if let Ok(raw) = serde_json::to_string(doc) {
-        let _ = fs::write(path, raw);
+        let _ = crate::tools::write_if_regular(&path, raw.as_bytes());
     }
 }
 
-fn zip_file_text(bytes: &[u8], name: &str) -> Option<String> {
-    let mut zip = zip::ZipArchive::new(Cursor::new(bytes)).ok()?;
-    let mut f = zip.by_name(name).ok()?;
-    let mut s = String::new();
-    f.read_to_string(&mut s).ok()?;
-    Some(s)
+const MAX_ZIP_ENTRY_BYTES: usize = 8 * 1024 * 1024;
+const MAX_ZIP_TOTAL_BYTES: usize = 16 * 1024 * 1024;
+const MAX_ZIP_MEMBERS: usize = 4096;
+
+fn reject_zip_members(bytes: &[u8]) -> Result<(), String> {
+    let mut zip = match zip::ZipArchive::new(Cursor::new(bytes)) {
+        Ok(z) => z,
+        Err(_) => return Ok(()),
+    };
+    let n = zip.len();
+    if n > MAX_ZIP_MEMBERS {
+        return Err(format!(
+            "Error: office zip has {n} parts (max {MAX_ZIP_MEMBERS}). Split it."
+        ));
+    }
+    let mut total = 0u64;
+    for i in 0..n {
+        let f = match zip.by_index(i) {
+            Ok(f) => f,
+            Err(_) => continue,
+        };
+        let sz = f.size();
+        if sz > MAX_ZIP_ENTRY_BYTES as u64 {
+            return Err(format!(
+                "Error: office zip entry is too large to extract (max {MAX_ZIP_ENTRY_BYTES} bytes)."
+            ));
+        }
+        total = total.saturating_add(sz);
+        if total > MAX_ZIP_TOTAL_BYTES as u64 {
+            return Err(format!(
+                "Error: office zip extract exceeds the {MAX_ZIP_TOTAL_BYTES}-byte cap."
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn read_zip_text_capped<R: Read>(f: &mut R, max: usize) -> Result<String, String> {
+    let mut buf = Vec::new();
+    let mut tmp = [0u8; 8192];
+    loop {
+        match f.read(&mut tmp) {
+            Ok(0) => break,
+            Ok(n) => {
+                if buf.len().saturating_add(n) > max {
+                    return Err(format!(
+                        "Error: office zip entry is too large to extract (max {max} bytes)."
+                    ));
+                }
+                buf.extend_from_slice(&tmp[..n]);
+            }
+            Err(e) => return Err(format!("Error: office zip read failed ({e}).")),
+        }
+    }
+    Ok(String::from_utf8_lossy(&buf).into_owned())
+}
+
+fn zip_file_text(bytes: &[u8], name: &str) -> Result<Option<String>, String> {
+    let mut zip = zip::ZipArchive::new(Cursor::new(bytes))
+        .map_err(|e| format!("Error: not a valid office zip ({e})."))?;
+    let mut f = match zip.by_name(name) {
+        Ok(f) => f,
+        Err(_) => return Ok(None),
+    };
+    Ok(Some(read_zip_text_capped(&mut f, MAX_ZIP_ENTRY_BYTES)?))
 }
 
 fn zip_files_matching(
     bytes: &[u8],
     pred: impl Fn(&str) -> bool,
+    max_hits: usize,
 ) -> Result<Vec<(String, String)>, String> {
     let mut zip = zip::ZipArchive::new(Cursor::new(bytes))
         .map_err(|e| format!("Error: not a valid office zip ({e})."))?;
+    let mut hits = 0usize;
+    for i in 0..zip.len() {
+        let f = zip
+            .by_index(i)
+            .map_err(|e| format!("Error: office zip read failed ({e})."))?;
+        let name = f.name().replace('\\', "/");
+        if pred(&name) {
+            hits += 1;
+            if hits > max_hits {
+                return Err(format!(
+                    "Error: document has more than {max_hits} parts. Split it."
+                ));
+            }
+        }
+    }
     let mut out = Vec::new();
+    let mut total = 0usize;
     for i in 0..zip.len() {
         let mut f = zip
             .by_index(i)
@@ -774,9 +1287,13 @@ fn zip_files_matching(
         if !pred(&name) {
             continue;
         }
-        let mut s = String::new();
-        f.read_to_string(&mut s)
-            .map_err(|e| format!("Error: office zip read failed ({e})."))?;
+        let s = read_zip_text_capped(&mut f, MAX_ZIP_ENTRY_BYTES)?;
+        total = total.saturating_add(s.len());
+        if total > MAX_ZIP_TOTAL_BYTES {
+            return Err(format!(
+                "Error: office zip extract exceeds the {MAX_ZIP_TOTAL_BYTES}-byte cap."
+            ));
+        }
         out.push((name, s));
     }
     Ok(out)
@@ -1212,6 +1729,24 @@ mod tests {
     }
 
     #[test]
+    fn pptx_too_many_slides_is_error_not_extract() {
+        let slide = "<p:sld xmlns:p=\"http://schemas.openxmlformats.org/presentationml/2006/main\"/>";
+        let files: Vec<(String, String)> = (1..=MAX_PPTX_SLIDES + 1)
+            .map(|i| (format!("ppt/slides/slide{i}.xml"), slide.to_string()))
+            .collect();
+        let refs: Vec<(&str, &str)> = files.iter().map(|(n, b)| (n.as_str(), b.as_str())).collect();
+        let bytes = zip_bytes(&refs);
+        let started = std::time::Instant::now();
+        let err = extract_pptx(&bytes).unwrap_err();
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(2),
+            "slide bomb must fail before extract: {:?}",
+            started.elapsed()
+        );
+        assert!(err.contains("parts") || err.contains("slide"), "{err}");
+    }
+
+    #[test]
     fn xlsx_sheet_named_in_outline() {
         let doc = extract_sheet(&fixture_xlsx()).unwrap();
         assert!(
@@ -1244,5 +1779,329 @@ mod tests {
         assert!(!is_doc_path("old.doc"));
         assert!(is_doc_path("report.DOCX"));
         assert!(is_doc_path("a.pdf"));
+    }
+
+    #[test]
+    fn zip_entry_over_eight_mib_is_error_not_oom() {
+        let huge = "x".repeat(MAX_ZIP_ENTRY_BYTES + 64);
+        let bytes = zip_bytes(&[("word/document.xml", &huge)]);
+        let err = extract_docx(&bytes).unwrap_err();
+        assert!(
+            err.contains("too large"),
+            "zip bomb must Error, not extract: {err}"
+        );
+    }
+
+    #[test]
+    fn parse_a1_xfd_is_last_excel_column() {
+        assert_eq!(parse_a1("A1"), Some((1, 1)));
+        assert_eq!(parse_a1("XFD1048576"), Some((1_048_576, 16_384)));
+        assert_eq!(dimension_cell_count("A1:C2"), Some(6));
+        assert!(dimension_cell_count("A1:XFD1048576").unwrap() > MAX_SHEET_CELLS);
+    }
+
+    #[test]
+    fn xlsx_huge_dimension_is_error_not_calamine() {
+        let sheet = r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main">
+  <dimension ref="A1:XFD1048576"/>
+  <sheetData/>
+</worksheet>"#;
+        let bytes = zip_bytes(&[("xl/worksheets/sheet1.xml", sheet)]);
+        let started = std::time::Instant::now();
+        let err = extract_sheet(&bytes).unwrap_err();
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(2),
+            "sheet bomb must fail before calamine: {:?}",
+            started.elapsed()
+        );
+        assert!(err.contains("cells"), "{err}");
+    }
+
+    #[test]
+    fn xlsx_tiny_dimension_huge_cells_is_error_not_calamine() {
+        let cells = "<c r=\"A1\"/>".repeat(MAX_SHEET_CELLS + 1);
+        let sheet = format!(
+            r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main">
+  <dimension ref="A1:A1"/>
+  <sheetData>{cells}</sheetData>
+</worksheet>"#
+        );
+        let bytes = zip_bytes(&[("xl/worksheets/sheet1.xml", &sheet)]);
+        let started = std::time::Instant::now();
+        let err = extract_sheet(&bytes).unwrap_err();
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(3),
+            "hidden cell bomb must fail before calamine: {:?}",
+            started.elapsed()
+        );
+        assert!(err.contains("cells"), "{err}");
+    }
+
+    #[test]
+    fn xlsx_too_many_sheets_is_error_not_calamine() {
+        let sheet = r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main">
+  <dimension ref="A1:A1"/>
+  <sheetData/>
+</worksheet>"#;
+        let files: Vec<(String, String)> = (1..=MAX_SHEETS + 1)
+            .map(|i| (format!("xl/worksheets/sheet{i}.xml"), sheet.to_string()))
+            .collect();
+        let refs: Vec<(&str, &str)> = files.iter().map(|(n, b)| (n.as_str(), b.as_str())).collect();
+        let bytes = zip_bytes(&refs);
+        let started = std::time::Instant::now();
+        let err = extract_sheet(&bytes).unwrap_err();
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(2),
+            "sheet-count bomb must fail before calamine: {:?}",
+            started.elapsed()
+        );
+        assert!(err.contains("sheets"), "{err}");
+    }
+
+    #[test]
+    fn xls_is_refused_not_calamine() {
+        let bytes = b"not-a-real-xls";
+        let started = std::time::Instant::now();
+        let err = extract_sheet_kind("xls", bytes).unwrap_err();
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(1),
+            "xls must fail before calamine: {:?}",
+            started.elapsed()
+        );
+        assert!(err.contains(".xls"), "{err}");
+        assert!(err.contains("precheck") || err.contains("xlsx"), "{err}");
+    }
+
+    #[test]
+    fn xlsb_is_refused_not_calamine() {
+        let bytes = b"PK\x03\x04not-a-real-xlsb";
+        let started = std::time::Instant::now();
+        let err = extract_sheet_kind("xlsb", bytes).unwrap_err();
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(1),
+            "xlsb must fail before calamine: {:?}",
+            started.elapsed()
+        );
+        assert!(err.contains(".xlsb"), "{err}");
+        assert!(err.contains("precheck") || err.contains("xlsx"), "{err}");
+    }
+
+    #[test]
+    fn ods_repeated_rows_is_error_not_calamine() {
+        let content = r#"<?xml version="1.0"?>
+<office:document-content xmlns:office="urn:oasis:names:tc:opendocument:xmlns:office:1.0"
+                         xmlns:table="urn:oasis:names:tc:opendocument:xmlns:table:1.0">
+  <office:body><office:spreadsheet>
+    <table:table table:name="A">
+      <table:table-row table:number-rows-repeated="1048576">
+        <table:table-cell table:number-columns-repeated="16384"/>
+      </table:table-row>
+    </table:table>
+  </office:spreadsheet></office:body>
+</office:document-content>"#;
+        let bytes = zip_bytes(&[("content.xml", content)]);
+        let started = std::time::Instant::now();
+        let err = extract_sheet_kind("ods", &bytes).unwrap_err();
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(2),
+            "ods row bomb must fail before calamine: {:?}",
+            started.elapsed()
+        );
+        assert!(err.contains("cells"), "{err}");
+    }
+
+    #[test]
+    fn pdf_over_sixteen_mib_is_error_not_oom() {
+        let dir = std::env::temp_dir().join(format!(
+            "hyper-pdf-big-{}",
+            uuid::Uuid::new_v4().simple()
+        ));
+        fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("huge.pdf");
+        {
+            let f = fs::File::create(&path).unwrap();
+            f.set_len(MAX_PDF_BYTES + 1).unwrap();
+        }
+        let ws = Workspace::open(&dir, false).unwrap();
+        let started = std::time::Instant::now();
+        let err = load_or_extract(&ws, "huge.pdf", &path).unwrap_err();
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(2),
+            "oversized PDF must fail on size, not extract: {:?}",
+            started.elapsed()
+        );
+        assert!(err.contains("too large"), "{err}");
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn pdf_too_many_page_objects_is_error_not_extract() {
+        let mut bytes = b"%PDF-1.4\n".to_vec();
+        bytes.extend_from_slice(b"/Type /Pages\n");
+        for _ in 0..(MAX_PDF_PAGES + 1) {
+            bytes.extend_from_slice(b"/Type /Page\n");
+        }
+        assert_eq!(
+            pdf_page_objects(&bytes),
+            MAX_PDF_PAGES + 1,
+            "scanner must count /Type /Page, not /Pages"
+        );
+        let started = std::time::Instant::now();
+        let err = extract_pdf(&bytes).unwrap_err();
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(2),
+            "page-bomb PDF must fail before extract: {:?}",
+            started.elapsed()
+        );
+        assert!(err.contains("page"), "{err}");
+        assert!(err.contains("max"), "{err}");
+    }
+
+    #[test]
+    fn pdf_huge_stream_length_is_error_not_extract() {
+        let mut bytes = b"%PDF-1.4\n/Type /Page\n".to_vec();
+        bytes.extend_from_slice(
+            format!(
+                "/Length {}\nstream\nx\nendstream\n",
+                MAX_EXTRACT_TEXT_BYTES + 1
+            )
+            .as_bytes(),
+        );
+        let started = std::time::Instant::now();
+        let err = extract_pdf(&bytes).unwrap_err();
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(2),
+            "stream-bomb PDF must fail before extract: {:?}",
+            started.elapsed()
+        );
+        assert!(err.contains("stream") || err.contains("bytes"), "{err}");
+    }
+
+    #[test]
+    fn pdf_indirect_stream_length_is_error_not_extract() {
+        let n = MAX_EXTRACT_TEXT_BYTES + 1;
+        let mut bytes = b"%PDF-1.4\n/Type /Page\n/Length 12 0 R\nstream\nx\nendstream\n".to_vec();
+        bytes.extend_from_slice(format!("12 0 obj\n{n}\nendobj\n").as_bytes());
+        assert_eq!(pdf_declared_stream_bytes(&bytes), n as u64);
+        let started = std::time::Instant::now();
+        let err = extract_pdf(&bytes).unwrap_err();
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(2),
+            "indirect Length bomb must fail before extract: {:?}",
+            started.elapsed()
+        );
+        assert!(err.contains("stream") || err.contains("bytes"), "{err}");
+    }
+
+    #[test]
+    fn pdf_unresolved_flate_is_error_not_extract() {
+        let bytes = b"%PDF-1.4\n/Type /Page\n/Filter /FlateDecode\nstream\nx\nendstream\n";
+        let started = std::time::Instant::now();
+        let err = extract_pdf(bytes).unwrap_err();
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(2),
+            "unresolved FlateDecode must fail before extract: {:?}",
+            started.elapsed()
+        );
+        assert!(
+            err.contains("Length") || err.contains("compressed"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn pdf_flate_zip_bomb_is_error_not_extract() {
+        use flate2::write::ZlibEncoder;
+        use flate2::Compression;
+        use std::io::Write;
+        let raw = vec![b'A'; MAX_EXTRACT_TEXT_BYTES + 1];
+        let mut enc = ZlibEncoder::new(Vec::new(), Compression::fast());
+        enc.write_all(&raw).unwrap();
+        let comp = enc.finish().unwrap();
+        assert!(
+            comp.len() < MAX_EXTRACT_TEXT_BYTES,
+            "compressed bomb must fit under Length cap: {}",
+            comp.len()
+        );
+        let mut bytes = b"%PDF-1.4\n/Type /Page\n/Filter /FlateDecode\n".to_vec();
+        bytes.extend_from_slice(format!("/Length {}\nstream\n", comp.len()).as_bytes());
+        bytes.extend_from_slice(&comp);
+        bytes.extend_from_slice(b"\nendstream\n");
+        assert!(pdf_declared_stream_bytes(&bytes) > 0);
+        assert!(!pdf_unresolved_flate(&bytes));
+        let started = std::time::Instant::now();
+        let err = extract_pdf(&bytes).unwrap_err();
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(2),
+            "flate zip bomb must fail before pdf_extract: {:?}",
+            started.elapsed()
+        );
+        assert!(
+            err.contains("inflat") || err.contains("cap") || err.contains("compressed"),
+            "{err}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn extract_fifo_pdf_is_error_not_hang() {
+        let dir = std::env::temp_dir()
+            .join(format!("hyper-doc-src-fifo-{}", uuid::Uuid::new_v4().simple()));
+        fs::create_dir_all(&dir).unwrap();
+        let fifo = dir.join("a.pdf");
+        let st = std::process::Command::new("mkfifo")
+            .arg(&fifo)
+            .status()
+            .unwrap();
+        assert!(st.success());
+        let ws = Workspace::open(&dir, false).unwrap();
+        let started = std::time::Instant::now();
+        let err = load_or_extract(&ws, "a.pdf", &fifo).unwrap_err();
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(2),
+            "FIFO office extract must not block: {:?}",
+            started.elapsed()
+        );
+        assert!(err.contains("not a regular file"), "{err}");
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn doc_cache_fifo_is_skipped_not_hang() {
+        let dir =
+            std::env::temp_dir().join(format!("hyper-doc-fifo-{}", uuid::Uuid::new_v4().simple()));
+        fs::create_dir_all(&dir).unwrap();
+        let ws = Workspace::open(&dir, false).unwrap();
+        let cache = cache_dir(&ws);
+        fs::create_dir_all(&cache).unwrap();
+        let fifo = cache.join("deadbeef.json");
+        let st = std::process::Command::new("mkfifo")
+            .arg(&fifo)
+            .status()
+            .unwrap();
+        assert!(st.success());
+        let started = std::time::Instant::now();
+        assert!(read_cache(&ws, "deadbeef").is_none());
+        write_cache(
+            &ws,
+            "deadbeef",
+            &CachedDoc {
+                v: 1,
+                kind: "pdf".into(),
+                sha256: "deadbeef".into(),
+                outline: vec![],
+                chunks: vec![],
+            },
+        );
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(2),
+            "FIFO doc cache must not block: {:?}",
+            started.elapsed()
+        );
+        let _ = fs::remove_dir_all(dir);
     }
 }

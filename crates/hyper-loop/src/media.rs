@@ -430,7 +430,7 @@ pub fn sniff_image_mime(bytes: &[u8]) -> &'static str {
     sniff_known_image_mime(bytes).unwrap_or("image/jpeg")
 }
 
-fn sniff_known_image_mime(bytes: &[u8]) -> Option<&'static str> {
+pub(crate) fn sniff_known_image_mime(bytes: &[u8]) -> Option<&'static str> {
     if bytes.starts_with(&[0x89, b'P', b'N', b'G']) {
         Some("image/png")
     } else if bytes.len() >= 3 && bytes[0] == 0xFF && bytes[1] == 0xD8 && bytes[2] == 0xFF {
@@ -439,6 +439,38 @@ fn sniff_known_image_mime(bytes: &[u8]) -> Option<&'static str> {
         Some("image/gif")
     } else if bytes.len() >= 12 && bytes.starts_with(b"RIFF") && &bytes[8..12] == b"WEBP" {
         Some("image/webp")
+    } else {
+        None
+    }
+}
+
+/// ISO-BMFF (`ftyp`), Matroska/WebM (EBML), or AVI. Extension-only `.mp4` is not enough.
+pub(crate) fn sniff_known_video_mime(bytes: &[u8]) -> Option<&'static str> {
+    if bytes.len() >= 12 && &bytes[4..8] == b"ftyp" {
+        Some("video/mp4")
+    } else if bytes.starts_with(&[0x1A, 0x45, 0xDF, 0xA3]) {
+        Some("video/webm")
+    } else if bytes.len() >= 12 && bytes.starts_with(b"RIFF") && &bytes[8..12] == b"AVI " {
+        Some("video/x-msvideo")
+    } else {
+        None
+    }
+}
+
+/// WAV / FLAC / Ogg / MP3 / MP4-audio. Extension-only `.wav` is not enough.
+pub(crate) fn sniff_known_audio_mime(bytes: &[u8]) -> Option<&'static str> {
+    if bytes.len() >= 12 && bytes.starts_with(b"RIFF") && &bytes[8..12] == b"WAVE" {
+        Some("audio/wav")
+    } else if bytes.starts_with(b"fLaC") {
+        Some("audio/flac")
+    } else if bytes.starts_with(b"OggS") {
+        Some("audio/ogg")
+    } else if bytes.starts_with(b"ID3") {
+        Some("audio/mpeg")
+    } else if bytes.len() >= 2 && bytes[0] == 0xFF && bytes[1] & 0xE0 == 0xE0 {
+        Some("audio/mpeg")
+    } else if bytes.len() >= 12 && &bytes[4..8] == b"ftyp" {
+        Some("audio/mp4")
     } else {
         None
     }
@@ -480,7 +512,7 @@ pub fn persist_image_file(root: &Path, bytes: &[u8], mime: &str) -> Option<Strin
     let rel = format!(".grok-hyper/generated/{uniq}").replace('\\', "/");
     let dest = root.join(".grok-hyper").join("generated").join(&uniq);
     std::fs::create_dir_all(dest.parent()?).ok()?;
-    std::fs::write(&dest, bytes).ok()?;
+    crate::tools::write_if_regular(&dest, bytes).ok()?;
     Some(rel)
 }
 
@@ -635,7 +667,14 @@ pub fn inline_workspace_media(
             } else {
                 root.join(&part.url)
             };
-            let Ok(bytes) = std::fs::read(&path) else {
+            let Ok(meta) = std::fs::metadata(&path) else {
+                continue;
+            };
+            // FIFO / socket / device: `read` blocks until a peer opens.
+            if !meta.is_file() || meta.len() == 0 || meta.len() as usize > cap {
+                continue;
+            }
+            let Ok(bytes) = crate::tools::read_bytes_regular(&path) else {
                 continue;
             };
             if bytes.is_empty() || bytes.len() > cap {
@@ -668,7 +707,7 @@ pub async fn fetch_http_bytes(url: &str, cap: usize) -> Result<(String, Vec<u8>)
     )
     .build()
     .map_err(|e| e.to_string())?;
-    let resp = client
+    let mut resp = client
         .get(parsed)
         .header(
             reqwest::header::ACCEPT,
@@ -681,6 +720,11 @@ pub async fn fetch_http_bytes(url: &str, cap: usize) -> Result<(String, Vec<u8>)
     if !resp.status().is_success() {
         return Err(format!("http {}", resp.status().as_u16()));
     }
+    if let Some(len) = resp.content_length() {
+        if len as usize > cap {
+            return Err("file too large".into());
+        }
+    }
     let header_mime = resp
         .headers()
         .get(reqwest::header::CONTENT_TYPE)
@@ -691,10 +735,7 @@ pub async fn fetch_http_bytes(url: &str, cap: usize) -> Result<(String, Vec<u8>)
         .unwrap_or("")
         .trim()
         .to_string();
-    let bytes = resp.bytes().await.map_err(|e| e.to_string())?;
-    if bytes.len() > cap {
-        return Err("file too large".into());
-    }
+    let bytes = take_body_capped(&mut resp, cap).await?;
     if bytes.len() < 24 {
         return Err("not an image".into());
     }
@@ -706,7 +747,80 @@ pub async fn fetch_http_bytes(url: &str, cap: usize) -> Result<(String, Vec<u8>)
     } else {
         return Err("not an image".into());
     };
-    Ok((mime, bytes.to_vec()))
+    Ok((mime, bytes))
+}
+
+pub async fn take_body_capped(resp: &mut reqwest::Response, cap: usize) -> Result<Vec<u8>, String> {
+    let mut bytes: Vec<u8> = Vec::new();
+    loop {
+        match resp.chunk().await {
+            Ok(Some(chunk)) => {
+                if bytes.len().saturating_add(chunk.len()) > cap {
+                    return Err("file too large".into());
+                }
+                bytes.extend_from_slice(&chunk);
+            }
+            Ok(None) => break,
+            Err(e) => return Err(e.to_string()),
+        }
+    }
+    Ok(bytes)
+}
+
+/// JSON API bodies (IM / probe / error payloads). Bigger than this is dropped.
+pub const JSON_API_CAP: usize = 2 * 1024 * 1024;
+
+pub async fn json_or_null(resp: reqwest::Response) -> Value {
+    match json_result(resp).await {
+        Ok(v) => v,
+        Err(_) => Value::Null,
+    }
+}
+
+pub async fn json_result(resp: reqwest::Response) -> Result<Value, String> {
+    json_result_capped(resp, JSON_API_CAP).await
+}
+
+/// Error-page / IM text. Truncates instead of failing so a snippet still logs.
+pub const HTTP_ERROR_BODY_CAP: usize = 256 * 1024;
+/// Non-stream LLM JSON (thinking + tools). Oversize is an error, not a hang.
+pub const LLM_JSON_CAP: usize = 32 * 1024 * 1024;
+
+pub async fn take_body_prefix(resp: &mut reqwest::Response, cap: usize) -> Result<Vec<u8>, String> {
+    let mut bytes: Vec<u8> = Vec::new();
+    loop {
+        match resp.chunk().await {
+            Ok(Some(chunk)) => {
+                if bytes.len() < cap {
+                    let room = cap - bytes.len();
+                    bytes.extend_from_slice(&chunk[..chunk.len().min(room)]);
+                } else {
+                    break;
+                }
+            }
+            Ok(None) => break,
+            Err(e) => return Err(e.to_string()),
+        }
+    }
+    Ok(bytes)
+}
+
+pub async fn text_prefix(resp: reqwest::Response, cap: usize) -> String {
+    let mut resp = resp;
+    match take_body_prefix(&mut resp, cap).await {
+        Ok(b) => String::from_utf8_lossy(&b).into_owned(),
+        Err(_) => String::new(),
+    }
+}
+
+pub async fn text_or_empty(resp: reqwest::Response) -> String {
+    text_prefix(resp, JSON_API_CAP).await
+}
+
+pub async fn json_result_capped(resp: reqwest::Response, cap: usize) -> Result<Value, String> {
+    let mut resp = resp;
+    let bytes = take_body_capped(&mut resp, cap).await?;
+    serde_json::from_slice(&bytes).map_err(|e| e.to_string())
 }
 
 fn audio_api_value(url: &str, mime: &str) -> Value {
@@ -1054,6 +1168,72 @@ mod tests {
         ];
         retain_referenced_media(&mut pointed);
         assert_eq!(pointed[1].parts.len(), 1);
+    }
+
+    #[test]
+    fn inline_workspace_media_skips_fifo_without_blocking() {
+        let dir = std::env::temp_dir().join(format!(
+            "hyper-inline-fifo-{}",
+            uuid::Uuid::new_v4().simple()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let fifo = dir.join("pipe.png");
+        let st = std::process::Command::new("mkfifo")
+            .arg(&fifo)
+            .status()
+            .unwrap();
+        assert!(st.success());
+        let mut msg = crate::template::ChatMessage::user("see");
+        msg.parts = vec![MediaPart::image_url(fifo.to_string_lossy().as_ref())];
+        let mut msgs = vec![msg];
+        let started = std::time::Instant::now();
+        inline_workspace_media(&dir, &mut msgs, MAX_INLINE_MEDIA_BYTES);
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(2),
+            "FIFO inline must not block: {:?}",
+            started.elapsed()
+        );
+        assert!(
+            !msgs[0].parts[0].url.starts_with("data:"),
+            "{}",
+            msgs[0].parts[0].url
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn fetch_http_bytes_stops_unbounded_body() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let (mut sock, _) = listener.accept().await.unwrap();
+            let mut buf = vec![0u8; 2048];
+            let _ = tokio::io::AsyncReadExt::read(&mut sock, &mut buf).await;
+            let _ = tokio::io::AsyncWriteExt::write_all(
+                &mut sock,
+                b"HTTP/1.1 200 OK\r\nContent-Type: image/png\r\n\r\n",
+            )
+            .await;
+            let chunk = vec![0u8; 64 * 1024];
+            for _ in 0..80 {
+                if tokio::io::AsyncWriteExt::write_all(&mut sock, &chunk)
+                    .await
+                    .is_err()
+                {
+                    break;
+                }
+            }
+        });
+        let url = format!("http://{addr}/x.png");
+        let started = std::time::Instant::now();
+        let r = fetch_http_bytes(&url, 256 * 1024).await;
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(4),
+            "unbounded HTTP body must not slurp: {:?}",
+            started.elapsed()
+        );
+        let err = r.expect_err("must cap");
+        assert!(err.contains("too large"), "{err}");
     }
 
     #[test]

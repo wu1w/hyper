@@ -201,14 +201,13 @@ pub async fn download(http: &reqwest::Client, refer: &CdnRef) -> Result<Vec<u8>>
     }
     let key = parse_aes_key(&refer.aes_key, &refer.aeskey_hex)?;
     let url = download_url(&refer.param);
-    let resp = http.get(&url).send().await?;
+    let mut resp = http.get(&url).send().await?;
     if !resp.status().is_success() {
         return Err(Error::msg(format!("wechat cdn download {}", resp.status())));
     }
-    let bytes = resp.bytes().await?;
-    if bytes.len() > super::xfer::FETCH_CAP {
-        return Err(Error::msg("wechat cdn: file over cap"));
-    }
+    let bytes = crate::media::take_body_capped(&mut resp, super::xfer::FETCH_CAP)
+        .await
+        .map_err(Error::msg)?;
     decrypt_aes_ecb(&bytes, &key)
 }
 

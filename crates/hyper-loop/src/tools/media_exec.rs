@@ -23,6 +23,7 @@ const FRAME_MAX_BYTES: usize = 400_000;
 const FFMPEG_TIMEOUT: Duration = Duration::from_secs(20);
 const DURATION_TIMEOUT: Duration = Duration::from_secs(8);
 const WHISPER_TIMEOUT: Duration = Duration::from_secs(120);
+const PROC_PIPE_CAP: usize = 1024 * 1024;
 
 struct TmpDir(PathBuf);
 
@@ -116,6 +117,9 @@ pub fn no_hear_msg(name: &str, why: &str) -> String {
 }
 
 pub async fn extract_frames(bins: &MediaBins, path: &Path) -> Result<SampledVideo, String> {
+    if crate::tools::is_special_file(path) {
+        return Err(format!("{} is not a regular file", path.display()));
+    }
     let ffmpeg = bins
         .ffmpeg
         .as_ref()
@@ -131,7 +135,7 @@ pub async fn extract_frames(bins: &MediaBins, path: &Path) -> Result<SampledVide
     for (i, t) in stamps.iter().enumerate() {
         let out = tmp.0.join(format!("f{i}.jpg"));
         if grab_frame(ffmpeg, path, *t, &out).await && accept_jpeg(&out) {
-            if let Ok(bytes) = std::fs::read(&out) {
+            if let Ok(bytes) = crate::tools::read_bytes_regular(&out) {
                 parts.push(MediaPart::data_uri(MediaKind::Image, "image/jpeg", &bytes));
                 kept.push(*t);
             }
@@ -216,9 +220,9 @@ async fn probe_duration(bins: &MediaBins, path: &Path) -> Option<f64> {
             .arg("-of")
             .arg("csv=p=0")
             .arg(path);
-        if let Ok(Ok(out)) = tokio::time::timeout(DURATION_TIMEOUT, cmd.output()).await {
-            if out.status.success() {
-                if let Ok(s) = String::from_utf8(out.stdout) {
+        if let Ok((ok, stdout, _)) = run_capped(&mut cmd, DURATION_TIMEOUT, PROC_PIPE_CAP).await {
+            if ok {
+                if let Ok(s) = String::from_utf8(stdout) {
                     if let Ok(d) = s.trim().parse::<f64>() {
                         if d.is_finite() && d > 0.0 {
                             return Some(d);
@@ -231,16 +235,18 @@ async fn probe_duration(bins: &MediaBins, path: &Path) -> Option<f64> {
     let ffmpeg = bins.ffmpeg.as_ref()?;
     let mut cmd = media_cmd(ffmpeg);
     cmd.arg("-hide_banner").arg("-nostdin").arg("-i").arg(path);
-    let out = tokio::time::timeout(DURATION_TIMEOUT, cmd.output())
+    let out = run_capped(&mut cmd, DURATION_TIMEOUT, PROC_PIPE_CAP)
         .await
-        .ok()?
         .ok()?;
-    let stderr = String::from_utf8_lossy(&out.stderr);
+    let stderr = String::from_utf8_lossy(&out.2);
     parse_ffmpeg_duration(&stderr)
 }
 
 /// Decode up to [`AUDIO_MAX_SECS`] of audio to 16 kHz mono WAV, then whisper-cli.
 pub async fn transcribe_file(bins: &MediaBins, path: &Path) -> Result<String, String> {
+    if crate::tools::is_special_file(path) {
+        return Err(format!("{} is not a regular file", path.display()));
+    }
     let whisper = bins
         .whisper
         .as_ref()
@@ -265,6 +271,9 @@ pub async fn transcribe_file(bins: &MediaBins, path: &Path) -> Result<String, St
 }
 
 async fn to_wav16k(bins: &MediaBins, input: &Path, wav: &Path) -> Result<(), String> {
+    if crate::tools::is_special_file(input) {
+        return Err(format!("{} is not a regular file", input.display()));
+    }
     if let Some(ffmpeg) = bins.ffmpeg.as_ref() {
         let mut cmd = media_cmd(ffmpeg);
         cmd.arg("-hide_banner")
@@ -296,10 +305,18 @@ async fn to_wav16k(bins: &MediaBins, input: &Path, wav: &Path) -> Result<(), Str
             _ => return Err("ffmpeg audio convert timed out".into()),
         }
     }
+    if let Ok(meta) = std::fs::metadata(input) {
+        if meta.len() as usize > AUDIO_FETCH_MAX_BYTES {
+            return Err(format!(
+                "audio is {} bytes and exceeds the {AUDIO_FETCH_MAX_BYTES}-byte limit",
+                meta.len()
+            ));
+        }
+    }
     // Already a WAV and no ffmpeg: pass through if it looks like RIFF/WAVE.
     let head = read_head(input, 12).unwrap_or_default();
     if head.len() >= 12 && head.starts_with(b"RIFF") && &head[8..12] == b"WAVE" {
-        std::fs::copy(input, wav).map_err(|e| format!("copy wav: {e}"))?;
+        std::fs::copy(input, wav).map_err(|e| format!("copy wav: {}", super::io_user_msg(&e)))?;
         return Ok(());
     }
     Err("ffmpeg is not on PATH (needed to decode audio)".into())
@@ -330,24 +347,25 @@ async fn run_whisper(
         for a in extra {
             cmd.arg(a);
         }
-        match tokio::time::timeout(WHISPER_TIMEOUT, cmd.output()).await {
-            Ok(Ok(out)) => {
+        match run_capped(&mut cmd, WHISPER_TIMEOUT, PROC_PIPE_CAP).await {
+            Ok((ok, stdout, _)) => {
                 let txt = prefix.with_extension("txt");
-                if txt.is_file() {
-                    let raw = std::fs::read_to_string(&txt).unwrap_or_default();
-                    if !raw.trim().is_empty() || out.status.success() {
-                        return Ok(raw);
+                if crate::tools::is_special_file(&txt) {
+                    // skip
+                } else if txt.is_file() {
+                    let raw = crate::tools::read_text_if_regular(&txt).unwrap_or_default();
+                    if !raw.trim().is_empty() || ok {
+                        return Ok(clip_transcript(&raw));
                     }
                 }
-                let stdout = String::from_utf8_lossy(&out.stdout);
+                let stdout = String::from_utf8_lossy(&stdout);
                 let cleaned = clean_whisper_stdout(&stdout);
                 if !cleaned.is_empty() {
-                    return Ok(cleaned);
+                    return Ok(clip_transcript(&cleaned));
                 }
-                last = format!("whisper-cli exit {}", out.status.code().unwrap_or(-1));
+                last = format!("whisper-cli exit {}", if ok { 0 } else { -1 });
             }
-            Ok(Err(e)) => last = format!("whisper-cli: {e}"),
-            Err(_) => last = "whisper-cli timed out".into(),
+            Err(e) => last = format!("whisper-cli: {e}"),
         }
     }
     Err(last)
@@ -371,11 +389,16 @@ fn clean_whisper_stdout(s: &str) -> String {
 
 fn read_head(path: &Path, n: usize) -> Option<Vec<u8>> {
     use std::io::Read;
-    let mut f = std::fs::File::open(path).ok()?;
+    let mut f = crate::tools::open_read_nonblock(path).ok()?;
     let mut buf = vec![0u8; n];
-    let got = f.read(&mut buf).ok()?;
-    buf.truncate(got);
-    Some(buf)
+    match f.read(&mut buf) {
+        Ok(got) => {
+            buf.truncate(got);
+            Some(buf)
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => None,
+        Err(_) => None,
+    }
 }
 
 fn media_cmd(bin: &Path) -> Command {
@@ -386,6 +409,70 @@ fn media_cmd(bin: &Path) -> Command {
         .stderr(Stdio::piped());
     crate::proc_spawn::hide_window_async(&mut cmd);
     cmd
+}
+
+async fn read_capped_bytes<R: tokio::io::AsyncRead + Unpin>(
+    pipe: Option<R>,
+    cap: usize,
+) -> Vec<u8> {
+    use tokio::io::AsyncReadExt;
+    let Some(mut pipe) = pipe else {
+        return Vec::new();
+    };
+    const DISCARD_MAX: usize = 8 * 1024 * 1024;
+    let mut buf = Vec::new();
+    let mut discarded = 0usize;
+    let mut tmp = [0u8; 8192];
+    loop {
+        match pipe.read(&mut tmp).await {
+            Ok(0) => break,
+            Ok(n) => {
+                let room = cap.saturating_sub(buf.len());
+                if room > 0 {
+                    buf.extend_from_slice(&tmp[..n.min(room)]);
+                    discarded = discarded.saturating_add(n.saturating_sub(room));
+                } else {
+                    discarded = discarded.saturating_add(n);
+                }
+                if discarded >= DISCARD_MAX {
+                    break;
+                }
+            }
+            Err(_) => break,
+        }
+    }
+    buf
+}
+
+async fn run_capped(
+    cmd: &mut Command,
+    timeout: Duration,
+    cap: usize,
+) -> Result<(bool, Vec<u8>, Vec<u8>), String> {
+    let mut child = cmd.spawn().map_err(|e| super::io_user_msg(&e))?;
+    let stdout = child.stdout.take();
+    let stderr = child.stderr.take();
+    let out_task = tokio::spawn(async move { read_capped_bytes(stdout, cap).await });
+    let err_task = tokio::spawn(async move { read_capped_bytes(stderr, cap).await });
+    let status = match tokio::time::timeout(timeout, child.wait()).await {
+        Ok(Ok(st)) => st,
+        Ok(Err(e)) => {
+            let _ = child.start_kill();
+            let _ = out_task.await;
+            let _ = err_task.await;
+            return Err(e.to_string());
+        }
+        Err(_) => {
+            let _ = child.start_kill();
+            let _ = child.wait().await;
+            let _ = out_task.await;
+            let _ = err_task.await;
+            return Err("timed out".into());
+        }
+    };
+    let stdout = out_task.await.unwrap_or_default();
+    let stderr = err_task.await.unwrap_or_default();
+    Ok((status.success(), stdout, stderr))
 }
 
 /// Encode a solid-color clip with lavfi (Windows / Linux / macOS). Used by tests.
@@ -435,6 +522,14 @@ mod tests {
     }
 
     #[test]
+    fn clip_transcript_respects_max_chars() {
+        let s = "a".repeat(TRANSCRIPT_MAX_CHARS + 8);
+        let clipped = clip_transcript(&s);
+        assert!(clipped.ends_with('…'));
+        assert_eq!(clipped.chars().count(), TRANSCRIPT_MAX_CHARS + 1);
+    }
+
+    #[test]
     fn short_clip_one_midpoint() {
         let t = sample_times(0.2, 3);
         assert_eq!(t.len(), 1);
@@ -455,5 +550,30 @@ mod tests {
         let c = clip_transcript(&long);
         assert!(c.ends_with('…'));
         assert_eq!(c.chars().count(), TRANSCRIPT_MAX_CHARS + 1);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn extract_frames_fifo_is_error_not_hang() {
+        let dir = std::env::temp_dir().join(format!("hyper-frames-fifo-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let fifo = dir.join("clip.mp4");
+        let st = std::process::Command::new("mkfifo")
+            .arg(&fifo)
+            .status()
+            .unwrap();
+        assert!(st.success());
+        let started = std::time::Instant::now();
+        let err = match extract_frames(&crate::media::MediaBins::none(), &fifo).await {
+            Err(e) => e,
+            Ok(_) => panic!("FIFO video must not extract"),
+        };
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(2),
+            "FIFO video must not block ffmpeg: {:?}",
+            started.elapsed()
+        );
+        assert!(err.contains("not a regular file"), "{err}");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

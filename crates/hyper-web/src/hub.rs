@@ -1,7 +1,10 @@
 use std::collections::{HashMap, VecDeque};
+use std::panic::AssertUnwindSafe;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
+
+use futures::FutureExt;
 
 use anyhow::Result;
 use hyper_loop::clarify::{ClarifyDecision, ClarifyHub, ClarifyRequest};
@@ -62,7 +65,6 @@ impl Inner {
     pub fn focused_live(&self) -> bool {
         self.session.turn_in_flight() || self.live.contains_key(self.session.session_id())
     }
-
 
     fn session_mut(&mut self, id: &str) -> Option<&mut SidecarSession> {
         if self.session.session_id() == id {
@@ -337,11 +339,8 @@ impl AppState {
                 if !g.cron.heartbeat_due(now) {
                     continue;
                 }
-                match hyper_loop::cron::heartbeat_tick(
-                    &last_fp,
-                    &pulse.fingerprint,
-                    custom_prompt,
-                ) {
+                match hyper_loop::cron::heartbeat_tick(&last_fp, &pulse.fingerprint, custom_prompt)
+                {
                     hyper_loop::cron::HeartbeatTick::SkipQuiet => {
                         g.cron.heartbeat.last_run = Some(now);
                         let _ = g.cron.save();
@@ -1042,7 +1041,21 @@ impl Drop for TurnPanicGuard {
 
 fn cleanup_after_panic(g: &mut Inner, session_id: &str) {
     let extra = if let Some(sess) = g.session_mut(session_id) {
-        sess.finish_turn(&TurnResult::fail("internal error: turn task panicked"))
+        let rec = hyper_loop::panic_diag::take();
+        let msg = rec
+            .as_ref()
+            .map(|r| hyper_loop::secrets::redact(&r.message))
+            .filter(|s| !s.is_empty())
+            .unwrap_or_else(|| "internal error: turn task panicked".into());
+        if let Some(r) = rec.as_ref() {
+            hyper_loop::panic_diag::write_desktop_log(
+                Some(r),
+                &format!("session={session_id} {msg}"),
+            );
+        }
+        sess.finish_turn(&TurnResult::fail(format!(
+            "internal error: turn task panicked: {msg}"
+        )))
     } else {
         Vec::new()
     };
@@ -1131,7 +1144,27 @@ pub fn start_turn(
             session_id: turn_sid.clone(),
             armed: true,
         };
-        let result = execute_turn(cfg, agents_md, agents_md_head, req).await;
+        hyper_loop::panic_diag::install_once();
+        let result = match AssertUnwindSafe(execute_turn(cfg, agents_md, agents_md_head, req))
+            .catch_unwind()
+            .await
+        {
+            Ok(r) => r,
+            Err(payload) => {
+                let rec = hyper_loop::panic_diag::take();
+                let msg = hyper_loop::panic_diag::format_user_message(&*payload, rec.as_ref());
+                let summary = hyper_loop::panic_diag::summary_line(
+                    &turn_sid,
+                    &turn_sid,
+                    0,
+                    None,
+                    rec.as_ref(),
+                    &msg,
+                );
+                hyper_loop::panic_diag::write_desktop_log(rec.as_ref(), &summary);
+                TurnResult::fail(format!("internal error: turn task panicked: {msg}"))
+            }
+        };
         let mut g = shared.lock().await;
         guard.armed = false;
         let extra = if let Some(sess) = g.session_mut(&turn_sid) {

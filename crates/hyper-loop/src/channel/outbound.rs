@@ -206,10 +206,10 @@ pub(crate) async fn replay_pending(ep: Option<&ChannelEndpoint>) -> Result<usize
         if path.extension().and_then(|s| s.to_str()) != Some("json") {
             continue;
         }
-        let raw = match fs::read_to_string(&path) {
-            Ok(s) => s,
-            Err(e) => {
-                quarantine_pending(&path, &format!("read: {e}"));
+        let raw = match crate::tools::read_text_if_regular(&path) {
+            Some(s) => s,
+            None => {
+                quarantine_pending(&path, "read: not a regular file or too large");
                 continue;
             }
         };
@@ -541,7 +541,7 @@ fn persist_intent(intent: &DeliveryIntent) -> Result<PathBuf> {
     }
     let tmp = dir.join(format!("{}.{}.tmp", intent.id, std::process::id()));
     let body = serde_json::to_vec(intent).map_err(crate::error::Error::msg)?;
-    fs::write(&tmp, body)?;
+    crate::tools::write_if_regular(&tmp, &body)?;
     fs::rename(&tmp, &path)?;
     set_private(&path);
     Ok(path)

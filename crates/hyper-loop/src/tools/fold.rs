@@ -39,7 +39,7 @@ impl BlobStore {
         let path = self.path_for(&sha)?;
         ensure_dir(&self.root)?;
         cleanup_stale_tmp(&self.root, &sha);
-        if path.exists() {
+        if path.exists() && !crate::tools::is_special_file(&path) {
             return Ok(sha);
         }
         let tmp = unique_tmp_path(&self.root, &sha);
@@ -48,7 +48,10 @@ impl BlobStore {
             let mut opts = fs::OpenOptions::new();
             opts.create(true).write(true).truncate(true);
             #[cfg(unix)]
-            opts.mode(0o600);
+            {
+                opts.mode(0o600);
+                opts.custom_flags(libc::O_NONBLOCK);
+            }
             let mut f = opts.open(&tmp)?;
             f.write_all(bytes)?;
             f.sync_all()?;
@@ -61,7 +64,13 @@ impl BlobStore {
 
     pub fn get(&self, sha: &str) -> Result<Vec<u8>> {
         let path = self.path_for(sha)?;
-        Ok(fs::read(path)?)
+        if crate::tools::is_special_file(&path) {
+            return Err(Error::msg("blob is not a regular file"));
+        }
+        if crate::tools::is_oversized_text(&path) {
+            return Err(Error::msg("blob is too large"));
+        }
+        Ok(crate::tools::read_bytes_regular(&path)?)
     }
 
     pub fn get_text(&self, sha: &str) -> Result<String> {
@@ -314,6 +323,33 @@ mod tests {
             let _guard = TmpGuard(tmp.clone());
         }
         assert!(!tmp.exists());
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn blob_get_fifo_is_error_not_hang() {
+        let dir = std::env::temp_dir().join(format!(
+            "hyper-blobs-fifo-{}",
+            uuid::Uuid::new_v4().simple()
+        ));
+        fs::create_dir_all(&dir).unwrap();
+        let store = BlobStore::new(&dir);
+        let sha = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+        let path = store.path_for(sha).unwrap();
+        let st = std::process::Command::new("mkfifo")
+            .arg(&path)
+            .status()
+            .unwrap();
+        assert!(st.success());
+        let started = std::time::Instant::now();
+        let err = store.get(sha).unwrap_err();
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(2),
+            "FIFO blob get must not block: {:?}",
+            started.elapsed()
+        );
+        assert!(err.to_string().contains("not a regular file"), "{err}");
         let _ = fs::remove_dir_all(dir);
     }
 }

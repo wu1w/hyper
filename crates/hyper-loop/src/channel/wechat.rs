@@ -408,7 +408,7 @@ async fn post_json(http: &reqwest::Client, url: &str, token: &str, body: &Value)
         .send()
         .await?;
     let status = resp.status();
-    let data: Value = resp.json().await.unwrap_or(Value::Null);
+    let data: Value = crate::media::json_or_null(resp).await;
     if !status.is_success() {
         return Err(Error::msg(format!("wechat HTTP {status}")));
     }
@@ -716,18 +716,20 @@ fn cursor_path(id: &str) -> PathBuf {
 }
 
 fn load_cursor(id: &str) -> String {
-    std::fs::read_to_string(cursor_path(id))
-        .ok()
+    crate::tools::read_text_if_regular(&cursor_path(id))
         .map(|s| s.trim().to_string())
         .unwrap_or_default()
 }
 
 fn save_cursor(id: &str, cursor: &str) {
     let path = cursor_path(id);
+    if crate::tools::is_special_file(&path) {
+        return;
+    }
     if let Some(dir) = path.parent() {
         let _ = std::fs::create_dir_all(dir);
     }
-    let _ = std::fs::write(path, cursor);
+    let _ = crate::tools::write_if_regular(&path, cursor);
 }
 
 fn clip(s: &str, n: usize) -> String {

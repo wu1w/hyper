@@ -27,6 +27,14 @@ run_code, CallDynamicTool, legacy mcp, and ComputerUse click/type are blocked. I
 workspace and put the markdown plan in plan.md: files to change, steps, risks. \
 Do not implement yet.";
 
+/// Cursor Ask: inspect and AskQuestion only. No plan.md exception.
+pub const ASK_CARD: &str = "\
+ASK MODE. Read-only. Allowed: Read, Glob, Grep, Search, ReadLints, FetchMcpResource list/read, \
+WebSearch, WebFetch, view, recall, AskQuestion, SwitchMode, ComputerUse screenshot/list_displays/wait. \
+Write, StrReplace, Delete, EditNotebook, mutating Shell, GenerateImage, Task, CallDynamicTool, \
+legacy mcp, FetchMcpResource with downloadPath, and ComputerUse click/type are blocked. Call \
+AskQuestion and wait. SwitchMode agent to implement.";
+
 pub const PLAN_IMPLEMENT: &str = "Implement the approved plan.";
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -215,6 +223,15 @@ pub fn is_mutating(tool: &str) -> bool {
 /// Shell passes when the command is non-mutating, or only touches the plan file.
 pub fn plan_mode_blocks(tool: &str, args: &Value) -> bool {
     plan_mode_blocks_in(tool, args, DEFAULT_PLAN_FILE)
+}
+
+/// Cursor Ask / `/clarify` without `/plan`: every mutation is denied, including plan.md.
+pub fn ask_mode_blocks(tool: &str, args: &Value) -> bool {
+    let name = normalize_tool(tool);
+    if matches!(name.as_str(), "task") {
+        return true;
+    }
+    plan_mode_blocks_in(tool, args, "")
 }
 
 pub fn plan_mode_blocks_in(tool: &str, args: &Value, plan_file: &str) -> bool {
@@ -479,6 +496,13 @@ pub fn plan_denied(tool: &str) -> String {
     )
 }
 
+pub fn ask_denied(tool: &str) -> String {
+    format!(
+        "Error: ask mode: `{tool}` blocked. Stay read-only. Call AskQuestion, or SwitchMode \
+         agent to implement."
+    )
+}
+
 pub fn fetch_writes_workspace(args: &Value) -> bool {
     ["downloadPath", "download_path"].iter().any(|key| {
         args.get(*key)
@@ -627,6 +651,31 @@ mod tests {
             "/tmp/ws/.grok-hyper/plan.md",
             ".grok-hyper/plan.md"
         ));
+    }
+
+    #[test]
+    fn ask_mode_blocks_every_write_including_plan_md() {
+        let plan = serde_json::json!({"path": "plan.md", "contents": "# plan"});
+        let other = serde_json::json!({"path": "src/lib.rs", "contents": "nope"});
+        let ask = serde_json::json!({"prompt": "pick", "options": [{"label": "a"}]});
+        let ls = serde_json::json!({"command": "ls -la && git status"});
+        let rm = serde_json::json!({"command": "rm -rf src"});
+        assert!(ask_mode_blocks("Write", &plan));
+        assert!(ask_mode_blocks("Write", &other));
+        assert!(ask_mode_blocks("StrReplace", &plan));
+        assert!(ask_mode_blocks("Delete", &other));
+        assert!(ask_mode_blocks(
+            "Task",
+            &serde_json::json!({"prompt": "explore", "description": "look around"})
+        ));
+        assert!(!ask_mode_blocks("AskQuestion", &ask));
+        assert!(!ask_mode_blocks("Read", &other));
+        assert!(!ask_mode_blocks(
+            "SwitchMode",
+            &serde_json::json!({"mode": "agent"})
+        ));
+        assert!(!ask_mode_blocks("bash", &ls));
+        assert!(ask_mode_blocks("Shell", &rm));
     }
 
     #[tokio::test]

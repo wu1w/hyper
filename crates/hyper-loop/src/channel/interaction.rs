@@ -144,7 +144,7 @@ fn controls_path(session: &str) -> Option<PathBuf> {
 
 fn load_disk(session: &str) -> Option<(SessionControls, HashSet<String>)> {
     let path = controls_path(session)?;
-    let raw = std::fs::read_to_string(path).ok()?;
+    let raw = crate::tools::read_text_if_regular(&path)?;
     let disk: DiskControls = serde_json::from_str(&raw).ok()?;
     let approvals = ApprovalMode::parse(&disk.approvals).unwrap_or(IM_DEFAULT_APPROVALS);
     Some((
@@ -171,6 +171,9 @@ fn persist_session(session: &str) {
     let Some(path) = controls_path(session) else {
         return;
     };
+    if crate::tools::is_special_file(&path) {
+        return;
+    }
     if let Some(dir) = path.parent() {
         let _ = std::fs::create_dir_all(dir);
     }
@@ -187,7 +190,7 @@ fn persist_session(session: &str) {
     let Ok(body) = serde_json::to_string_pretty(&disk) else {
         return;
     };
-    if std::fs::write(&path, body).is_ok() {
+    if crate::tools::write_if_regular(&path, body).is_ok() {
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;

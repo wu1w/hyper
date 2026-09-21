@@ -390,10 +390,17 @@ pub async fn load_src(src: &str, workspace: Option<&Path>) -> Result<Blob> {
         return fetch_http(src).await;
     }
     let path = resolve_local(src, workspace)?;
-    let bytes = std::fs::read(&path)?;
-    if bytes.len() > FETCH_CAP {
+    if crate::tools::is_special_file(&path) {
+        return Err(Error::msg("media src is not a regular file"));
+    }
+    let meta = std::fs::metadata(&path)?;
+    if !meta.is_file() {
+        return Err(Error::msg("media src is not a regular file"));
+    }
+    if meta.len() as usize > FETCH_CAP {
         return Err(Error::msg("media over fetch cap"));
     }
+    let bytes = crate::tools::read_bytes_capped(&path, FETCH_CAP as u64)?;
     let name = path
         .file_name()
         .and_then(|s| s.to_str())
@@ -433,12 +440,17 @@ pub async fn load_part(part: &ContentPart, workspace: Option<&Path>) -> Result<B
 }
 
 async fn fetch_http(url: &str) -> Result<Blob> {
-    let resp = crate::llm_http::env_aware_client(30, url)?
+    let mut resp = crate::llm_http::env_aware_client(30, url)?
         .get(url)
         .send()
         .await?;
     if !resp.status().is_success() {
         return Err(Error::msg(format!("media GET {}", resp.status())));
+    }
+    if let Some(len) = resp.content_length() {
+        if len as usize > FETCH_CAP {
+            return Err(Error::msg("media over fetch cap"));
+        }
     }
     let mime = resp
         .headers()
@@ -450,10 +462,9 @@ async fn fetch_http(url: &str) -> Result<Blob> {
         .unwrap_or("")
         .trim()
         .to_string();
-    let bytes = resp.bytes().await?;
-    if bytes.len() > FETCH_CAP {
-        return Err(Error::msg("media over fetch cap"));
-    }
+    let bytes = crate::media::take_body_capped(&mut resp, FETCH_CAP)
+        .await
+        .map_err(Error::msg)?;
     let name = url
         .rsplit(['/', '?'])
         .find(|s| !s.is_empty() && s.contains('.'))
@@ -473,7 +484,7 @@ async fn fetch_http(url: &str) -> Result<Blob> {
         kind,
         mime,
         name,
-        bytes: bytes.to_vec(),
+        bytes: bytes,
     })
 }
 
@@ -513,7 +524,7 @@ pub fn save_inbox(bytes: &[u8], name: &str) -> Result<PathBuf> {
     std::fs::create_dir_all(&dir)?;
     let safe = sanitize_name(name);
     let path = dir.join(format!("{}-{safe}", &uuid::Uuid::new_v4().to_string()[..8]));
-    std::fs::write(&path, bytes)?;
+    crate::tools::write_if_regular(&path, bytes)?;
     Ok(path)
 }
 
@@ -757,6 +768,30 @@ mod tests {
         };
         assert_eq!(http_src(&remote), Some("https://cdn.example/p.jpg"));
         assert!(http_src(&local).is_none());
+    }
+
+    #[tokio::test]
+    async fn load_src_fifo_is_error_not_hang() {
+        let dir = std::env::temp_dir().join(format!("hyper-xfer-fifo-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let fifo = dir.join("pipe.png");
+        let st = std::process::Command::new("mkfifo")
+            .arg(&fifo)
+            .status()
+            .unwrap();
+        assert!(st.success());
+        let started = std::time::Instant::now();
+        let err = load_src(fifo.to_str().unwrap(), Some(&dir))
+            .await
+            .unwrap_err();
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(2),
+            "FIFO media load must not block: {:?}",
+            started.elapsed()
+        );
+        let msg = err.to_string();
+        assert!(msg.contains("regular file"), "{msg}");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

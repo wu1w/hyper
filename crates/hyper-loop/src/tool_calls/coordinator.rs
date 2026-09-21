@@ -9,10 +9,7 @@ use crate::lock_unpoison;
 use tokio::task::JoinHandle;
 use tokio::time::{sleep_until, Instant};
 
-use super::timeout::{
-    secs_to_dur, COORDINATOR_OWNED_EXEC_TIMEOUT_SECS, MIN_BACKGROUND_WINDOW_SECS,
-    OFFLOAD_TIMEOUT_RATIO,
-};
+use super::timeout::{secs_to_dur, COORDINATOR_OWNED_EXEC_TIMEOUT_SECS, OFFLOAD_TIMEOUT_RATIO};
 use super::types::{
     CancelFlag, CancelReason, Deadlines, TextBlock, ToolCall, ToolResponse, ToolState,
 };
@@ -225,8 +222,7 @@ impl ToolCoordinator {
                 }
                 _ = sleep_opt(deadlines.offload_at) => {
                     if force_offload
-                        || (self.offload_on_deadline.load(Ordering::Relaxed)
-                            && Self::has_kill_budget(&deadlines))
+                        || self.offload_on_deadline.load(Ordering::Relaxed)
                     {
                         let name = lock_unpoison(&self.live)
                             .get(&id)
@@ -235,6 +231,8 @@ impl ToolCoordinator {
                         // Foreground timeout only bounds the hop. After offload
                         // the command keeps running (Cursor: AwaitShell), up to
                         // the coordinator-owned cap — not the 60s code_mode kill.
+                        // Explicit `block_until_ms` can be well under 30s; do
+                        // not require leftover foreground kill before offload.
                         let bg_kill = Instant::now()
                             + secs_to_dur(COORDINATOR_OWNED_EXEC_TIMEOUT_SECS);
                         self.spawn_watch(id.clone(), name, join, cancel, Some(bg_kill));
@@ -294,19 +292,17 @@ impl ToolCoordinator {
             lock_unpoison(&finished).push(FinishedBg { name, response });
         });
     }
-
-    fn has_kill_budget(deadlines: &Deadlines) -> bool {
-        // 50% of the default 60s timeout is exactly 30s. Treat that as enough
-        // leftover so a one-tick jitter cannot skip offload and hard-kill.
-        deadlines
-            .remaining_kill()
-            .is_some_and(|d| d.as_secs_f64() + 0.05 >= MIN_BACKGROUND_WINDOW_SECS)
-    }
 }
 
 fn shell_wants_background(call: &ToolCall) -> bool {
-    crate::tools_schema::dispatch_name(&call.name) == "bash"
-        && call.arguments.get("background").and_then(|v| v.as_bool()) == Some(true)
+    if crate::tools_schema::dispatch_name(&call.name) != "bash" {
+        return false;
+    }
+    if call.arguments.get("background").and_then(|v| v.as_bool()) == Some(true) {
+        return true;
+    }
+    // Cursor: wait 0ms then background. `0` is not "no timeout".
+    crate::tools::arg_u32(&call.arguments, "block_until_ms") == Some(0)
 }
 
 async fn force_stop(
@@ -349,6 +345,41 @@ mod tests {
             .await;
         assert_eq!(out.state, ToolState::Success);
         assert_eq!(out.joined_text(), "ok");
+    }
+
+    #[tokio::test]
+    async fn zero_block_until_ms_offloads_immediately() {
+        let coord = ToolCoordinator::new(Some(30.0));
+        coord.set_offload_on_deadline(true);
+        let call = ToolCall {
+            id: "c0".into(),
+            name: "Shell".into(),
+            arguments: serde_json::json!({"command": "sleep 8", "block_until_ms": 0}),
+        };
+        let started = Instant::now();
+        let out = coord
+            .execute(call, "hyper", None, |cancel| async move {
+                tokio::select! {
+                    _ = cancel.cancelled() => {
+                        ToolResponse::text("c0", "saw-cancel", ToolState::Interrupted)
+                    }
+                    _ = tokio::time::sleep(Duration::from_secs(8)) => {
+                        ToolResponse::text("c0", "TOO_LATE", ToolState::Success)
+                    }
+                }
+            })
+            .await;
+        assert!(
+            started.elapsed() < Duration::from_secs(2),
+            "block_until_ms=0 must offload immediately: {:?}",
+            started.elapsed()
+        );
+        assert!(out.offloaded, "{out:?}");
+        assert!(
+            out.joined_text().contains("running in background"),
+            "{}",
+            out.joined_text()
+        );
     }
 
     #[tokio::test]
@@ -416,6 +447,42 @@ mod tests {
         let out = exec.await;
         assert_eq!(out.state, ToolState::Interrupted);
         assert!(out.joined_text().contains("timeout"));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn short_block_until_offloads_instead_of_timeout() {
+        let coord = ToolCoordinator::new(Some(1.6));
+        coord.set_offload_on_deadline(true);
+        let exec = coord.execute(call("c-short"), "hyper", Some(1.6), |cancel| async move {
+            tokio::select! {
+                _ = cancel.cancelled() => {
+                    ToolResponse::text("c-short", "saw-cancel", ToolState::Interrupted)
+                }
+                _ = tokio::time::sleep(Duration::from_secs(8)) => {
+                    ToolResponse::text("c-short", "TOO_LATE", ToolState::Success)
+                }
+            }
+        });
+        tokio::pin!(exec);
+        tokio::select! {
+            biased;
+            _ = &mut exec => panic!("tool finished before offload"),
+            _ = tokio::task::yield_now() => {}
+        }
+        tokio::time::advance(Duration::from_millis(900)).await;
+        let out = exec.await;
+        assert!(out.offloaded, "{out:?}");
+        assert_eq!(out.state, ToolState::Success);
+        assert!(
+            out.joined_text().contains("running in background"),
+            "{}",
+            out.joined_text()
+        );
+        assert!(
+            !out.joined_text().contains("timeout"),
+            "short block_until_ms must not hard-timeout: {}",
+            out.joined_text()
+        );
     }
 
     #[tokio::test(start_paused = true)]

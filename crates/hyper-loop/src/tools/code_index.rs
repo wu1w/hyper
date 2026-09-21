@@ -3,7 +3,6 @@
 //! the core tool set — `bind_periphery` appends `search_tool()` when `code_search` is on.
 
 use std::collections::{HashMap, HashSet};
-use std::io::Read;
 use std::path::{Component, Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::Mutex;
@@ -14,16 +13,20 @@ use rusqlite::{params, Connection, Transaction};
 use super::{arg_str, folded_response, ToolLimits, Workspace};
 use crate::tool_calls::{ToolCall, ToolResponse, ToolState};
 
-/// Same copy for empty index and "index not bound yet" so the model retries
-/// Search instead of falling through to Glob/Grep.
-pub const SEARCH_WARMING: &str =
-    "No matches. Index is empty or still warming. Retry Search shortly, or Read a path you already know.";
+/// Empty index after a finished build. Do not say "retry shortly" (it will
+/// not fill) and do not name Grep/Glob (that steers a storm).
+pub const SEARCH_EMPTY: &str = "No matches.";
+/// Home / Desktop / drive-root workspaces never index. Success+warming is a lie.
+pub const SEARCH_SKIPPED: &str =
+    "Error: Search skipped this workspace (home, Desktop, or a drive root). Use Grep or Read.";
+/// `settle_code_index` joined Err. Not "still warming".
+pub const SEARCH_FAILED: &str = "Error: Search index failed to build. Use Grep or Read.";
 
 const HIT_CAP: usize = 8;
 const CHUNK_LINES: usize = 80;
 const RENDER_CHARS: usize = 4000;
 const MAX_FILES: usize = 50_000;
-const MAX_FILE_BYTES: usize = 1024 * 1024;
+const MAX_FILE_BYTES: usize = super::path::MAX_TEXT_SLURP_BYTES as usize;
 const INDEX_SCHEMA: i64 = 4;
 /// Agent::new rebuilds the index every turn. A persistent sqlite that was
 /// scanned moments ago is still current; skip git-ls + metadata until this
@@ -87,6 +90,8 @@ const HYPER_SKIP_DIR: &[&str] = &["sessions", "blobs", "doc-cache", "generated"]
 
 pub struct CodeIndex {
     conn: Mutex<Connection>,
+    /// `skip_index_root`: Search will never have hits here.
+    skipped_root: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -103,7 +108,7 @@ impl CodeIndex {
         // profile (AppData / OneDrive / Downloads) blocks the first model hop
         // for minutes while the UI says "正在调用模型".
         if skip_index_root(root) {
-            return Self::empty();
+            return Self::skipped();
         }
         if reuse_persistent(root) {
             if let Some(idx) = Self::persistent(root) {
@@ -156,6 +161,16 @@ impl CodeIndex {
         init_schema(&conn).expect("fts5 chunks");
         Self {
             conn: Mutex::new(conn),
+            skipped_root: false,
+        }
+    }
+
+    fn skipped() -> Self {
+        let conn = Connection::open_in_memory().expect("in-memory sqlite");
+        init_schema(&conn).expect("fts5 chunks");
+        Self {
+            conn: Mutex::new(conn),
+            skipped_root: true,
         }
     }
 
@@ -164,12 +179,17 @@ impl CodeIndex {
         let key = crate::vendor::sha256_hex(canonical.to_string_lossy().as_bytes());
         let dir = crate::config::Config::home_dir().ok()?.join("code-index");
         std::fs::create_dir_all(&dir).ok()?;
-        let conn = Connection::open(dir.join(format!("{}.sqlite3", &key[..24]))).ok()?;
+        let path = dir.join(format!("{}.sqlite3", &key[..24]));
+        if crate::tools::is_special_file(&path) {
+            return None;
+        }
+        let conn = Connection::open(&path).ok()?;
         conn.busy_timeout(std::time::Duration::from_secs(5)).ok()?;
         let _ = conn.pragma_update(None, "journal_mode", "WAL");
         init_schema(&conn).ok()?;
         Some(Self {
             conn: Mutex::new(conn),
+            skipped_root: false,
         })
     }
 
@@ -215,9 +235,10 @@ impl CodeIndex {
             if known.get(&rel_s) == Some(&stamp) {
                 continue;
             }
-            let content = std::fs::read_to_string(&abs)
+            let content = super::path::read_bytes_regular(&abs)
                 .ok()
-                .filter(|s| !s.contains('\0') && s.len() <= MAX_FILE_BYTES);
+                .filter(|b| !b.contains(&0) && b.len() <= MAX_FILE_BYTES)
+                .and_then(|b| String::from_utf8(b).ok());
             updates.push((rel_s, stamp, content));
         }
 
@@ -253,12 +274,25 @@ impl CodeIndex {
             self.drop_path(&shown);
             return;
         }
-        match std::fs::read_to_string(&abs) {
-            Ok(content) if !content.contains('\0') && content.len() <= MAX_FILE_BYTES => {
-                let stamp = std::fs::metadata(&abs)
-                    .map(|m| file_stamp(&m))
-                    .unwrap_or((content.len() as i64, 0));
-                self.upsert_file(&shown, &content, stamp);
+        let Ok(meta) = std::fs::metadata(&abs) else {
+            self.drop_path(&shown);
+            return;
+        };
+        if !meta.is_file() || meta.len() as usize > MAX_FILE_BYTES {
+            self.drop_path(&shown);
+            return;
+        }
+        match super::path::read_bytes_regular(&abs) {
+            Ok(bytes) if !bytes.contains(&0) && bytes.len() <= MAX_FILE_BYTES => {
+                match String::from_utf8(bytes) {
+                    Ok(content) => {
+                        let stamp = std::fs::metadata(&abs)
+                            .map(|m| file_stamp(&m))
+                            .unwrap_or((content.len() as i64, 0));
+                        self.upsert_file(&shown, &content, stamp);
+                    }
+                    Err(_) => self.drop_path(&shown),
+                }
             }
             _ => self.drop_path(&shown),
         }
@@ -595,13 +629,11 @@ pub fn run_search(
             }
         }
     }
+    if index.skipped_root {
+        return ToolResponse::text(&call.id, SEARCH_SKIPPED, ToolState::Error);
+    }
     if hits.is_empty() {
-        let hint = if index.is_empty() {
-            SEARCH_WARMING
-        } else {
-            "No matches."
-        };
-        return ToolResponse::text(&call.id, hint, ToolState::Success);
+        return ToolResponse::text(&call.id, SEARCH_EMPTY, ToolState::Success);
     }
     let body = render_hits(&hits, RENDER_CHARS);
     let body = match widened {
@@ -1243,28 +1275,37 @@ fn git_at(root: &Path, args: &[&str]) -> Option<Vec<u8>> {
         .stdout(Stdio::piped())
         .stderr(Stdio::null());
     let mut child = cmd.spawn().ok()?;
+    let stdout = child.stdout.take();
+    let reader = std::thread::spawn(move || {
+        let mut buf = Vec::new();
+        if let Some(mut out) = stdout {
+            crate::proc_spawn::drain_capped(&mut out, &mut buf, MAX_GIT_LS);
+        }
+        buf
+    });
     let started = Instant::now();
-    loop {
+    let status = loop {
         match child.try_wait() {
-            Ok(Some(st)) if st.success() => {
-                let mut buf = Vec::new();
-                let _ = child.stdout.as_mut()?.read_to_end(&mut buf);
-                return Some(buf);
-            }
-            Ok(Some(_)) => return None,
+            Ok(Some(st)) => break st,
             Ok(None) if started.elapsed() > GIT_TIMEOUT => {
                 let _ = child.kill();
                 let _ = child.wait();
+                let _ = reader.join();
                 return None;
             }
             Ok(None) => std::thread::sleep(Duration::from_millis(20)),
             Err(_) => {
                 let _ = child.kill();
+                let _ = reader.join();
                 return None;
             }
         }
-    }
+    };
+    let buf = reader.join().ok()?;
+    status.success().then_some(buf)
 }
+
+const MAX_GIT_LS: usize = 8 * 1024 * 1024;
 
 /// `git ls-files` relative to `root`. None when git is missing, the repo is the
 /// user home (accidental `~/.git`), or the discovered toplevel lives outside
@@ -1820,6 +1861,25 @@ mod tests {
     }
 
     #[test]
+    fn search_indexes_file_between_one_and_eight_mib() {
+        let dir = std::env::temp_dir().join(format!(
+            "hyper-idx-big-{}",
+            uuid::Uuid::new_v4().simple()
+        ));
+        std::fs::create_dir_all(dir.join("src")).unwrap();
+        let mut body = String::from("fn unique_search_omega_marker() {}\n");
+        body.push_str(&"x".repeat(1_500_000));
+        std::fs::write(dir.join("src/big.rs"), body).unwrap();
+        let idx = CodeIndex::build(&dir);
+        let hits = idx.search("unique_search_omega_marker", None, 8);
+        assert!(
+            !hits.is_empty(),
+            "1.5MiB source must be indexed, not treated as absent"
+        );
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
     fn search_ranks_production_ahead_of_tests_rs() {
         let dir = std::env::temp_dir().join(format!("hyper-idx-{}", uuid::Uuid::new_v4().simple()));
         std::fs::create_dir_all(dir.join("src")).unwrap();
@@ -1916,9 +1976,28 @@ mod tests {
         let out = run_search(&idx, &ws, &call, ToolLimits::default());
         let text = out.joined_text();
         assert!(text.contains("No matches"), "{text}");
-        assert!(text.contains("warming"), "{text}");
+        assert!(!text.contains("warming"), "{text}");
         assert!(!text.contains("Glob"), "{text}");
         assert!(!text.contains("Grep"), "{text}");
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn skipped_root_search_is_error_not_warming() {
+        let (dir, ws) = scratch();
+        let idx = CodeIndex::skipped();
+        assert!(idx.is_empty());
+        let call = ToolCall {
+            id: "t".into(),
+            name: "search".into(),
+            arguments: json!({"query": "main"}),
+        };
+        let out = run_search(&idx, &ws, &call, ToolLimits::default());
+        let text = out.joined_text();
+        assert_eq!(out.state, ToolState::Error, "{text}");
+        assert!(text.contains("skipped"), "{text}");
+        assert!(text.contains("Grep"), "{text}");
+        assert!(!text.contains("warming"), "{text}");
         let _ = std::fs::remove_dir_all(dir);
     }
 
@@ -1970,6 +2049,7 @@ mod tests {
         init_schema(&conn).unwrap();
         let idx = CodeIndex {
             conn: Mutex::new(conn),
+            skipped_root: false,
         };
         idx.sync_root(
             ws.root(),
@@ -2366,6 +2446,8 @@ mod tests {
         assert!(is_volume_root(Path::new("/")));
         if let Some(home) = crate::config::user_home() {
             assert!(skip_index_root(&home));
+            let idx = CodeIndex::build(&home);
+            assert!(idx.skipped_root, "home workspace must not pretend to index");
         }
     }
 

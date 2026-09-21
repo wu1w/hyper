@@ -704,7 +704,7 @@ fn extract(
                 if washed.trim().is_empty() {
                     continue;
                 }
-                let clipped = clip(&washed, CLIP);
+                let clipped = crate::secrets::redact(&clip(&washed, CLIP));
                 lines.push(format!("seq {seq}  user  {clipped}"));
                 // Live user is Active Task. Earlier real turns are the sticky
                 // channel as Prior User — no keyword mining.
@@ -814,8 +814,9 @@ fn extract(
     summary.push_str("\n## Open Work\n");
     summary.push_str(&format_open_work(&already, keep_user <= until));
     summary.push('\n');
-
-    (summary, prefer_mutation_index(lines).join("\n"))
+    let summary = crate::secrets::redact(&summary);
+    let index = crate::secrets::redact(&prefer_mutation_index(lines).join("\n"));
+    (summary, index)
 }
 
 fn collect_tool_states(events: &[SessionEvent], from: usize, until: usize) -> Vec<String> {
@@ -2114,6 +2115,29 @@ mod tests {
                 .to_ascii_lowercase()
                 .contains("continue working"),
             "hidden continue must not become Prior User: {}",
+            plan.summary
+        );
+    }
+
+    #[test]
+    fn prior_user_redacts_labeled_password() {
+        let events = vec![
+            start(),
+            SessionEvent::user("VPS password: hunter2-not-real do not leak"),
+            SessionEvent::assistant("ok", "", None),
+            SessionEvent::user("read pads/p01.txt then stop"),
+            SessionEvent::assistant("", "", Some(vec![read_call("r", "pads/p01.txt")])),
+            SessionEvent::tool("r", "read", "pad-01 line"),
+        ];
+        let plan = plan_compact(&events).expect("compact");
+        assert!(
+            !plan.summary.contains("hunter2-not-real"),
+            "compact must not copy labeled passwords: {}",
+            plan.summary
+        );
+        assert!(
+            plan.summary.contains("[redacted]"),
+            "redaction marker missing: {}",
             plan.summary
         );
     }

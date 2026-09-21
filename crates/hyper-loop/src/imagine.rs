@@ -107,13 +107,13 @@ pub async fn generate(
         req = req.bearer_auth(resolved.token());
     }
     req = apply_grok_headers(req, header_mode);
-    let resp = tokio::select! {
+    let mut resp = tokio::select! {
         biased;
         _ = cancel.cancelled() => return Err("aborted".into()),
         r = req.send() => r.map_err(|e| e.to_string())?,
     };
     let status = resp.status();
-    let bytes = resp.bytes().await.map_err(|e| e.to_string())?;
+    let bytes = crate::media::take_body_capped(&mut resp, FETCH_CAP).await?;
     let text = String::from_utf8_lossy(&bytes);
     if !status.is_success() {
         return Err(http_error_snippet(status, &text));

@@ -90,7 +90,7 @@ pub async fn docs_ready(docs_url: &str) -> bool {
     };
     match client.get(&url).send().await {
         Ok(r) if r.status().is_success() => {
-            let t = r.text().await.unwrap_or_default();
+            let t = hyper_loop::media::text_or_empty(r).await;
             t.trim().eq_ignore_ascii_case("true") || t.trim() == "1"
         }
         _ => false,
@@ -415,7 +415,7 @@ async fn command_forcesave(office: &OfficeConfig, key: &str) -> Result<()> {
     let url = format!("{}/coauthoring/CommandService.ashx", office.docs_origin());
     let client = hyper_loop::llm_http::env_aware_client(15, &url).map_err(|e| anyhow!(e))?;
     let r = client.post(url).json(&body).send().await?;
-    let v: Value = r.json().await.unwrap_or(json!({}));
+    let v: Value = hyper_loop::media::json_or_null(r).await;
     let err = v.get("error").and_then(|e| e.as_i64()).unwrap_or(-1);
     if err != 0 {
         bail!("forcesave error {err}");
@@ -425,15 +425,13 @@ async fn command_forcesave(office: &OfficeConfig, key: &str) -> Result<()> {
 
 async fn download_edited(url: &str) -> Result<Vec<u8>> {
     let client = hyper_loop::llm_http::env_aware_client(60, url).map_err(|e| anyhow!(e))?;
-    let r = client.get(url).send().await?;
+    let mut r = client.get(url).send().await?;
     if !r.status().is_success() {
         bail!("download edited file: HTTP {}", r.status());
     }
-    let bytes = r.bytes().await?;
-    if bytes.len() > FILE_PUT_CAP {
-        bail!("edited file too large");
-    }
-    Ok(bytes.to_vec())
+    hyper_loop::media::take_body_capped(&mut r, FILE_PUT_CAP)
+        .await
+        .map_err(|e| anyhow!(e))
 }
 
 struct FileMeta {

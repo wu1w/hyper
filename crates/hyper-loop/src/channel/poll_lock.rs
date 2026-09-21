@@ -52,9 +52,15 @@ pub fn acquire_in(dir: &Path, kind: &str, id: &str) -> Result<PollLock> {
         use std::os::unix::fs::OpenOptionsExt;
         opts.mode(0o600);
     }
+    if crate::tools::is_special_file(&path) {
+        return Err(Error::msg(format!(
+            "poll lock {} is not a regular file",
+            path.display()
+        )));
+    }
     let mut file = opts.open(&path)?;
     if file.try_lock_exclusive().is_err() {
-        let holder = std::fs::read_to_string(&path).unwrap_or_default();
+        let holder = crate::tools::read_text_if_regular(&path).unwrap_or_default();
         let holder = holder.trim();
         let extra = if holder.is_empty() {
             String::new()

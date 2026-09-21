@@ -751,10 +751,7 @@ mod tests {
 
     #[test]
     fn gateway_wait_is_zero_after_a_healthy_run() {
-        assert_eq!(
-            gateway_next_wait(8, SUPERVISE_HEALTHY, true),
-            (0, 0)
-        );
+        assert_eq!(gateway_next_wait(8, SUPERVISE_HEALTHY, true), (0, 0));
         assert_eq!(
             gateway_next_wait(8, Duration::from_secs(1), true),
             (9, supervise_backoff_secs(9))

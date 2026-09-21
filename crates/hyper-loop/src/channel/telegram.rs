@@ -49,7 +49,7 @@ pub async fn run_long_poll(ep: ChannelEndpoint, mgr: ChannelManager) -> Result<(
             }
         };
         let status = resp.status();
-        let body: Value = match resp.json().await {
+        let body: Value = match crate::media::json_result(resp).await {
             Ok(v) => v,
             Err(e) => {
                 eprintln!("hyper telegram json: {e}");
@@ -195,7 +195,7 @@ pub(crate) async fn settle_choices(
     });
     let resp = client.post(&url).json(&body).send().await?;
     if !resp.status().is_success() {
-        let t = resp.text().await.unwrap_or_default();
+        let t = crate::media::text_or_empty(resp).await;
         return Err(Error::msg(format!("telegram settle choice: {t}")));
     }
     Ok(())
@@ -212,7 +212,7 @@ async fn answer_callback_query(
     if !resp.status().is_success() {
         return Err(Error::msg(format!(
             "telegram answerCallbackQuery: {}",
-            resp.text().await.unwrap_or_default()
+            crate::media::text_or_empty(resp).await
         )));
     }
     Ok(())
@@ -353,7 +353,7 @@ async fn edit_message(
     });
     let resp = client.post(&url).json(&body).send().await?;
     let status = resp.status();
-    let t = resp.text().await.unwrap_or_default();
+    let t = crate::media::text_or_empty(resp).await;
     if !status.is_success() {
         return Err(Error::msg(format!("telegram editMessageText: {t}")));
     }
@@ -377,7 +377,7 @@ async fn send_message(
     );
     let resp = client.post(&url).json(&body).send().await?;
     let status = resp.status();
-    let t = resp.text().await.unwrap_or_default();
+    let t = crate::media::text_or_empty(resp).await;
     if status.as_u16() == 429 {
         let secs = serde_json::from_str::<Value>(&t)
             .ok()
@@ -386,7 +386,7 @@ async fn send_message(
         tokio::time::sleep(Duration::from_secs(secs)).await;
         let retry = client.post(&url).json(&body).send().await?;
         let status = retry.status();
-        let t = retry.text().await.unwrap_or_default();
+        let t = crate::media::text_or_empty(retry).await;
         if !status.is_success() {
             return Err(Error::msg(format!("telegram sendMessage: {t}")));
         }
@@ -426,7 +426,7 @@ async fn send_message_markup(
     );
     let resp = client.post(&url).json(&body).send().await?;
     let status = resp.status();
-    let t = resp.text().await.unwrap_or_default();
+    let t = crate::media::text_or_empty(resp).await;
     if !status.is_success() {
         return Err(Error::msg(format!("telegram sendMessage: {t}")));
     }
@@ -467,7 +467,7 @@ async fn send_media(
     if !resp.status().is_success() {
         return Err(Error::msg(format!(
             "telegram {method}: {}",
-            resp.text().await.unwrap_or_default()
+            crate::media::text_or_empty(resp).await
         )));
     }
     Ok(())
@@ -629,22 +629,23 @@ async fn fetch_telegram_file(
     let path = meta["result"]["file_path"]
         .as_str()
         .ok_or_else(|| Error::msg("telegram getFile: no file_path"))?;
-    let bytes = client
+    let mut resp = client
         .get(format!("{API}/file/bot{token}/{path}"))
         .send()
-        .await?
-        .bytes()
         .await?;
-    if bytes.len() > super::xfer::FETCH_CAP {
-        return Err(Error::msg("telegram file over cap"));
+    if !resp.status().is_success() {
+        return Err(Error::msg(format!("telegram file HTTP {}", resp.status())));
     }
+    let bytes = crate::media::take_body_capped(&mut resp, super::xfer::FETCH_CAP)
+        .await
+        .map_err(Error::msg)?;
     let kind = super::xfer::kind_from_name(name);
     let mime = super::xfer::guess_mime(name, kind).to_string();
     let blob = super::xfer::Blob {
         kind,
         mime,
         name: name.to_string(),
-        bytes: bytes.to_vec(),
+        bytes,
     };
     super::xfer::blob_to_inbound_part(blob)
 }
@@ -703,18 +704,20 @@ fn offset_path(id: &str) -> PathBuf {
 }
 
 fn load_offset(id: &str) -> i64 {
-    std::fs::read_to_string(offset_path(id))
-        .ok()
+    crate::tools::read_text_if_regular(&offset_path(id))
         .and_then(|s| s.trim().parse().ok())
         .unwrap_or(0)
 }
 
 fn save_offset(id: &str, offset: i64) {
     let path = offset_path(id);
+    if crate::tools::is_special_file(&path) {
+        return;
+    }
     if let Some(dir) = path.parent() {
         let _ = std::fs::create_dir_all(dir);
     }
-    let _ = std::fs::write(path, offset.to_string());
+    let _ = crate::tools::write_if_regular(&path, offset.to_string());
 }
 
 fn retry_after_secs(body: &Value, desc: &str, http_status: u16) -> Option<u64> {

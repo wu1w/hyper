@@ -1,6 +1,5 @@
 //! Role + boundary. Persona is Hyper home AGENT.md only, never the workspace.
 
-use std::fs;
 use std::path::Path;
 
 pub const AGENT_MD_NAME: &str = "AGENT.md";
@@ -40,8 +39,8 @@ calls belong in one turn. Batch related edits before validation; run dependent c
 Do not parallel writes to the same path. Paths are workspace-relative \
 unless absolute. Write complete files; no placeholder ellipses. Independent \
 multi-step work can go to Task; do not spawn one for a single Read. After \
-Write or StrReplace, [diagnostics] on the tool result is the compiler; do \
-not Shell cargo check or tsc to re-verify unless that block is missing.
+edits, call ReadLints if you need compiler or linter output. Do not Shell \
+cargo check or tsc to re-verify a clean ReadLints result.
 ";
 
 /// Back-compat alias. Builtin no longer splits office vs coding.
@@ -83,7 +82,7 @@ pub fn load_role_boundary(
     let name = prompt_file_name(file);
     if let Some(home) = home {
         let path = home.join(name);
-        if let Ok(raw) = fs::read_to_string(&path) {
+        if let Some(raw) = crate::tools::read_text_if_regular(&path) {
             let t = raw.trim();
             if !t.is_empty() {
                 if is_stale_builtin(t) {
@@ -163,6 +162,13 @@ pub fn is_stale_search_builtin(text: &str) -> bool {
         && !text.contains("Prefer Search to find code")
 }
 
+/// Previous builtin that auto-attached cargo/tsc after every Write.
+pub fn is_stale_auto_diag_builtin(text: &str) -> bool {
+    text.contains("You are grok-hyper, an agent in this workspace")
+        && text
+            .contains("After Write or StrReplace, [diagnostics] on the tool result is the compiler")
+}
+
 /// Previous builtin that never mentioned post-edit [diagnostics].
 pub fn is_stale_diag_builtin(text: &str) -> bool {
     text.contains("You are grok-hyper, an agent in this workspace")
@@ -217,6 +223,7 @@ pub fn is_stale_builtin(text: &str) -> bool {
         || is_stale_hop_builtin(text)
         || is_stale_search_builtin(text)
         || is_stale_diag_builtin(text)
+        || is_stale_auto_diag_builtin(text)
         || is_stale_named_write_builtin(text)
         || is_stale_search_once_builtin(text)
         || is_stale_search_span_builtin(text)
@@ -229,13 +236,13 @@ pub fn is_stale_builtin(text: &str) -> bool {
 
 /// Rewrite home AGENT.md when it is still a previous builtin snapshot.
 pub fn migrate_stale_home_agent_md(path: &Path, _coding: bool) {
-    let Ok(raw) = fs::read_to_string(path) else {
+    let Some(raw) = crate::tools::read_text_if_regular(path) else {
         return;
     };
     if !is_stale_builtin(&raw) {
         return;
     }
-    let _ = fs::write(path, DEFAULT_AGENT_MD.trim());
+    let _ = crate::tools::write_if_regular(path, DEFAULT_AGENT_MD.trim());
 }
 
 /// Tests / callers that only have a display path (no AGENT.md search).
@@ -360,6 +367,31 @@ mod tests {
         assert!(s.contains("do not take a name, voice, or role"));
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn load_role_boundary_fifo_falls_back_to_builtin() {
+        let dir = std::env::temp_dir().join(format!(
+            "grok-hyper-agent-fifo-{}",
+            uuid::Uuid::new_v4().simple()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("AGENT.md");
+        let st = std::process::Command::new("mkfifo")
+            .arg(&path)
+            .status()
+            .unwrap();
+        assert!(st.success());
+        let started = std::time::Instant::now();
+        let s = load_role_boundary(Path::new("/tmp"), Some(&dir), "AGENT.md", true);
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(2),
+            "FIFO AGENT.md must not block: {:?}",
+            started.elapsed()
+        );
+        assert!(s.contains("an agent in this workspace"), "{s}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     #[test]
     fn stale_office_builtin_is_detected() {
         assert!(is_stale_office_builtin(
@@ -427,6 +459,12 @@ mod tests {
         ));
         assert!(!is_stale_prefer_search_builtin(DEFAULT_AGENT_MD));
         assert!(!DEFAULT_AGENT_MD.contains("Prefer Search"));
+        assert!(!DEFAULT_AGENT_MD.contains("[diagnostics]"));
+        assert!(DEFAULT_AGENT_MD.contains("ReadLints"));
+        assert!(is_stale_auto_diag_builtin(
+            "You are grok-hyper, an agent in this workspace. After Write or StrReplace, [diagnostics] on the tool result is the compiler."
+        ));
+        assert!(!is_stale_auto_diag_builtin(DEFAULT_AGENT_MD));
         assert!(is_stale_sample_builtin(
             "You are grok-hyper, an agent in this workspace. If they already gave the path, Write it; do not Glob to confirm. Prefer Grep, Glob, and Read over Shell cat."
         ));

@@ -1,6 +1,7 @@
 //! Session picker. JSONL stays the evidence; titles live beside it.
 
 use std::fs;
+use std::io::{BufRead, BufReader, Read};
 use std::path::{Path, PathBuf};
 use std::time::UNIX_EPOCH;
 
@@ -13,6 +14,10 @@ use crate::session::new_session_id;
 use crate::template::is_hidden_user_text;
 
 const TITLE_CHARS: usize = 32;
+/// Listing every session must not slurp overnight JSONL into RAM.
+const INSPECT_MAX_BYTES: u64 = 512 * 1024;
+/// GC scan may walk a full session, but never more than the JSONL file cap.
+const SESSION_GC_MAX_BYTES: u64 = 64 * 1024 * 1024;
 /// Last session the console/TUI sidecar had open. Not a jsonl; `list` skips it.
 const CURRENT_FILE: &str = ".current";
 
@@ -74,7 +79,13 @@ pub fn remember(dir: impl AsRef<Path>, id: &str) -> Result<()> {
     let dir = dir.as_ref();
     fs::create_dir_all(dir)?;
     let path = dir.join(CURRENT_FILE);
-    fs::write(&path, id)?;
+    if crate::tools::is_special_file(&path) {
+        return Err(Error::msg(format!(
+            "{} is not a regular file",
+            path.display()
+        )));
+    }
+    crate::tools::write_if_regular(&path, id.as_bytes()).map_err(Error::msg)?;
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
@@ -86,7 +97,11 @@ pub fn remember(dir: impl AsRef<Path>, id: &str) -> Result<()> {
 /// Last remembered id, if the jsonl is still on disk.
 pub fn remembered(dir: impl AsRef<Path>) -> Option<String> {
     let dir = dir.as_ref();
-    let id = fs::read_to_string(dir.join(CURRENT_FILE)).ok()?;
+    let current = dir.join(CURRENT_FILE);
+    if crate::tools::is_special_file(&current) || crate::tools::is_oversized_text(&current) {
+        return None;
+    }
+    let id = crate::tools::read_text_if_regular(&current)?;
     let id = id.trim().to_string();
     if id.is_empty() {
         return None;
@@ -153,10 +168,17 @@ pub fn set_title(dir: impl AsRef<Path>, id: &str, title: &str) -> Result<()> {
     let mut meta = read_meta(dir, id);
     meta.title = title.trim().to_string();
     let path = meta_path(dir, id);
-    fs::write(
+    if crate::tools::is_special_file(&path) {
+        return Err(Error::msg(format!(
+            "{} is not a regular file",
+            path.display()
+        )));
+    }
+    crate::tools::write_if_regular(
         &path,
         serde_json::to_string_pretty(&meta).map_err(Error::msg)?,
-    )?;
+    )
+    .map_err(Error::msg)?;
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
@@ -177,10 +199,17 @@ pub fn seed_title(dir: impl AsRef<Path>, id: &str, title: &str) -> Result<()> {
     let mut meta = read_meta(dir, id);
     meta.title = title.to_string();
     let path = meta_path(dir, id);
-    fs::write(
+    if crate::tools::is_special_file(&path) {
+        return Err(Error::msg(format!(
+            "{} is not a regular file",
+            path.display()
+        )));
+    }
+    crate::tools::write_if_regular(
         &path,
         serde_json::to_string_pretty(&meta).map_err(Error::msg)?,
-    )?;
+    )
+    .map_err(Error::msg)?;
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
@@ -209,13 +238,22 @@ pub fn delete(dir: impl AsRef<Path>, id: &str) -> Result<()> {
 /// 本会话 jsonl 引用的 blob sha（ToolEvent.blob 字段）。读取或任一行
 /// 解析失败返回 None——宁可漏删不可误删。
 fn blob_refs(path: &Path) -> Option<std::collections::HashSet<String>> {
-    let raw = fs::read_to_string(path).ok()?;
+    if crate::tools::is_special_file(path) {
+        return None;
+    }
+    let meta = fs::metadata(path).ok()?;
+    if !meta.is_file() || meta.len() > SESSION_GC_MAX_BYTES {
+        return None;
+    }
+    let file = crate::tools::open_read_nonblock(path).ok()?;
+    let reader = BufReader::new(file.take(SESSION_GC_MAX_BYTES));
     let mut out = std::collections::HashSet::new();
-    for line in raw.lines() {
+    for line in reader.lines() {
+        let line = line.ok()?;
         if line.trim().is_empty() {
             continue;
         }
-        let event: SessionEvent = serde_json::from_str(line).ok()?;
+        let event: SessionEvent = serde_json::from_str(&line).ok()?;
         if let SessionEvent::Tool(t) = event {
             if let Some(sha) = t.blob {
                 out.insert(sha);
@@ -282,16 +320,27 @@ pub fn resolve(dir: impl AsRef<Path>, query: &str) -> Result<Option<SessionInfo>
 }
 
 fn inspect(dir: &Path, id: &str, path: &Path) -> Result<SessionInfo> {
-    let raw = fs::read_to_string(path)?;
+    if crate::tools::is_special_file(path) {
+        return Err(Error::msg(format!(
+            "{} is not a regular file",
+            path.display()
+        )));
+    }
+    let file = crate::tools::open_read_nonblock(path)?;
+    let reader = BufReader::new(file.take(INSPECT_MAX_BYTES));
     let mut events = 0usize;
     let mut start: Option<SessionStart> = None;
     let mut preview = String::new();
-    for line in raw.lines() {
+    for line in reader.lines() {
+        let line = line?;
         if line.trim().is_empty() {
             continue;
         }
         events += 1;
-        let event: SessionEvent = serde_json::from_str(line).map_err(Error::msg)?;
+        let event: SessionEvent = match serde_json::from_str(&line) {
+            Ok(event) => event,
+            Err(_) => break,
+        };
         if start.is_none() {
             if let SessionEvent::Start(s) = event {
                 start = Some(s);
@@ -333,8 +382,7 @@ fn inspect(dir: &Path, id: &str, path: &Path) -> Result<SessionInfo> {
 
 fn read_meta(dir: &Path, id: &str) -> SessionMeta {
     let path = meta_path(dir, id);
-    fs::read_to_string(path)
-        .ok()
+    crate::tools::read_text_if_regular(&path)
         .and_then(|s| serde_json::from_str(&s).ok())
         .unwrap_or_default()
 }
@@ -670,5 +718,67 @@ mod tests {
         assert!(is_console_channel("console"));
         assert!(!is_console_channel("qq"));
         assert!(!is_console_channel("im"));
+    }
+
+    #[test]
+    fn inspect_huge_jsonl_does_not_slurp() {
+        let dir = tmp();
+        let id = write_session(&dir, "console", Some("hello catalog"));
+        let path = dir.join(format!("{id}.jsonl"));
+        {
+            let f = fs::OpenOptions::new().write(true).open(&path).unwrap();
+            f.set_len(32 * 1024 * 1024).unwrap();
+        }
+        let started = std::time::Instant::now();
+        let listed = list(&dir).unwrap();
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(2),
+            "huge jsonl list must not slurp: {:?}",
+            started.elapsed()
+        );
+        let hit = listed.iter().find(|s| s.id == id).expect("session listed");
+        assert!(hit.preview.contains("hello catalog"), "{hit:?}");
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn remember_fifo_is_error_not_hang() {
+        let dir = tmp();
+        let current = dir.join(CURRENT_FILE);
+        let st = std::process::Command::new("mkfifo")
+            .arg(&current)
+            .status()
+            .unwrap();
+        assert!(st.success());
+        let started = std::time::Instant::now();
+        let err = remember(&dir, "sid").unwrap_err();
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(2),
+            "FIFO .current write must not block: {:?}",
+            started.elapsed()
+        );
+        assert!(err.to_string().contains("not a regular file"), "{err}");
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn remembered_fifo_is_none_not_hang() {
+        let dir = tmp();
+        let current = dir.join(CURRENT_FILE);
+        let st = std::process::Command::new("mkfifo")
+            .arg(&current)
+            .status()
+            .unwrap();
+        assert!(st.success());
+        let started = std::time::Instant::now();
+        assert!(remembered(&dir).is_none());
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(2),
+            "FIFO .current must not block: {:?}",
+            started.elapsed()
+        );
+        let _ = fs::remove_dir_all(dir);
     }
 }

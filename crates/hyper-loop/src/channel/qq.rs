@@ -117,7 +117,7 @@ async fn gateway_url(http: &reqwest::Client, token: &str, bases: &[String]) -> R
             }
         };
         let status = resp.status();
-        let data: Value = resp.json().await.unwrap_or(Value::Null);
+        let data: Value = crate::media::json_or_null(resp).await;
         if status.is_success() {
             if let Some(url) = data.get("url").and_then(Value::as_str) {
                 eprintln!("hyper qq gateway {base}");
@@ -654,7 +654,7 @@ async fn ack_interaction(
         last = Error::msg(format!(
             "qq interaction ack {} {}",
             resp.status(),
-            resp.text().await.unwrap_or_default()
+            crate::media::text_or_empty(resp).await
         ));
     }
     Err(last)
@@ -915,7 +915,7 @@ async fn post_first_ok(
             }
         };
         let status = resp.status();
-        let data: Value = resp.json().await.unwrap_or(Value::Null);
+        let data: Value = crate::media::json_or_null(resp).await;
         if status.is_success() {
             return Ok(data);
         }

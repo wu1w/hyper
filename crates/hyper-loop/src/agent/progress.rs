@@ -24,7 +24,7 @@ pub const STOP_NO_PROGRESS_SYNTHESIZED: &str = "no_progress_synthesized";
 pub const STOP_NO_PROGRESS_EMPTY: &str = "no_progress_empty";
 
 pub const FORCED_SYNTHESIS_NOTE: &str = "\
-[trajectory] Further inspection is not adding enough new evidence. \
+[channel] Further inspection is not adding enough new evidence. \
 Do not call tools. Answer the user now using the evidence already collected. \
 State remaining uncertainty explicitly.";
 
@@ -91,6 +91,12 @@ impl ProgressTracker {
     pub fn clear_synthesis(&mut self) {
         self.inspect_streak = 0;
         self.low_streak = 0;
+    }
+
+    /// Cursor-shaped inspect cap: enough consecutive Read/Grep/Glob hops.
+    /// The loop injects [`FORCED_SYNTHESIS_NOTE`] once; it does not Stop.
+    pub fn inspect_cap_hit(&self) -> bool {
+        self.inspect_streak >= INSPECT_STREAK
     }
 
     /// Count novelty. Do not rewrite successful tool bodies.
@@ -255,6 +261,7 @@ impl ProgressTracker {
 fn is_gate_or_nudge(body: &str) -> bool {
     body.contains("[already observed]")
         || body.contains("[trajectory]")
+        || body.contains("[channel]")
         || body.contains("Already Read")
         || body.contains("Already searched")
         || body.contains("Already located")
@@ -510,11 +517,18 @@ mod tests {
     }
 
     #[test]
+    fn inspect_cap_hit_after_streak() {
+        let mut t = ProgressTracker::default();
+        t.inspect_streak = INSPECT_STREAK - 1;
+        assert!(!t.inspect_cap_hit());
+        t.inspect_streak = INSPECT_STREAK;
+        assert!(t.inspect_cap_hit());
+    }
+
+    #[test]
     fn seen_blobs_keep_real_text() {
-        let dir = std::env::temp_dir().join(format!(
-            "hyper-prog-keep-{}",
-            uuid::Uuid::new_v4().simple()
-        ));
+        let dir =
+            std::env::temp_dir().join(format!("hyper-prog-keep-{}", uuid::Uuid::new_v4().simple()));
         std::fs::create_dir_all(&dir).unwrap();
         let body = "fn ping() {}\n".repeat(20);
         std::fs::write(dir.join("a.rs"), &body).unwrap();

@@ -172,7 +172,7 @@ async fn open_connection(
     });
     let resp = http.post(OPEN_URL).json(&body).send().await?;
     let status = resp.status();
-    let data: Value = resp.json().await.unwrap_or(Value::Null);
+    let data: Value = crate::media::json_or_null(resp).await;
     if !status.is_success() {
         return Err(Error::msg(format!("dingtalk open {status}: {data}")));
     }
@@ -420,11 +420,14 @@ async fn robot_download(
     if url.is_empty() {
         return Err(Error::msg(format!("dingtalk download: {data}")));
     }
-    let bytes = http.get(&url).send().await?.bytes().await?;
-    if bytes.len() > super::xfer::FETCH_CAP {
-        return Err(Error::msg("dingtalk media over cap"));
+    let mut resp = http.get(&url).send().await?;
+    if !resp.status().is_success() {
+        return Err(Error::msg(format!("dingtalk media HTTP {}", resp.status())));
     }
-    Ok(bytes.to_vec())
+    let bytes = crate::media::take_body_capped(&mut resp, super::xfer::FETCH_CAP)
+        .await
+        .map_err(Error::msg)?;
+    Ok(bytes)
 }
 
 fn native_from_chatbot(ep: &ChannelEndpoint, data: &Value) -> Option<NativePayload> {
@@ -631,7 +634,7 @@ fn query_encode(s: &str) -> String {
 async fn post_webhook(http: &reqwest::Client, url: &str, body: &Value) -> Result<()> {
     let resp = http.post(url).json(body).send().await?;
     let status = resp.status();
-    let t = resp.text().await.unwrap_or_default();
+    let t = crate::media::text_or_empty(resp).await;
     if !status.is_success() {
         return Err(Error::msg(format!("dingtalk send {status} {t}")));
     }

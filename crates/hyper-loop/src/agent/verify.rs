@@ -139,7 +139,14 @@ pub fn read_lints_reply(report: &LintReport, paths: &[String]) -> (String, ToolS
             truncate_diag(format!("[diagnostics]\n{s}")),
             ToolState::Success,
         ),
-        LintReport::Incomplete(s) => (s.clone(), ToolState::Success),
+        LintReport::Incomplete(s) => {
+            let text = if s.starts_with("Error:") {
+                s.clone()
+            } else {
+                format!("Error: {s}")
+            };
+            (text, ToolState::Error)
+        }
         LintReport::Cancelled => ("Error: lint check aborted".into(), ToolState::Interrupted),
     }
 }
@@ -229,8 +236,14 @@ pub fn run_lints(root: &Path, edited: &[String], cancel: &CancelFlag) -> LintRep
     let mut checks = Vec::new();
     let mut packages = std::collections::BTreeMap::<String, Vec<String>>::new();
     for path in code.iter().filter(|p| p.ends_with(".rs")) {
-        if let Some((_, name)) = nearest_cargo_package(root, path) {
-            packages.entry(name).or_default().push(path.clone());
+        if let Some((pkg_dir, name)) = nearest_cargo_package(root, path) {
+            if cargo_covers_path(&pkg_dir, root, path) {
+                packages.entry(name).or_default().push(path.clone());
+            } else {
+                checks.push(Check::Skip(format!(
+                    "{path} is not a crate source of `{name}`; cargo check does not compile it. That is not a clean check."
+                )));
+            }
         } else {
             checks.push(Check::Skip(format!("no Cargo.toml package for {path}")));
         }
@@ -611,8 +624,27 @@ fn nearest_cargo_package(root: &Path, rel: &str) -> Option<(PathBuf, String)> {
     None
 }
 
+/// `cargo check -p` only sees files the crate graph compiles (src/, tests/,
+/// examples/, benches/, build.rs). A stray `bad.rs` next to Cargo.toml is not
+/// a clean ReadLints.
+fn cargo_covers_path(pkg_dir: &Path, root: &Path, rel: &str) -> bool {
+    let abs = root.join(rel);
+    let Ok(rel_pkg) = abs.strip_prefix(pkg_dir) else {
+        return false;
+    };
+    let s = rel_pkg.to_string_lossy().replace('\\', "/");
+    if s.is_empty() || s.contains("..") {
+        return false;
+    }
+    matches!(s.as_str(), "build.rs" | "lib.rs" | "main.rs")
+        || s.starts_with("src/")
+        || s.starts_with("tests/")
+        || s.starts_with("examples/")
+        || s.starts_with("benches/")
+}
+
 fn package_name(cargo_toml: &Path) -> Option<String> {
-    let raw = std::fs::read_to_string(cargo_toml).ok()?;
+    let raw = crate::tools::read_text_if_regular(cargo_toml)?;
     let v: toml::Value = raw.parse().ok()?;
     v.get("package")?
         .get("name")?
@@ -902,8 +934,8 @@ mod tests {
             other => panic!("{other:?}"),
         }
         let (text, state) = read_lints_reply(&LintReport::Incomplete(timeout), &["find.rs".into()]);
-        assert_eq!(state, ToolState::Success);
-        assert!(!text.starts_with("Error:"), "{text}");
+        assert_eq!(state, ToolState::Error);
+        assert!(text.starts_with("Error:"), "{text}");
         assert!(text.contains("Not a compiler verdict"), "{text}");
         assert!(!text.contains("No compiler or linter errors"), "{text}");
         let (ok, st) = read_lints_reply(&LintReport::Clean, &["src/lib.rs".into()]);
@@ -945,6 +977,40 @@ mod tests {
             }
             other => panic!("mixed rust+ts without root tsconfig must not look clean: {other:?}"),
         }
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn stray_rs_next_to_cargo_toml_is_not_clean() {
+        let dir = std::env::temp_dir().join(format!(
+            "hyper-lint-stray-{}",
+            uuid::Uuid::new_v4().simple()
+        ));
+        std::fs::create_dir_all(dir.join("src")).unwrap();
+        std::fs::write(
+            dir.join("Cargo.toml"),
+            "[package]\nname = \"lintstray\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
+        )
+        .unwrap();
+        std::fs::write(dir.join("src/lib.rs"), "pub fn ok() {}\n").unwrap();
+        std::fs::write(dir.join("bad.rs"), "fn main() { let x = 1 }\n").unwrap();
+        let report = run_lints(&dir, &["bad.rs".into()], &CancelFlag::new());
+        match report {
+            LintReport::Incomplete(s) => {
+                assert!(s.contains("bad.rs"), "{s}");
+                assert!(
+                    s.contains("not a crate source") || s.contains("does not compile"),
+                    "{s}"
+                );
+                assert!(!s.contains("No compiler or linter errors"), "{s}");
+            }
+            other => panic!("stray rs must not look clean: {other:?}"),
+        }
+        let covered = run_lints(&dir, &["src/lib.rs".into()], &CancelFlag::new());
+        assert!(
+            matches!(covered, LintReport::Clean | LintReport::Findings(_)),
+            "real crate source still checked: {covered:?}"
+        );
         let _ = std::fs::remove_dir_all(dir);
     }
 }

@@ -89,7 +89,11 @@ impl OfficialCompaction {
         }
     }
 
-    pub fn from_persisted(id: impl Into<String>, model: impl Into<String>, blob: impl Into<String>) -> Self {
+    pub fn from_persisted(
+        id: impl Into<String>,
+        model: impl Into<String>,
+        blob: impl Into<String>,
+    ) -> Self {
         Self::from_persist(OfficialPersist {
             id: id.into(),
             model: model.into(),
@@ -577,7 +581,12 @@ pub async fn run_official_compact_input(
     }
     let resp = req.send().await.map_err(|e| Error::Http(e.to_string()))?;
     let status = resp.status();
-    let text = resp.text().await.map_err(|e| Error::Http(e.to_string()))?;
+    let cap = if status.is_success() {
+        crate::media::LLM_JSON_CAP
+    } else {
+        crate::media::HTTP_ERROR_BODY_CAP
+    };
+    let text = crate::media::text_prefix(resp, cap).await;
     if !status.is_success() {
         return Err(Error::Http(format!(
             "responses/compact {status}: {}",
@@ -1174,6 +1183,36 @@ mod tests {
                 .unwrap()
                 .iter()
                 .any(|p| p["type"] == "input_image"),
+            "{input:?}"
+        );
+    }
+
+    #[test]
+    fn computer_use_error_after_screenshot_is_plain_output() {
+        let mut shot = ChatMessage::tool("cu-shot", "screenshot Built-in: image 1280x800");
+        shot.parts = vec![crate::media::MediaPart::image_url(
+            "data:image/jpeg;base64,shot",
+        )];
+        let err = ChatMessage::tool(
+            "cu-click",
+            "Error: the application does not have the permission to simulate input. On macOS grant Screen Recording (screenshot) and Accessibility (click/type) to grok-hyper, Terminal, or this IDE in System Settings → Privacy & Security, then retry.",
+        );
+        let assistant = ChatMessage::assistant_tools(
+            None,
+            vec![serde_json::json!({
+                "id": "cu-click",
+                "type": "function",
+                "function": {"name": "ComputerUse", "arguments": "{\"action\":\"click\",\"x\":1,\"y\":1}"}
+            })],
+        );
+        let input = messages_to_responses_input(&[shot, assistant, err]);
+        assert!(
+            input.iter().any(|i| {
+                i["type"] == "function_call_output"
+                    && i["call_id"] == "cu-click"
+                    && i["output"].is_string()
+                    && i["output"].as_str().unwrap().contains("permission")
+            }),
             "{input:?}"
         );
     }

@@ -111,7 +111,19 @@ pub fn filter_tool(call: &ToolCall, child: Option<&ChildCtx>) -> Option<ToolResp
 pub async fn dispatch(call: &ToolCall, ctx: &DispatchCtx) -> ToolResponse {
     match crate::tools_schema::dispatch_name(&call.name) {
         "task" => dispatch_task(call, ctx).await,
-        "awaitshell" => dispatch_await(call, ctx).await,
+        "awaitshell" => {
+            if call
+                .arguments
+                .get("task_ids")
+                .or_else(|| call.arguments.get("ids"))
+                .and_then(|v| v.as_array())
+                .is_some()
+            {
+                dispatch_wait_many(call).await
+            } else {
+                dispatch_await(call, ctx).await
+            }
+        }
         _ => match call.name.as_str() {
             "wait_commands_or_subagents" => dispatch_wait_many(call).await,
             "kill_command_or_subagent" => dispatch_kill(call),
@@ -466,14 +478,39 @@ async fn dispatch_wait_many(call: &ToolCall) -> ToolResponse {
             .unwrap_or(DEFAULT_AWAIT_TIMEOUT),
     );
     let recs = registry::wait_many(&ids, timeout).await;
-    let body = recs
+    let missing: Vec<&str> = ids
+        .iter()
+        .filter(|id| !recs.iter().any(|r| r.id == **id))
+        .map(|s| s.as_str())
+        .collect();
+    let mut body = recs
         .iter()
         .map(record_text)
         .collect::<Vec<_>>()
         .join("\n\n---\n\n");
+    if !missing.is_empty() {
+        if !body.is_empty() {
+            body.push_str("\n\n---\n\n");
+        }
+        body.push_str(&format!(
+            "Error: subagent not found: {}.",
+            missing.join(", ")
+        ));
+    }
     let state = if recs
         .iter()
         .any(|r| r.status == registry::ChildStatus::Running)
+    {
+        ToolState::Interrupted
+    } else if recs
+        .iter()
+        .any(|r| r.status == registry::ChildStatus::Failed)
+        || !missing.is_empty()
+    {
+        ToolState::Error
+    } else if recs
+        .iter()
+        .any(|r| r.status == registry::ChildStatus::Cancelled)
     {
         ToolState::Interrupted
     } else {
@@ -588,8 +625,10 @@ fn format_record(call_id: &str, rec: Option<registry::ChildRecord>) -> ToolRespo
         Some(r) => {
             let state = match r.status {
                 registry::ChildStatus::Failed => ToolState::Error,
-                registry::ChildStatus::Running => ToolState::Interrupted,
-                _ => ToolState::Success,
+                registry::ChildStatus::Running | registry::ChildStatus::Cancelled => {
+                    ToolState::Interrupted
+                }
+                registry::ChildStatus::Done => ToolState::Success,
             };
             ToolResponse::text(call_id, record_text(&r), state)
         }
@@ -645,7 +684,11 @@ fn arg_bool(args: &Value, key: &str) -> Option<bool> {
 
 fn arg_u64(args: &Value, key: &str) -> Option<u64> {
     match args.get(key) {
-        Some(Value::Number(n)) => n.as_u64(),
+        Some(Value::Number(n)) => n.as_u64().or_else(|| {
+            n.as_f64()
+                .filter(|f| f.is_finite() && *f >= 0.0)
+                .map(|f| f.min(u64::MAX as f64) as u64)
+        }),
         Some(Value::String(s)) => s.parse().ok(),
         _ => None,
     }
@@ -746,6 +789,90 @@ mod tests {
             .and_then(|l| l.split(" id=").nth(1))
             .unwrap_or("")
             .to_string()
+    }
+
+    #[tokio::test]
+    async fn wait_many_failed_child_is_error_not_success() {
+        let _g = lock_registry_for_test().await;
+        registry::clear();
+        let handle = registry::insert_running(
+            "child-fail-1".into(),
+            "sess".into(),
+            "boom".into(),
+            SubagentType::GeneralPurpose,
+            CapabilityMode::from_kind(SubagentType::GeneralPurpose),
+            Isolation::Auto,
+            None,
+        )
+        .unwrap();
+        registry::finish(
+            &handle.id,
+            registry::ChildStatus::Failed,
+            String::new(),
+            Vec::new(),
+            Some("child crashed".into()),
+        );
+        let resp = dispatch(
+            &call(
+                "wait_commands_or_subagents",
+                json!({"task_ids": ["child-fail-1"]}),
+            ),
+            &parent_ctx(PathBuf::from("/tmp")),
+        )
+        .await;
+        let t = resp.joined_text();
+        assert_eq!(resp.state, ToolState::Error, "{t}");
+        assert!(t.contains("failed") || t.contains("child crashed"), "{t}");
+        registry::clear();
+    }
+
+    #[tokio::test]
+    async fn wait_many_missing_ids_is_error_not_empty_success() {
+        let _g = lock_registry_for_test().await;
+        registry::clear();
+        let resp = dispatch(
+            &call(
+                "wait_commands_or_subagents",
+                json!({"task_ids": ["no-such-child"]}),
+            ),
+            &parent_ctx(PathBuf::from("/tmp")),
+        )
+        .await;
+        let t = resp.joined_text();
+        assert_eq!(resp.state, ToolState::Error, "{t}");
+        assert!(t.contains("not found"), "{t}");
+        registry::clear();
+    }
+
+    #[tokio::test]
+    async fn await_cancelled_child_is_interrupted() {
+        let _g = lock_registry_for_test().await;
+        registry::clear();
+        let handle = registry::insert_running(
+            "child-cancel-1".into(),
+            "sess".into(),
+            "stop".into(),
+            SubagentType::GeneralPurpose,
+            CapabilityMode::from_kind(SubagentType::GeneralPurpose),
+            Isolation::Auto,
+            None,
+        )
+        .unwrap();
+        registry::finish(
+            &handle.id,
+            registry::ChildStatus::Cancelled,
+            String::new(),
+            Vec::new(),
+            None,
+        );
+        let resp = dispatch(
+            &call("AwaitShell", json!({"task_id": "child-cancel-1"})),
+            &parent_ctx(PathBuf::from("/tmp")),
+        )
+        .await;
+        let t = resp.joined_text();
+        assert_eq!(resp.state, ToolState::Interrupted, "{t}");
+        registry::clear();
     }
 
     #[tokio::test]

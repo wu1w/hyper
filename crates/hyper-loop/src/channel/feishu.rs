@@ -43,6 +43,9 @@ fn feishu_trace(msg: impl std::fmt::Display) {
     if let Some(dir) = path.parent() {
         let _ = std::fs::create_dir_all(dir);
     }
+    if crate::tools::is_special_file(&path) {
+        return;
+    }
     if let Ok(mut f) = std::fs::OpenOptions::new()
         .create(true)
         .append(true)
@@ -348,7 +351,7 @@ pub(crate) async fn settle_choices(
         .send()
         .await?;
     let status = resp.status();
-    let data: Value = resp.json().await.unwrap_or(Value::Null);
+    let data: Value = crate::media::json_or_null(resp).await;
     let code = data.get("code").and_then(Value::as_i64).unwrap_or(-1);
     if status.is_success() && code == 0 {
         return Ok(());
@@ -799,8 +802,7 @@ fn load_catchup() -> CatchupStore {
     let Some(p) = catchup_path() else {
         return CatchupStore::default();
     };
-    std::fs::read_to_string(p)
-        .ok()
+    crate::tools::read_text_if_regular(&p)
         .and_then(|s| serde_json::from_str(&s).ok())
         .unwrap_or_default()
 }
@@ -809,11 +811,14 @@ fn save_catchup(store: &CatchupStore) {
     let Some(p) = catchup_path() else {
         return;
     };
+    if crate::tools::is_special_file(&p) {
+        return;
+    }
     if let Some(dir) = p.parent() {
         let _ = std::fs::create_dir_all(dir);
     }
     if let Ok(s) = serde_json::to_string(store) {
-        let _ = std::fs::write(p, s);
+        let _ = crate::tools::write_if_regular(&p, s);
     }
 }
 
@@ -1054,7 +1059,7 @@ async fn list_bot_chats(api: &FeishuApi, token: &str) -> Result<Vec<(String, boo
             .send()
             .await?;
         let status = resp.status();
-        let data: Value = resp.json().await.unwrap_or(Value::Null);
+        let data: Value = crate::media::json_or_null(resp).await;
         if !status.is_success() {
             if out.is_empty() {
                 return Err(Error::msg(format!(
@@ -1205,7 +1210,7 @@ async fn list_chat_messages(api: &FeishuApi, token: &str, chat_id: &str) -> Resu
         .send()
         .await?;
     let status = resp.status();
-    let data: Value = resp.json().await.unwrap_or(Value::Null);
+    let data: Value = crate::media::json_or_null(resp).await;
     if !status.is_success() {
         return Err(Error::msg(format!(
             "feishu list messages HTTP {status} msg={}",
@@ -1262,7 +1267,7 @@ async fn post_ws_url(http: &reqwest::Client, url: &str, body: Value) -> Result<S
         .send()
         .await?;
     let status = resp.status();
-    let data: Value = resp.json().await.unwrap_or(Value::Null);
+    let data: Value = crate::media::json_or_null(resp).await;
     if !status.is_success() {
         let code = data.get("code").cloned().unwrap_or(Value::Null);
         let msg = js_str(&data["msg"]);
@@ -1569,7 +1574,7 @@ async fn patch_text(
         .send()
         .await?;
     let status = resp.status();
-    let data: Value = resp.json().await.unwrap_or(Value::Null);
+    let data: Value = crate::media::json_or_null(resp).await;
     let code = data.get("code").and_then(Value::as_i64).unwrap_or(-1);
     if status.is_success() && code == 0 {
         return Ok(());
@@ -1596,7 +1601,7 @@ async fn patch_text(
             .send()
             .await?;
         let status = resp.status();
-        let data: Value = resp.json().await.unwrap_or(Value::Null);
+        let data: Value = crate::media::json_or_null(resp).await;
         let code = data.get("code").and_then(Value::as_i64).unwrap_or(-1);
         if status.is_success() && code == 0 {
             return Ok(());
@@ -1758,7 +1763,7 @@ async fn upload_form(
         .send()
         .await?;
     let status = resp.status();
-    let data: Value = resp.json().await.unwrap_or(Value::Null);
+    let data: Value = crate::media::json_or_null(resp).await;
     let code = data.get("code").and_then(Value::as_i64).unwrap_or(-1);
     if status.is_success() && code == 0 {
         let key = js_str(&data["data"][key_field]);
@@ -1832,7 +1837,7 @@ async fn send_im(
             }
         };
         let status = resp.status();
-        let data: Value = resp.json().await.unwrap_or(Value::Null);
+        let data: Value = crate::media::json_or_null(resp).await;
         let code = data.get("code").and_then(Value::as_i64).unwrap_or(-1);
         if status.is_success() && code == 0 {
             remember_from_send(env, &data);
@@ -2119,7 +2124,7 @@ async fn download_resource(
         urlencoding_seg(key),
         urlencoding_seg(ty)
     );
-    let resp = api
+    let mut resp = api
         .http
         .get(&url)
         .header("Authorization", format!("Bearer {token}"))
@@ -2148,10 +2153,9 @@ async fn download_resource(
             "file.bin".into()
         }
     });
-    let bytes = resp.bytes().await?;
-    if bytes.len() > super::xfer::FETCH_CAP {
-        return Err(Error::msg("feishu resource over cap"));
-    }
+    let bytes = crate::media::take_body_capped(&mut resp, super::xfer::FETCH_CAP)
+        .await
+        .map_err(Error::msg)?;
     let kind = super::xfer::kind_from_mime_name(&mime, &name);
     let mime = if mime.is_empty() {
         super::xfer::guess_mime(&name, kind).to_string()
@@ -2162,7 +2166,7 @@ async fn download_resource(
         kind,
         mime,
         name,
-        bytes: bytes.to_vec(),
+        bytes,
     })
 }
 

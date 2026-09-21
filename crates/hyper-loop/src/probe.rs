@@ -309,7 +309,8 @@ pub async fn fetch_model(client: &Client, cfg: &Config) -> Result<(String, Optio
         req = req.bearer_auth(resolved.token());
     }
     req = crate::transport::apply_grok_headers(req, resolved.mode);
-    let v: Value = req.send().await?.error_for_status()?.json().await?;
+    let resp = req.send().await?.error_for_status()?;
+    let v: Value = crate::media::json_result(resp).await.map_err(Error::Http)?;
     let data = v
         .get("data")
         .and_then(|d| d.as_array())
@@ -399,7 +400,10 @@ async fn complete_chat(
     if !cfg.server.api_key.is_empty() {
         req = req.bearer_auth(&cfg.server.api_key);
     }
-    let v: Value = req.send().await?.error_for_status()?.json().await?;
+    let resp = req.send().await?.error_for_status()?;
+    let v: Value = crate::media::json_result_capped(resp, crate::media::LLM_JSON_CAP)
+        .await
+        .map_err(Error::Http)?;
     if let Some(err) = crate::llm_http::json_api_error(&v) {
         return Err(Error::Http(err.to_string()));
     }
@@ -879,7 +883,9 @@ async fn complete_messages(
     }
     let resp = req.send().await?;
     let status = resp.status();
-    let v: Value = resp.json().await?;
+    let v: Value = crate::media::json_result_capped(resp, crate::media::LLM_JSON_CAP)
+        .await
+        .map_err(Error::Http)?;
     if !status.is_success() {
         return Err(Error::Http(format!("{status}: {v}")));
     }
@@ -993,11 +999,17 @@ fn unix_now() -> u64 {
 
 pub fn write_report(report: &ProbeReport) -> Result<std::path::PathBuf> {
     let path = Config::probe_path()?;
+    if crate::tools::is_special_file(&path) {
+        return Err(Error::msg(format!(
+            "{} is not a regular file",
+            path.display()
+        )));
+    }
     if let Some(dir) = path.parent() {
         std::fs::create_dir_all(dir)?;
     }
     let json = serde_json::to_string_pretty(report).map_err(|e| Error::msg(e))?;
-    std::fs::write(&path, json)?;
+    crate::tools::write_if_regular(&path, json)?;
     Ok(path)
 }
 

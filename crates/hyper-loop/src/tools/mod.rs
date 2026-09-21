@@ -34,11 +34,15 @@ pub(super) const STALE_TMP_MAX_AGE: Duration = Duration::from_secs(300);
 pub(crate) use bash::cat_like_path;
 pub use code_index::{
     bash_search_query, render_query_spans, run_search, search_dump_too_big, CodeIndex,
-    SEARCH_WARMING,
+    SEARCH_EMPTY, SEARCH_FAILED, SEARCH_SKIPPED,
 };
 pub(crate) use find::{is_unfiltered_tree_glob, shallow_listing, GLOB_TREE_MSG};
 pub use fold::{fold_text, BlobStore, Folded};
-pub use path::{is_reparse_or_symlink, Workspace};
+pub(crate) use path::io_user_msg;
+pub use path::{
+    is_oversized_text, is_reparse_or_symlink, is_special_file, open_read_nonblock,
+    read_bytes_capped, read_bytes_regular, read_text_if_regular, write_if_regular, Workspace,
+};
 pub use view::view;
 pub use web::WebRunner;
 
@@ -123,28 +127,20 @@ pub async fn run_tool(
     inherit_env: bool,
     blobs: Option<&BlobStore>,
 ) -> ToolResponse {
-    match crate::tools_schema::dispatch_name(&call.name) {
-        "read" => {
-            if crate::tools::arg_path(&call.arguments)
-                .is_some_and(|p| crate::media::is_media_ext(&p))
-            {
-                return view::view(
-                    workspace,
-                    call,
-                    &crate::media::MediaCaps::default(),
-                    &crate::media::MediaBins::detect(),
-                    crate::media::MAX_INLINE_MEDIA_BYTES,
-                )
-                .await;
-            }
-            fs::read_file(workspace, call, limits, blobs)
-        }
-        "write" => fs::write_file(workspace, call),
-        "edit" => fs::edit_file(workspace, call),
-        "delete" => fs::delete_file(workspace, call),
-        "glob" => find::glob_files(workspace, call, limits),
-        "grep" => find::grep_files(workspace, call, limits, blobs),
-        "todowrite" => todo::todo_write(workspace, call),
+    let name = crate::tools_schema::dispatch_name(&call.name);
+    if name == "read"
+        && crate::tools::arg_path(&call.arguments).is_some_and(|p| crate::media::is_media_ext(&p))
+    {
+        return view::view(
+            workspace,
+            call,
+            &crate::media::MediaCaps::default(),
+            &crate::media::MediaBins::detect(),
+            crate::media::MAX_INLINE_MEDIA_BYTES,
+        )
+        .await;
+    }
+    match name {
         "task" | "awaitshell" => {
             let mut owned = call.clone();
             owned.name = if crate::tools_schema::dispatch_name(&call.name) == "task" {
@@ -158,7 +154,6 @@ pub async fn run_tool(
             )
             .await
         }
-        "editnotebook" => notebook::edit_notebook(workspace, call),
         "bash" => bash::bash(workspace, call, cancel, limits, blobs).await,
         "run_code" => run_code::run_code(workspace, call, cancel, limits, inherit_env, blobs).await,
         "view" => {
@@ -172,6 +167,45 @@ pub async fn run_tool(
             .await
         }
         "computeruse" => computer::computer_use(call, cancel, "").await,
+        "read" | "write" | "edit" | "delete" | "glob" | "grep" | "todowrite" | "editnotebook" => {
+            let ws = workspace.clone();
+            let owned = call.clone();
+            let blobs = blobs.cloned();
+            let id = call.id.clone();
+            match tokio::task::spawn_blocking(move || {
+                run_sync_tool(&ws, &owned, limits, blobs.as_ref())
+            })
+            .await
+            {
+                Ok(r) => r,
+                Err(_) => {
+                    ToolResponse::text(&id, "Error: tool task aborted", ToolState::Interrupted)
+                }
+            }
+        }
+        other => ToolResponse::text(
+            &call.id,
+            format!("Error: unknown tool '{other}'."),
+            ToolState::Error,
+        ),
+    }
+}
+
+fn run_sync_tool(
+    workspace: &Workspace,
+    call: &ToolCall,
+    limits: ToolLimits,
+    blobs: Option<&BlobStore>,
+) -> ToolResponse {
+    match crate::tools_schema::dispatch_name(&call.name) {
+        "read" => fs::read_file(workspace, call, limits, blobs),
+        "write" => fs::write_file(workspace, call),
+        "edit" => fs::edit_file(workspace, call),
+        "delete" => fs::delete_file(workspace, call),
+        "glob" => find::glob_files(workspace, call, limits),
+        "grep" => find::grep_files(workspace, call, limits, blobs),
+        "todowrite" => todo::todo_write(workspace, call),
+        "editnotebook" => notebook::edit_notebook(workspace, call),
         other => ToolResponse::text(
             &call.id,
             format!("Error: unknown tool '{other}'."),
@@ -232,7 +266,14 @@ pub(crate) fn arg_new_string(args: &Value) -> Option<String> {
 
 pub(crate) fn arg_u32(args: &Value, key: &str) -> Option<u32> {
     match args.get(key) {
-        Some(Value::Number(n)) => n.as_u64().map(|v| v as u32),
+        Some(Value::Number(n)) => n
+            .as_u64()
+            .and_then(|v| u32::try_from(v).ok())
+            .or_else(|| {
+                n.as_f64()
+                    .filter(|f| f.is_finite() && *f >= 0.0)
+                    .map(|f| f.min(u32::MAX as f64) as u32)
+            }),
         Some(Value::String(s)) => s.parse().ok(),
         _ => None,
     }
@@ -271,6 +312,14 @@ mod tests {
             name: name.into(),
             arguments: args,
         }
+    }
+
+    #[test]
+    fn arg_u32_accepts_float_and_clamps() {
+        assert_eq!(arg_u32(&json!({"n": 1500.0}), "n"), Some(1500));
+        assert_eq!(arg_u32(&json!({"n": "400"}), "n"), Some(400));
+        assert_eq!(arg_u32(&json!({"n": -1}), "n"), None);
+        assert_eq!(arg_u32(&json!({"n": 5_000_000_000u64}), "n"), Some(u32::MAX));
     }
 
     #[test]
@@ -416,6 +465,72 @@ mod tests {
         );
         assert_eq!(out.state, ToolState::Error);
         assert!(out.joined_text().contains("workspace"));
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn unconfined_write_follows_file_symlink() {
+        use std::os::unix::fs::symlink;
+        let dir =
+            std::env::temp_dir().join(format!("hyper-tools-{}", uuid::Uuid::new_v4().simple()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let real = dir.join("real.txt");
+        std::fs::write(&real, "TARGET\n").unwrap();
+        symlink("real.txt", dir.join("alias.txt")).unwrap();
+        let ws = Workspace::open(&dir, false).unwrap();
+        let out = fs::write_file(
+            &ws,
+            &call("Write", json!({"path": "alias.txt", "contents": "NEW\n"})),
+        );
+        assert_eq!(out.state, ToolState::Success, "{}", out.joined_text());
+        assert_eq!(std::fs::read_to_string(&real).unwrap(), "NEW\n");
+        assert!(
+            dir.join("alias.txt")
+                .symlink_metadata()
+                .unwrap()
+                .file_type()
+                .is_symlink(),
+            "Write must not replace the symlink with a regular file"
+        );
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn unconfined_delete_unlinks_symlink_not_target() {
+        use std::os::unix::fs::symlink;
+        let dir =
+            std::env::temp_dir().join(format!("hyper-tools-{}", uuid::Uuid::new_v4().simple()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let real = dir.join("real.txt");
+        std::fs::write(&real, "KEEP\n").unwrap();
+        symlink("real.txt", dir.join("alias.txt")).unwrap();
+        let ws = Workspace::open(&dir, false).unwrap();
+        let out = fs::delete_file(&ws, &call("Delete", json!({"path": "alias.txt"})));
+        assert_eq!(out.state, ToolState::Success, "{}", out.joined_text());
+        assert!(!dir.join("alias.txt").symlink_metadata().is_ok());
+        assert_eq!(std::fs::read_to_string(&real).unwrap(), "KEEP\n");
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn confined_delete_unlinks_outbound_file_symlink() {
+        use std::os::unix::fs::symlink;
+        let dir =
+            std::env::temp_dir().join(format!("hyper-tools-{}", uuid::Uuid::new_v4().simple()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let outside =
+            std::env::temp_dir().join(format!("hyper-del-out-{}", uuid::Uuid::new_v4().simple()));
+        std::fs::write(&outside, "SECRET\n").unwrap();
+        symlink(&outside, dir.join("leak.txt")).unwrap();
+        let ws = Workspace::open(&dir, true).unwrap();
+        let out = fs::delete_file(&ws, &call("Delete", json!({"path": "leak.txt"})));
+        assert_eq!(out.state, ToolState::Success, "{}", out.joined_text());
+        assert!(!dir.join("leak.txt").symlink_metadata().is_ok());
+        assert_eq!(std::fs::read_to_string(&outside).unwrap(), "SECRET\n");
+        let _ = std::fs::remove_file(&outside);
         let _ = std::fs::remove_dir_all(dir);
     }
 

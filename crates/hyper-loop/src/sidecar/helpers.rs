@@ -11,9 +11,7 @@ use crate::policy::ThinkPolicy;
 use crate::prompt::{coding_prompt, periphery_section, session_prompt};
 use crate::session::{tools_hash, SessionMode, SessionStart, SlashCmd};
 use crate::skills::SkillCatalog;
-use crate::tools_schema::{
-    agent_tools, code_tools, computer_use_tool, dynamic_mcp_tools, search_tool, view_tool,
-};
+use crate::tools_schema::{agent_tools, code_tools, dynamic_mcp_tools, search_tool, view_tool};
 
 use super::types::{PolicyCaps, RpcError};
 
@@ -205,11 +203,11 @@ pub(crate) fn sidecar_agent_surface(
         tools.push(view_tool());
     }
     if cfg.features.computer_use {
-        tools.push(computer_use_tool());
+        tools.push(crate::tools::computer::tool_schema());
     }
     let skills_md = if cfg.features.skills_auto_catalog {
         SkillCatalog::load(home.unwrap_or_else(|| std::path::Path::new("")), workspace)
-            .catalog_markdown()
+            .catalog_markdown_for(Some(workspace))
     } else {
         String::new()
     };

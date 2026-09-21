@@ -16,6 +16,9 @@ use std::path::{Path, PathBuf};
 use crate::tool_calls::{ToolCall, ToolResponse, ToolState};
 use crate::tools::{arg_str, folded_response, BlobStore, ToolLimits};
 
+const MAX_CATALOG_SKILLS: usize = 24;
+const MAX_CATALOG_CHARS: usize = 1600;
+
 #[derive(Clone, Debug)]
 pub struct Skill {
     pub name: String,
@@ -68,19 +71,45 @@ impl SkillCatalog {
     }
 
     /// One name + trigger line each. Empty when there are no skills.
+    /// Workspace skills first; home dumps (dozens of Cursor skills) are capped
+    /// so every hop does not pay for the full `~/.cursor/skills` list.
     pub fn catalog_markdown(&self) -> String {
+        self.catalog_markdown_for(None)
+    }
+
+    pub fn catalog_markdown_for(&self, workspace: Option<&Path>) -> String {
         if self.skills.is_empty() {
             return String::new();
         }
+        let mut items: Vec<&Skill> = self.skills.iter().collect();
+        items.sort_by(|a, b| {
+            let a_ws = workspace.is_some_and(|ws| a.path.starts_with(ws));
+            let b_ws = workspace.is_some_and(|ws| b.path.starts_with(ws));
+            b_ws.cmp(&a_ws).then_with(|| {
+                a.name
+                    .to_ascii_lowercase()
+                    .cmp(&b.name.to_ascii_lowercase())
+            })
+        });
         let mut s = String::from("skills:\n");
-        for sk in &self.skills {
+        let mut shown = 0usize;
+        for sk in items {
             let trig = if sk.description.is_empty() {
                 "on demand"
             } else {
                 sk.description.trim()
             };
             let trig: String = trig.chars().take(40).collect();
-            s.push_str(&format!("- {}: {}\n", sk.name, trig));
+            let line = format!("- {}: {}\n", sk.name, trig);
+            if shown >= MAX_CATALOG_SKILLS || s.len() + line.len() > MAX_CATALOG_CHARS {
+                break;
+            }
+            s.push_str(&line);
+            shown += 1;
+        }
+        let rest = self.skills.len().saturating_sub(shown);
+        if rest > 0 {
+            s.push_str(&format!("… {rest} more; name a skill to load it.\n"));
         }
         s
     }
@@ -118,14 +147,42 @@ pub fn run_skill(
             ToolState::Error,
         );
     };
-    match std::fs::read_to_string(&sk.path) {
-        Ok(body) => folded_response(&call.id, body, ToolState::Success, limits, blobs),
-        Err(e) => ToolResponse::text(&call.id, format!("Error: {e}"), ToolState::Error),
+    if crate::tools::is_special_file(&sk.path) {
+        return ToolResponse::text(
+            &call.id,
+            format!("Error: skill '{name}' is not a regular file."),
+            ToolState::Error,
+        );
+    }
+    if crate::tools::is_oversized_text(&sk.path) {
+        return ToolResponse::text(
+            &call.id,
+            format!("Error: skill '{name}' is too large to load."),
+            ToolState::Error,
+        );
+    }
+    match crate::tools::read_bytes_regular(&sk.path) {
+        Ok(bytes) => match String::from_utf8(bytes) {
+            Ok(body) => folded_response(&call.id, body, ToolState::Success, limits, blobs),
+            Err(_) => ToolResponse::text(
+                &call.id,
+                format!("Error: skill '{name}' is not valid UTF-8 text."),
+                ToolState::Error,
+            ),
+        },
+        Err(e) => ToolResponse::text(
+            &call.id,
+            format!("Error: {}", crate::tools::io_user_msg(&e)),
+            ToolState::Error,
+        ),
     }
 }
 
 pub fn hidden_card(skill: &Skill) -> Option<String> {
-    let raw = std::fs::read_to_string(&skill.path).ok()?;
+    if crate::tools::is_special_file(&skill.path) || crate::tools::is_oversized_text(&skill.path) {
+        return None;
+    }
+    let raw = crate::tools::read_text_if_regular(&skill.path)?;
     let body = strip_frontmatter(&raw);
     if body.is_empty() {
         return None;
@@ -236,7 +293,7 @@ fn scan_dir(dir: PathBuf, out: &mut Vec<Skill>) {
 }
 
 fn parse_skill(path: &Path) -> Option<Skill> {
-    let raw = std::fs::read_to_string(path).ok()?;
+    let raw = crate::tools::read_text_if_regular(path)?;
     let dir_name = path
         .parent()
         .and_then(|p| p.file_name())
@@ -309,6 +366,102 @@ mod tests {
         };
         let loaded = run_skill(&cat, &call, crate::tools::ToolLimits::default(), None);
         assert!(loaded.joined_text().contains("Use pdftotext"));
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn catalog_markdown_caps_home_dump_and_prefers_workspace() {
+        let ws = PathBuf::from("/tmp/hyper-ws-skills");
+        let mut skills = Vec::new();
+        for i in 0..40 {
+            skills.push(Skill {
+                name: format!("home-{i:02}"),
+                description: "x".repeat(40),
+                path: PathBuf::from(format!("/home/u/.cursor/skills/home-{i:02}/SKILL.md")),
+            });
+        }
+        skills.push(Skill {
+            name: "proj-skill".into(),
+            description: "workspace only".into(),
+            path: ws.join(".cursor/skills/proj-skill/SKILL.md"),
+        });
+        let cat = SkillCatalog { skills };
+        let md = cat.catalog_markdown_for(Some(&ws));
+        assert!(md.starts_with("skills:"), "{md}");
+        assert!(md.contains("proj-skill"), "{md}");
+        let proj_at = md.find("proj-skill").unwrap();
+        let home_at = md.find("home-").unwrap_or(md.len());
+        assert!(proj_at < home_at, "workspace skill must list first:\n{md}");
+        assert!(md.contains("more; name a skill to load it"), "{md}");
+        assert!(md.len() <= MAX_CATALOG_CHARS + 80, "len={}", md.len());
+        let listed = md.lines().filter(|l| l.starts_with("- ")).count();
+        assert!(listed <= MAX_CATALOG_SKILLS, "listed={listed}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn run_skill_fifo_is_error_not_hang() {
+        let dir =
+            std::env::temp_dir().join(format!("hyper-sk-fifo-{}", uuid::Uuid::new_v4().simple()));
+        let skill_dir = dir.join("skills").join("pipe");
+        std::fs::create_dir_all(&skill_dir).unwrap();
+        std::fs::write(
+            skill_dir.join("SKILL.md"),
+            "---\nname: pipe\ndescription: tmp\n---\nbody\n",
+        )
+        .unwrap();
+        let cat = SkillCatalog::load(&dir, &dir);
+        let fifo = skill_dir.join("SKILL.md");
+        std::fs::remove_file(&fifo).unwrap();
+        let st = std::process::Command::new("mkfifo")
+            .arg(&fifo)
+            .status()
+            .unwrap();
+        assert!(st.success());
+        let call = crate::tool_calls::ToolCall {
+            id: "1".into(),
+            name: "skill".into(),
+            arguments: serde_json::json!({"name": "pipe"}),
+        };
+        let started = std::time::Instant::now();
+        let loaded = run_skill(&cat, &call, crate::tools::ToolLimits::default(), None);
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(2),
+            "FIFO skill must not block: {:?}",
+            started.elapsed()
+        );
+        assert_eq!(loaded.state, ToolState::Error);
+        assert!(
+            loaded.joined_text().contains("not a regular file"),
+            "{}",
+            loaded.joined_text()
+        );
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn catalog_skips_fifo_skill_md() {
+        let dir = std::env::temp_dir().join(format!(
+            "hyper-sk-cat-fifo-{}",
+            uuid::Uuid::new_v4().simple()
+        ));
+        let skill_dir = dir.join("skills").join("pipe");
+        std::fs::create_dir_all(&skill_dir).unwrap();
+        let fifo = skill_dir.join("SKILL.md");
+        let st = std::process::Command::new("mkfifo")
+            .arg(&fifo)
+            .status()
+            .unwrap();
+        assert!(st.success());
+        let started = std::time::Instant::now();
+        let cat = SkillCatalog::load(&dir, &dir);
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(2),
+            "FIFO SKILL.md catalog must not block: {:?}",
+            started.elapsed()
+        );
+        assert!(cat.get("pipe").is_none());
         let _ = std::fs::remove_dir_all(dir);
     }
 

@@ -1,5 +1,8 @@
 //! User-turn ReAct loop: run / drive / finish, dump detection, effort, logging.
 
+use std::panic::AssertUnwindSafe;
+
+use futures::FutureExt;
 use serde_json::Value;
 
 use super::dispatch::{
@@ -62,12 +65,57 @@ impl<C: Completer> Agent<C> {
 
     /// Drive an already-hydrated transcript (last message is the live user).
     pub async fn drive(&mut self) -> Result<AgentOutcome> {
+        crate::panic_diag::install_once();
         self.begin_run();
-        let result = self.drive_inner().await;
-        if let Err(err) = &result {
-            self.end_run(RunPhase::Error, Some(err.to_string()));
+        match AssertUnwindSafe(self.drive_inner()).catch_unwind().await {
+            Ok(Ok(out)) => Ok(out),
+            Ok(Err(err)) => {
+                self.end_run(RunPhase::Error, Some(err.to_string()));
+                Err(err)
+            }
+            Err(payload) => {
+                let rec = crate::panic_diag::take();
+                let msg = crate::panic_diag::format_user_message(&*payload, rec.as_ref());
+                let (run_id, turn_id) = self
+                    .lifecycle_ids()
+                    .unwrap_or_else(|| ("-".into(), "-".into()));
+                let last_tool = self.last_scheduled_tool();
+                let summary = crate::panic_diag::summary_line(
+                    &run_id,
+                    &turn_id,
+                    self.current_step,
+                    last_tool.as_deref(),
+                    rec.as_ref(),
+                    &msg,
+                );
+                self.emit_step(StepPhase::Error, Some(msg.clone()), None);
+                self.log_event(SessionEvent::context("panic", summary.clone()));
+                self.end_run(RunPhase::Error, Some(msg.clone()));
+                crate::panic_diag::write_desktop_log(rec.as_ref(), &summary);
+                Err(crate::error::Error::msg(format!(
+                    "internal error: turn task panicked: {msg}"
+                )))
+            }
         }
-        result
+    }
+
+    fn last_scheduled_tool(&self) -> Option<String> {
+        for m in self.messages.iter().rev() {
+            let Some(calls) = &m.tool_calls else {
+                continue;
+            };
+            let Some(c) = calls.last() else {
+                continue;
+            };
+            let name = c
+                .pointer("/function/name")
+                .and_then(|v| v.as_str())
+                .or_else(|| c.get("name").and_then(|v| v.as_str()));
+            if let Some(n) = name.filter(|s| !s.is_empty()) {
+                return Some(n.to_string());
+            }
+        }
+        None
     }
 
     async fn drive_inner(&mut self) -> Result<AgentOutcome> {
@@ -81,6 +129,7 @@ impl<C: Completer> Agent<C> {
         self.watchdog_roomy_tried = false;
         self.wrap_up_after_tools = false;
         self.stub_nudged = false;
+        self.synthesis_nudged = false;
         self.length_truncations = 0;
         self.turn_steps = 0;
         self.turn_prompt_tokens = 0;
@@ -180,10 +229,7 @@ impl<C: Completer> Agent<C> {
         let (text, stop_reason) = match cause {
             StopCause::Aborted => (String::new(), Some("aborted".into())),
             StopCause::Deliver { text, reason } => (text, reason),
-            StopCause::Exhausted => (
-                self.last_spoken.clone().unwrap_or_default(),
-                None,
-            ),
+            StopCause::Exhausted => (self.last_spoken.clone().unwrap_or_default(), None),
         };
         self.finish(text, stop_reason, self.turn_steps)
     }
@@ -377,9 +423,7 @@ impl<C: Completer> Agent<C> {
 
         self.emit_tools_scheduled(&turn.tool_calls);
         self.push_assistant(turn);
-        if turn.tool_calls.is_empty() && crate::stutter::is_substantial_reply(&turn.content) {
-            self.last_spoken = Some(turn.content.clone());
-        }
+        self.remember_spoken(turn);
         let decision = self.gate_decision(turn);
 
         if !turn.tool_calls.is_empty() {
@@ -479,6 +523,15 @@ impl<C: Completer> Agent<C> {
             && !turn.content.trim().is_empty()
             && !crate::stutter::is_progress_narration(&turn.content)
             && !crate::stutter::is_leaked_write_narration(&turn.content)
+    }
+
+    fn remember_spoken(&mut self, turn: &ModelTurn) {
+        if crate::stutter::is_substantial_reply(&turn.content)
+            && !crate::stutter::is_progress_narration(&turn.content)
+            && !crate::stutter::is_leaked_write_narration(&turn.content)
+        {
+            self.last_spoken = Some(turn.content.clone());
+        }
     }
 
     fn rescue_incomplete(&mut self, turn: &ModelTurn) -> Verdict {
@@ -857,11 +910,9 @@ impl<C: Completer> Agent<C> {
     }
 
     pub(crate) fn persist_paused_text(&self) -> String {
-        self.persistence_error
-            .clone()
-            .unwrap_or_else(|| {
-                "session persistence failed; task paused before further tools".into()
-            })
+        self.persistence_error.clone().unwrap_or_else(|| {
+            "session persistence failed; task paused before further tools".into()
+        })
     }
 
     pub(crate) fn close_interrupted_tools(&mut self) {
@@ -958,7 +1009,7 @@ impl<C: Completer> Agent<C> {
             }
         }
         self.drain_background();
-        if stop_reason.as_deref() == Some("aborted") {
+        if self.print || stop_reason.as_deref() == Some("aborted") {
             self.coordinator.cancel_background();
         }
         self.mark_clean();

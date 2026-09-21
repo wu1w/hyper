@@ -397,6 +397,15 @@ pub fn live_has_clarify_note(messages: &[ChatMessage]) -> bool {
     })
 }
 
+pub fn live_has_ask_note(messages: &[ChatMessage]) -> bool {
+    messages.iter().any(|m| {
+        m.role == "user"
+            && m.content
+                .as_deref()
+                .is_some_and(|c| unwrap_hidden(c).starts_with("ASK MODE"))
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

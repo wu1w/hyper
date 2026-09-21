@@ -15,6 +15,7 @@ pub mod doc_read;
 pub mod echo;
 pub mod error;
 pub mod family;
+pub mod fs_mode;
 pub mod imagine;
 pub mod llm_http;
 pub mod mcp;
@@ -23,6 +24,7 @@ pub mod memory;
 pub mod oauth;
 pub mod office_edit;
 pub mod out_dir;
+pub mod panic_diag;
 pub mod paw_loop;
 pub mod permit;
 pub mod platform_prefix;
@@ -33,6 +35,7 @@ mod proc_spawn;
 pub use proc_spawn::{hide_window, hide_window_async};
 pub mod prompt;
 pub mod schemas;
+pub mod secrets;
 pub mod session;
 pub mod sidecar;
 pub mod skills;
@@ -109,4 +112,7 @@ pub use template::{
     is_hidden_user_text, wrap_tool_response, ChatMessage, RenderOpts, RenderedPrompt,
 };
 pub use tool_calls::{CancelFlag, ToolCall, ToolCoordinator, ToolResponse, ToolState};
-pub use tools::{is_reparse_or_symlink, BlobStore, Workspace};
+pub use tools::{
+    is_oversized_text, is_reparse_or_symlink, is_special_file, read_text_if_regular, BlobStore,
+    Workspace,
+};

@@ -600,7 +600,7 @@ Plan / permissions (TUI; --print stays YOLO)
   /plan <description>    plan on, then send that as the first prompt
   /plan go               approve the plan and implement (alias /approve)
   /plan off              leave plan mode
-  /clarify [on|off]      arm ask (2–4 options). /plan also arms it
+  /clarify [on|off]      read-only ask (2–4 options). /plan also arms it
   /imagine [on|off|<prompt>]  Imagine REST (alias /image); skips the agent loop
   /approvals ask|auto|yolo
                          ask = prompt write/bash (Grok default)
@@ -1169,8 +1169,9 @@ pub fn plan_text(on: bool) -> String {
 
 pub fn clarify_text(on: bool, plan: bool) -> String {
     if on {
-        "**Clarify on.** `ask` is armed. The model may present 2–4 options; pick, skip \
-         (recommended), or type Other.\n`/clarify off` disarms unless `/plan` is on."
+        "**Clarify on.** Ask mode is read-only. The model may present 2–4 options; pick, skip \
+         (recommended), or type Other. Writes stay blocked until `/clarify off` or SwitchMode \
+         agent.\n`/clarify off` disarms unless `/plan` is on."
             .into()
     } else if plan {
         "**Clarify off.** `ask` stays armed because `/plan` is on.".into()
@@ -1213,9 +1214,13 @@ pub fn diff_text(workspace: &Path, args: &str) -> String {
             cmd.arg(a);
         }
     }
-    match cmd.output() {
-        Ok(out) => {
-            let mut s = String::from_utf8_lossy(&out.stdout).into_owned();
+    match crate::proc_spawn::command_output_capped(
+        &mut cmd,
+        64 * 1024,
+        std::time::Duration::from_secs(8),
+    ) {
+        Ok((_, stdout, _)) => {
+            let mut s = String::from_utf8_lossy(&stdout).into_owned();
             if s.trim().is_empty() {
                 s = String::from("(no diff)");
             }

@@ -54,6 +54,13 @@ pub fn todo_write(ws: &Workspace, call: &ToolCall) -> ToolResponse {
         });
     }
     let path = todo_path(ws);
+    if crate::tools::is_special_file(&path) {
+        return ToolResponse::text(
+            &call.id,
+            "Error: .grok-hyper/todos.json is not a regular file.",
+            ToolState::Error,
+        );
+    }
     let mut list = if merge { load_todos(&path) } else { Vec::new() };
     for todo in incoming {
         if let Some(existing) = list.iter_mut().find(|t| t.id == todo.id) {
@@ -65,7 +72,10 @@ pub fn todo_write(ws: &Workspace, call: &ToolCall) -> ToolResponse {
     if let Err(e) = save_todos(&path, &list) {
         return ToolResponse::text(
             &call.id,
-            format!("Error: could not save todos: {e}"),
+            format!(
+                "Error: could not save todos: {}",
+                super::path::io_user_msg(&e)
+            ),
             ToolState::Error,
         );
     }
@@ -78,7 +88,10 @@ fn todo_path(ws: &Workspace) -> std::path::PathBuf {
 }
 
 fn load_todos(path: &std::path::Path) -> Vec<Todo> {
-    let Ok(raw) = std::fs::read_to_string(path) else {
+    if crate::tools::is_special_file(path) || crate::tools::is_oversized_text(path) {
+        return Vec::new();
+    }
+    let Some(raw) = crate::tools::read_text_if_regular(path) else {
         return Vec::new();
     };
     serde_json::from_str(&raw).unwrap_or_default()
@@ -99,7 +112,13 @@ fn save_todos(path: &std::path::Path, list: &[Todo]) -> std::io::Result<()> {
             })
             .collect(),
     );
-    std::fs::write(path, serde_json::to_vec_pretty(&v)?)
+    if crate::tools::is_special_file(path) {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!("{} is not a regular file", path.display()),
+        ));
+    }
+    crate::tools::write_if_regular(path, serde_json::to_vec_pretty(&v)?)
 }
 
 fn render(list: &[Todo]) -> String {
@@ -111,4 +130,70 @@ fn render(list: &[Todo]) -> String {
         s.push_str(&format!("- [{}] {} ({})\n", t.status, t.content, t.id));
     }
     s
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::tool_calls::ToolCall;
+    use serde_json::json;
+    use std::path::PathBuf;
+
+    fn scratch() -> (Workspace, PathBuf) {
+        let dir =
+            std::env::temp_dir().join(format!("hyper-todo-{}", uuid::Uuid::new_v4().simple()));
+        std::fs::create_dir_all(&dir).unwrap();
+        (Workspace::open(&dir, true).unwrap(), dir)
+    }
+
+    #[test]
+    fn todo_unknown_status_is_error() {
+        let (ws, dir) = scratch();
+        let r = todo_write(
+            &ws,
+            &ToolCall {
+                id: "t1".into(),
+                name: "TodoWrite".into(),
+                arguments: json!({"todos": [{"id": "1", "content": "x", "status": "bogus"}]}),
+            },
+        );
+        assert_eq!(r.state, ToolState::Error, "{}", r.joined_text());
+        assert!(
+            r.joined_text().contains("unknown status"),
+            "{}",
+            r.joined_text()
+        );
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn todo_write_fifo_is_error_not_hang() {
+        let (ws, dir) = scratch();
+        let overlay = dir.join(".grok-hyper");
+        std::fs::create_dir_all(&overlay).unwrap();
+        let fifo = overlay.join("todos.json");
+        let st = std::process::Command::new("mkfifo")
+            .arg(&fifo)
+            .status()
+            .unwrap();
+        assert!(st.success());
+        let started = std::time::Instant::now();
+        let r = todo_write(
+            &ws,
+            &ToolCall {
+                id: "t1".into(),
+                name: "TodoWrite".into(),
+                arguments: json!({"todos": [{"id": "1", "content": "x", "status": "pending"}]}),
+            },
+        );
+        assert!(started.elapsed() < std::time::Duration::from_secs(2));
+        assert_eq!(r.state, ToolState::Error, "{}", r.joined_text());
+        assert!(
+            r.joined_text().contains("not a regular file"),
+            "{}",
+            r.joined_text()
+        );
+        let _ = std::fs::remove_dir_all(dir);
+    }
 }

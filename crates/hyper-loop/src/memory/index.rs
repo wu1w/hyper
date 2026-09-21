@@ -20,14 +20,16 @@ pub struct MemoryIndex {
 
 impl MemoryIndex {
     pub fn open(dir: &Path) -> Result<Self> {
-        std::fs::create_dir_all(dir)?;
+        crate::fs_mode::ensure_private_dir(dir)?;
+        let sqlite = dir.join("memory.sqlite");
         let conn = Connection::open_with_flags(
-            dir.join("memory.sqlite"),
+            &sqlite,
             OpenFlags::SQLITE_OPEN_READ_WRITE
                 | OpenFlags::SQLITE_OPEN_CREATE
                 | OpenFlags::SQLITE_OPEN_FULL_MUTEX,
         )
         .map_err(Error::msg)?;
+        crate::fs_mode::tighten_file(&sqlite);
         conn.execute_batch(
             "PRAGMA journal_mode=WAL;
              PRAGMA synchronous=NORMAL;
@@ -151,7 +153,7 @@ fn walk_index(index: &MemoryIndex, root: &Path, dir: &Path) -> Result<()> {
         if path.file_name().and_then(|s| s.to_str()) == Some("MEMORY.md") {
             continue;
         }
-        let Ok(body) = std::fs::read_to_string(&path) else {
+        let Some(body) = crate::tools::read_text_if_regular(&path) else {
             continue;
         };
         let rel = path

@@ -87,7 +87,7 @@ hyper vscode-install              # 可选：装 VS Code / Cursor 侧栏扩展
 
 - `[server]` 端点、key、模型、引擎 profile、家族
 - `[context] working_window` 默认 **500000**，soft compact 80%；超过 200k token 后 xAI 单价翻倍
-- `[policy] default_effort = "auto"` 对 grok-4.6 映射为 **xhigh**（思考关不掉，成本和延迟都按最高档）；`/think` 仍可覆盖
+- `[policy] default_effort = "auto"` 对 grok-4.6 映射为 **high**（思考开着；最高档 `/think xhigh`）；`/think` 仍可覆盖
 - `[console] workspace` 控制台上次选的文件夹
 - `[web]` 搜索工具（无 key 也能用；有 Tavily key 自动升级）
 - `[mcp]` / 技能目录 overlay

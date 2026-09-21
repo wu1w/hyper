@@ -40,7 +40,7 @@ pub struct HistoryIndex {
 
 impl HistoryIndex {
     pub fn open(dir: &Path) -> Result<Self> {
-        std::fs::create_dir_all(dir)?;
+        crate::fs_mode::ensure_private_dir(dir)?;
         let path = dir.join("history.sqlite");
         let conn = Connection::open_with_flags(
             &path,
@@ -49,6 +49,7 @@ impl HistoryIndex {
                 | OpenFlags::SQLITE_OPEN_FULL_MUTEX,
         )
         .map_err(Error::msg)?;
+        crate::fs_mode::tighten_file(&path);
         conn.execute_batch(
             "PRAGMA journal_mode=WAL;
              PRAGMA synchronous=NORMAL;

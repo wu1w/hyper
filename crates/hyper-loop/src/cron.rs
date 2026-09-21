@@ -75,7 +75,7 @@ pub fn wants_cron_card(user: &str) -> bool {
 }
 
 pub fn load_jobs(path: impl AsRef<Path>) -> Vec<CronJob> {
-    let Ok(raw) = fs::read_to_string(path.as_ref()) else {
+    let Some(raw) = crate::tools::read_text_if_regular(path.as_ref()) else {
         return Vec::new();
     };
     parse_jobs_json(&raw)
@@ -94,13 +94,19 @@ pub fn parse_jobs_json(raw: &str) -> Vec<CronJob> {
 
 pub fn save_jobs(path: impl AsRef<Path>, jobs: &[CronJob]) -> Result<()> {
     let path = path.as_ref();
+    if crate::tools::is_special_file(path) {
+        return Err(Error::msg(format!(
+            "{} is not a regular file",
+            path.display()
+        )));
+    }
     if let Some(dir) = path.parent() {
         fs::create_dir_all(dir)?;
     }
     let file = FileShape {
         jobs: jobs.to_vec(),
     };
-    fs::write(
+    crate::tools::write_if_regular(
         path,
         serde_json::to_string_pretty(&file).map_err(Error::msg)?,
     )?;
@@ -294,19 +300,19 @@ pub fn heartbeat_tick(last_fp: &str, pulse_fp: &str, custom_prompt: bool) -> Hea
 }
 
 fn git_out(root: &Path, args: &[&str]) -> String {
-    use std::io::Read;
-    let mut child = match std::process::Command::new("git")
-        .args(args)
+    const MAX_GIT_PIPE: usize = 512 * 1024;
+    let mut cmd = std::process::Command::new("git");
+    crate::proc_spawn::hide_window(&mut cmd);
+    cmd.args(args)
         .current_dir(root)
         .env("GIT_OPTIONAL_LOCKS", "0")
         .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::null())
-        .spawn()
-    {
+        .stderr(std::process::Stdio::null());
+    let mut child = match cmd.spawn() {
         Ok(c) => c,
         Err(_) => return String::new(),
     };
-    let mut stdout = match child.stdout.take() {
+    let stdout = match child.stdout.take() {
         Some(s) => s,
         None => {
             let _ = child.kill();
@@ -315,7 +321,8 @@ fn git_out(root: &Path, args: &[&str]) -> String {
     };
     let reader = std::thread::spawn(move || {
         let mut buf = Vec::new();
-        let _ = stdout.read_to_end(&mut buf);
+        let mut out = stdout;
+        crate::proc_spawn::drain_capped(&mut out, &mut buf, MAX_GIT_PIPE);
         buf
     });
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
@@ -379,11 +386,7 @@ pub fn workspace_pulse(root: &Path) -> WorkspacePulse {
         }
     }
     let git = !head.is_empty();
-    let stamp = if git {
-        String::new()
-    } else {
-        tree_stamp(root)
-    };
+    let stamp = if git { String::new() } else { tree_stamp(root) };
     let raw = format!("{porcelain}\n{head}\n{watch}\n{stamp}");
     let fingerprint = crate::vendor::sha256_hex(raw.as_bytes());
     let git_dirty = porcelain
@@ -392,7 +395,7 @@ pub fn workspace_pulse(root: &Path) -> WorkspacePulse {
     let has_heartbeat_file = ["HEARTBEAT.md", ".grok-hyper/HEARTBEAT.md"]
         .iter()
         .any(|rel| {
-            fs::read_to_string(root.join(rel))
+            crate::tools::read_text_if_regular(&root.join(rel))
                 .map(|s| !s.trim().is_empty())
                 .unwrap_or(false)
         });
@@ -438,6 +441,31 @@ mod tests {
         assert_eq!(parse_interval("1d"), Some(86400));
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn save_jobs_fifo_is_error_not_hang() {
+        let dir = std::env::temp_dir().join(format!(
+            "hyper-cron-fifo-{}",
+            uuid::Uuid::new_v4().simple()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("cron.json");
+        let st = std::process::Command::new("mkfifo")
+            .arg(&path)
+            .status()
+            .unwrap();
+        assert!(st.success());
+        let started = std::time::Instant::now();
+        let err = save_jobs(&path, &[]).unwrap_err();
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(2),
+            "FIFO cron.json save must not block: {:?}",
+            started.elapsed()
+        );
+        assert!(err.to_string().contains("not a regular file"), "{err}");
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
     #[test]
     fn workspace_pulse_nongit_tracks_file_mtime() {
         let dir = std::env::temp_dir().join(format!(
@@ -453,7 +481,38 @@ mod tests {
         std::thread::sleep(std::time::Duration::from_millis(1100));
         std::fs::write(dir.join("a.txt"), "two").unwrap();
         let b = workspace_pulse(&dir);
-        assert_ne!(a.fingerprint, b.fingerprint, "non-git edit must change pulse");
+        assert_ne!(
+            a.fingerprint, b.fingerprint,
+            "non-git edit must change pulse"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn workspace_pulse_fifo_heartbeat_does_not_hang() {
+        let dir = std::env::temp_dir().join(format!(
+            "hyper-pulse-fifo-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let hb = dir.join("HEARTBEAT.md");
+        let st = std::process::Command::new("mkfifo")
+            .arg(&hb)
+            .status()
+            .unwrap();
+        assert!(st.success());
+        let started = std::time::Instant::now();
+        let pulse = workspace_pulse(&dir);
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(2),
+            "FIFO HEARTBEAT.md must not block pulse: {:?}",
+            started.elapsed()
+        );
+        assert!(!pulse.scripted, "FIFO heartbeat is not a scripted file");
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -537,10 +596,8 @@ mod tests {
 
     #[test]
     fn pulse_non_git_is_stable_until_watch_file_changes() {
-        let dir = std::env::temp_dir().join(format!(
-            "hyper-pulse-{}",
-            crate::session::new_session_id()
-        ));
+        let dir =
+            std::env::temp_dir().join(format!("hyper-pulse-{}", crate::session::new_session_id()));
         fs::create_dir_all(&dir).unwrap();
         let a = workspace_pulse(&dir);
         let b = workspace_pulse(&dir);

@@ -3,7 +3,7 @@
 
 use super::{Agent, Completer};
 use crate::mcp::card_for as mcp_card;
-use crate::permit::PLAN_CARD;
+use crate::permit::{ASK_CARD, PLAN_CARD};
 use crate::skills::hidden_card;
 use crate::sticky;
 
@@ -58,8 +58,11 @@ impl<C: Completer> Agent<C> {
         if self.plan_mode && !sticky::live_has_plan_note(&self.messages) {
             self.push_hidden_user(PLAN_CARD);
         }
-        if (self.plan_mode || self.clarify_mode) && !sticky::live_has_clarify_note(&self.messages) {
+        if self.plan_mode && !sticky::live_has_clarify_note(&self.messages) {
             self.push_hidden_user(crate::clarify::CLARIFY_CARD);
+        }
+        if self.clarify_mode && !self.plan_mode && !sticky::live_has_ask_note(&self.messages) {
+            self.push_hidden_user(ASK_CARD);
         }
     }
 
@@ -340,16 +343,18 @@ pub(crate) fn forbids_glob(user: &str) -> bool {
         || phrase_at_word(l.as_str(), "no glob")
 }
 
-/// `needle` must not be a prefix of a longer ASCII word (`no glob` ≠ `no global`).
+/// `needle` must not be a prefix of a longer ASCII word (`no glob` ≠ `no global`
+/// or `no glob_pattern`). `_` counts as a word character.
 fn phrase_at_word(hay: &str, needle: &str) -> bool {
+    let word = |c: char| c.is_ascii_alphanumeric() || c == '_';
     let mut rest = hay;
     while let Some(i) = rest.find(needle) {
-        let after = &rest[i + needle.len()..];
-        if after
+        let after_ok = rest[i + needle.len()..]
             .chars()
             .next()
-            .is_none_or(|c| !c.is_ascii_alphanumeric())
-        {
+            .is_none_or(|c| !word(c));
+        let before_ok = rest[..i].chars().next_back().is_none_or(|c| !word(c));
+        if after_ok && before_ok {
             return true;
         }
         rest = &rest[i + 1..];

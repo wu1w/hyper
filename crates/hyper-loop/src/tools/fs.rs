@@ -12,6 +12,39 @@ use super::{
 use crate::tool_calls::{ToolCall, ToolResponse, ToolState};
 use crate::vendor::sha256_hex;
 
+/// Cursor Read/StrReplace: NUL or invalid UTF-8 is binary, not a text page.
+const BINARY_TEXT_ERR: &str = "Error: this file appears to be binary and cannot be opened as text.";
+
+fn io_user_msg(e: &std::io::Error) -> String {
+    super::path::io_user_msg(e)
+}
+
+enum OpenText {
+    Utf8(String),
+    NotFound,
+    IsDir,
+    Binary,
+    Io(std::io::Error),
+}
+
+fn open_text(path: &Path) -> OpenText {
+    match super::path::read_bytes_regular(path) {
+        Ok(bytes) => {
+            if bytes.contains(&0) {
+                OpenText::Binary
+            } else {
+                match String::from_utf8(bytes) {
+                    Ok(s) => OpenText::Utf8(s),
+                    Err(_) => OpenText::Binary,
+                }
+            }
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => OpenText::NotFound,
+        Err(e) if e.kind() == std::io::ErrorKind::IsADirectory => OpenText::IsDir,
+        Err(e) => OpenText::Io(e),
+    }
+}
+
 pub fn read_file(
     ws: &Workspace,
     call: &ToolCall,
@@ -28,6 +61,9 @@ pub fn read_file(
     let shown = ws.shown(&raw);
     if path.is_dir() {
         return list_directory(&shown, &path, &call.id, limits, blobs);
+    }
+    if let Some(err) = special_file_error(&raw, &path, &call.id) {
+        return err;
     }
 
     if crate::media::is_media_ext(&raw) {
@@ -70,22 +106,37 @@ pub fn read_file(
         };
     }
 
-    let content = match fs::read_to_string(&path) {
-        Ok(s) => s,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+    if super::path::is_oversized_text(&path) {
+        let len = fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
+        return ToolResponse::text(
+            &call.id,
+            format!(
+                "Error: {shown} is too large to open as text ({len} bytes; max {} bytes). Grep a pattern, or Read a smaller file.",
+                super::path::MAX_TEXT_SLURP_BYTES
+            ),
+            ToolState::Error,
+        );
+    }
+
+    let content = match open_text(&path) {
+        OpenText::Utf8(s) => s,
+        OpenText::NotFound => {
             return ToolResponse::text(
                 &call.id,
                 format!("Error: The file {} does not exist.", ws.shown(&raw)),
                 ToolState::Error,
             );
         }
-        Err(e) if e.kind() == std::io::ErrorKind::IsADirectory => {
+        OpenText::IsDir => {
             return list_directory(&shown, &path, &call.id, limits, blobs);
         }
-        Err(e) => {
+        OpenText::Binary => {
+            return ToolResponse::text(&call.id, BINARY_TEXT_ERR, ToolState::Error);
+        }
+        OpenText::Io(e) => {
             return ToolResponse::text(
                 &call.id,
-                format!("Error: Read file failed due to \n{e}"),
+                format!("Error: Read file failed due to \n{}", io_user_msg(&e)),
                 ToolState::Error,
             );
         }
@@ -106,7 +157,9 @@ pub fn read_file(
                 ToolState::Error,
             );
         }
-        None => arg_u32(&call.arguments, "limit").unwrap_or(limits.read_default_lines) as usize,
+        None => arg_u32(&call.arguments, "limit")
+            .filter(|&n| n > 0)
+            .unwrap_or(limits.read_default_lines) as usize,
     };
     let cap = read_page_cap(limits);
     let capped = requested > cap;
@@ -153,12 +206,15 @@ fn list_directory(
     limits: ToolLimits,
     blobs: Option<&BlobStore>,
 ) -> ToolResponse {
-    let Ok(rd) = fs::read_dir(path) else {
-        return ToolResponse::text(
-            id,
-            format!("Error: Could not list directory {shown}."),
-            ToolState::Error,
-        );
+    let rd = match fs::read_dir(path) {
+        Ok(rd) => rd,
+        Err(e) => {
+            return ToolResponse::text(
+                id,
+                format!("Error: {shown}: {}", io_user_msg(&e)),
+                ToolState::Error,
+            );
+        }
     };
     let mut files = Vec::new();
     let mut dirs = Vec::new();
@@ -168,7 +224,11 @@ fn list_directory(
         if name == ".git" {
             continue;
         }
-        let is_dir = entry.file_type().map(|t| t.is_dir()).unwrap_or(false);
+        let path = entry.path();
+        let is_dir = entry
+            .file_type()
+            .map(|t| t.is_dir() || (t.is_symlink() && path.is_dir()))
+            .unwrap_or(false);
         if is_dir {
             dirs.push(name);
         } else {
@@ -213,14 +273,18 @@ fn list_directory(
         lines.push("(empty)".into());
     }
     if total > listed || scanned >= DIR_SCAN_CAP {
-        lines.push(format!(
-            "… truncated at {DIR_LIST_CAP} entries (sorted; {total} scanned{}).",
-            if scanned >= DIR_SCAN_CAP {
-                format!(", scan cap {DIR_SCAN_CAP}")
-            } else {
-                String::new()
-            }
-        ));
+        let extra = if scanned >= DIR_SCAN_CAP {
+            format!(", scan cap {DIR_SCAN_CAP}")
+        } else {
+            String::new()
+        };
+        lines.insert(
+            0,
+            format!(
+                "Error: directory listing truncated at {DIR_LIST_CAP} entries (sorted; {total} scanned{extra})."
+            ),
+        );
+        return folded_response(id, lines.join("\n"), ToolState::Error, limits, blobs);
     }
     folded_response(id, lines.join("\n"), ToolState::Success, limits, blobs)
 }
@@ -229,6 +293,44 @@ fn read_page_cap(limits: ToolLimits) -> usize {
     (limits.read_default_lines as usize)
         .saturating_mul(2)
         .max(1)
+}
+
+/// FIFOs / sockets / devices: `exists` is true but `fs::read` blocks forever.
+pub(crate) fn special_file_error(raw: &str, path: &Path, id: &str) -> Option<ToolResponse> {
+    if super::path::is_special_file(path) {
+        Some(ToolResponse::text(
+            id,
+            format!("Error: {raw} is not a regular file."),
+            ToolState::Error,
+        ))
+    } else {
+        None
+    }
+}
+
+pub(super) fn file_parent_error(raw: &str, path: &Path, id: &str) -> Option<ToolResponse> {
+    let mut cur = path.parent()?;
+    loop {
+        if cur.as_os_str().is_empty() {
+            break;
+        }
+        if cur.is_file() || super::path::is_special_file(cur) {
+            let shown = cur.file_name().and_then(|n| n.to_str()).unwrap_or(raw);
+            return Some(ToolResponse::text(
+                id,
+                format!("Error: {shown} is not a directory."),
+                ToolState::Error,
+            ));
+        }
+        if cur.is_dir() {
+            break;
+        }
+        match cur.parent() {
+            Some(next) if next != cur => cur = next,
+            _ => break,
+        }
+    }
+    None
 }
 
 pub fn write_file(ws: &Workspace, call: &ToolCall) -> ToolResponse {
@@ -240,6 +342,17 @@ pub fn write_file(ws: &Workspace, call: &ToolCall) -> ToolResponse {
     else {
         return ToolResponse::text(&call.id, "Error: No `contents` provided.", ToolState::Error);
     };
+    if content.len() as u64 > super::path::MAX_TEXT_SLURP_BYTES {
+        return ToolResponse::text(
+            &call.id,
+            format!(
+                "Error: contents is too large to write as text ({} bytes; max {} bytes).",
+                content.len(),
+                super::path::MAX_TEXT_SLURP_BYTES
+            ),
+            ToolState::Error,
+        );
+    }
     if crate::stutter::is_placeholder_write(&raw, &content) {
         return ToolResponse::text(&call.id, "Error: invalid path.", ToolState::Error);
     }
@@ -247,6 +360,19 @@ pub fn write_file(ws: &Workspace, call: &ToolCall) -> ToolResponse {
         Ok(p) => p,
         Err(e) => return ToolResponse::text(&call.id, e, ToolState::Error),
     };
+    if path.is_dir() {
+        return ToolResponse::text(
+            &call.id,
+            format!("Error: {raw} is a directory."),
+            ToolState::Error,
+        );
+    }
+    if let Some(err) = special_file_error(&raw, &path, &call.id) {
+        return err;
+    }
+    if let Some(err) = file_parent_error(&raw, &path, &call.id) {
+        return err;
+    }
     match write_atomic(&path, &content) {
         Ok(()) => ToolResponse::text(
             &call.id,
@@ -255,7 +381,7 @@ pub fn write_file(ws: &Workspace, call: &ToolCall) -> ToolResponse {
         ),
         Err(e) => ToolResponse::text(
             &call.id,
-            format!("Error: Write file failed due to \n{e}"),
+            format!("Error: Write file failed due to \n{}", io_user_msg(&e)),
             ToolState::Error,
         ),
     }
@@ -290,19 +416,46 @@ pub fn edit_file(ws: &Workspace, call: &ToolCall) -> ToolResponse {
         Ok(p) => p,
         Err(e) => return ToolResponse::text(&call.id, e, ToolState::Error),
     };
-    let content = match fs::read_to_string(&path) {
-        Ok(s) => s,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+    if let Some(err) = special_file_error(&raw, &path, &call.id) {
+        return err;
+    }
+    if let Some(err) = file_parent_error(&raw, &path, &call.id) {
+        return err;
+    }
+    if super::path::is_oversized_text(&path) {
+        let len = fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
+        return ToolResponse::text(
+            &call.id,
+            format!(
+                "Error: {raw} is too large to edit as text ({len} bytes; max {} bytes).",
+                super::path::MAX_TEXT_SLURP_BYTES
+            ),
+            ToolState::Error,
+        );
+    }
+    let content = match open_text(&path) {
+        OpenText::Utf8(s) => s,
+        OpenText::NotFound => {
             return ToolResponse::text(
                 &call.id,
                 format!("Error: The file {} does not exist.", ws.shown(&raw)),
                 ToolState::Error,
             );
         }
-        Err(e) => {
+        OpenText::IsDir => {
             return ToolResponse::text(
                 &call.id,
-                format!("Error: Read file failed due to \n{e}"),
+                format!("Error: {raw} is a directory."),
+                ToolState::Error,
+            );
+        }
+        OpenText::Binary => {
+            return ToolResponse::text(&call.id, BINARY_TEXT_ERR, ToolState::Error);
+        }
+        OpenText::Io(e) => {
+            return ToolResponse::text(
+                &call.id,
+                format!("Error: Read file failed due to \n{}", io_user_msg(&e)),
                 ToolState::Error,
             );
         }
@@ -356,6 +509,17 @@ pub fn edit_file(ws: &Workspace, call: &ToolCall) -> ToolResponse {
             }
         }
     };
+    if updated.len() as u64 > super::path::MAX_TEXT_SLURP_BYTES {
+        return ToolResponse::text(
+            &call.id,
+            format!(
+                "Error: {raw} is too large to write as text ({} bytes; max {} bytes).",
+                updated.len(),
+                super::path::MAX_TEXT_SLURP_BYTES
+            ),
+            ToolState::Error,
+        );
+    }
     match write_atomic(&path, &updated) {
         Ok(()) => ToolResponse::text(
             &call.id,
@@ -368,7 +532,7 @@ pub fn edit_file(ws: &Workspace, call: &ToolCall) -> ToolResponse {
         ),
         Err(e) => ToolResponse::text(
             &call.id,
-            format!("Error: Write file failed due to \n{e}"),
+            format!("Error: Write file failed due to \n{}", io_user_msg(&e)),
             ToolState::Error,
         ),
     }
@@ -378,19 +542,26 @@ pub fn delete_file(ws: &Workspace, call: &ToolCall) -> ToolResponse {
     let Some(raw) = arg_path(&call.arguments) else {
         return ToolResponse::text(&call.id, "Error: No `path` provided.", ToolState::Error);
     };
-    let path = match ws.resolve_write(&raw) {
+    let path = match ws.resolve_unlink(&raw) {
         Ok(p) => p,
         Err(e) => return ToolResponse::text(&call.id, e, ToolState::Error),
     };
-    if path.is_dir() {
-        return ToolResponse::text(
-            &call.id,
-            format!("Error: {raw} is a directory. Delete only files."),
-            ToolState::Error,
-        );
-    }
-    match fs::remove_file(&path) {
-        Ok(()) => ToolResponse::text(&call.id, format!("Deleted {raw}."), ToolState::Success),
+    match fs::symlink_metadata(&path) {
+        Ok(meta) if meta.file_type().is_dir() => {
+            return ToolResponse::text(
+                &call.id,
+                format!("Error: {raw} is a directory. Delete only files."),
+                ToolState::Error,
+            );
+        }
+        Ok(_) => match fs::remove_file(&path) {
+            Ok(()) => ToolResponse::text(&call.id, format!("Deleted {raw}."), ToolState::Success),
+            Err(e) => ToolResponse::text(
+                &call.id,
+                format!("Error: Delete failed due to \n{}", io_user_msg(&e)),
+                ToolState::Error,
+            ),
+        },
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => ToolResponse::text(
             &call.id,
             format!("Error: The file {} does not exist.", ws.shown(&raw)),
@@ -398,7 +569,7 @@ pub fn delete_file(ws: &Workspace, call: &ToolCall) -> ToolResponse {
         ),
         Err(e) => ToolResponse::text(
             &call.id,
-            format!("Error: Delete failed due to \n{e}"),
+            format!("Error: Delete failed due to \n{}", io_user_msg(&e)),
             ToolState::Error,
         ),
     }
@@ -592,6 +763,7 @@ mod tests {
     use super::*;
     use crate::tool_calls::{ToolCall, ToolState};
     use serde_json::json;
+    use std::io::Write;
     use std::time::Duration;
 
     fn scratch() -> PathBuf {
@@ -650,6 +822,22 @@ mod tests {
         assert!(t.contains("2"), "{t}");
         assert!(t.contains("4"), "{t}");
         assert!(!t.contains("one"), "{t}");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn read_limit_zero_does_not_return_empty_page() {
+        let (ws, dir) = workspace();
+        fs::write(dir.join("a.txt"), "UNIQUE_READ_LIMIT_ZERO\nsecond\n").unwrap();
+        let r = read_file(
+            &ws,
+            &call("read", json!({"path": "a.txt", "limit": 0})),
+            ToolLimits::default(),
+            None,
+        );
+        let t = r.joined_text();
+        assert_eq!(r.state, ToolState::Success, "{t}");
+        assert!(t.contains("UNIQUE_READ_LIMIT_ZERO"), "{t}");
         let _ = fs::remove_dir_all(&dir);
     }
 
@@ -988,7 +1176,9 @@ mod tests {
         let t = r.joined_text();
         assert_eq!(r.state, ToolState::Error, "{t}");
         assert!(
-            t.to_ascii_lowercase().contains("utf-8") || t.contains("UTF-8"),
+            t.to_ascii_lowercase().contains("binary")
+                || t.to_ascii_lowercase().contains("utf-8")
+                || t.contains("UTF-8"),
             "{t}"
         );
         let _ = fs::remove_dir_all(&dir);
@@ -1118,6 +1308,33 @@ mod tests {
         let _ = fs::remove_dir_all(&dir);
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn read_unreadable_directory_is_error_not_empty() {
+        use std::os::unix::fs::PermissionsExt;
+        let (ws, dir) = workspace();
+        let locked = dir.join("locked");
+        fs::create_dir_all(&locked).unwrap();
+        fs::write(locked.join("hit.rs"), "fn x() {}\n").unwrap();
+        fs::set_permissions(&locked, fs::Permissions::from_mode(0o000)).unwrap();
+        let r = read_file(
+            &ws,
+            &call("read", json!({"path": "locked"})),
+            ToolLimits::default(),
+            None,
+        );
+        let _ = fs::set_permissions(&locked, fs::Permissions::from_mode(0o755));
+        let t = r.joined_text();
+        assert_eq!(r.state, ToolState::Error, "{t}");
+        assert!(
+            t.to_ascii_lowercase().contains("permission") || t.contains("denied"),
+            "{t}"
+        );
+        assert!(!t.contains("os error"), "{t}");
+        assert!(!t.contains("Directory listing"), "{t}");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
     #[test]
     fn read_directory_sorts_then_truncates() {
         let (ws, dir) = workspace();
@@ -1132,12 +1349,271 @@ mod tests {
             None,
         );
         let t = r.joined_text();
-        assert_eq!(r.state, ToolState::Success, "{t}");
+        assert_eq!(r.state, ToolState::Error, "{t}");
+        assert!(t.starts_with("Error:"), "{t}");
         assert!(t.contains("aaa"), "sorted prefix must include aaa:\n{t}");
         assert!(t.contains("truncated at 200"), "{t}");
         assert!(
             !t.contains("z249"),
             "late names must not displace early ones:\n{t}"
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn read_nul_file_is_binary() {
+        let (ws, dir) = workspace();
+        fs::write(dir.join("bin.dat"), b"hello\0world").unwrap();
+        let r = read_file(
+            &ws,
+            &call("read", json!({"path": "bin.dat"})),
+            ToolLimits::default(),
+            None,
+        );
+        let t = r.joined_text();
+        assert_eq!(r.state, ToolState::Error, "{t}");
+        assert!(t.contains("binary"), "{t}");
+        assert!(!t.contains("hello"), "{t}");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn read_invalid_utf8_is_binary() {
+        let (ws, dir) = workspace();
+        fs::write(dir.join("bad.dat"), [0xff, 0xfe, 0x41, 0x42]).unwrap();
+        let r = read_file(
+            &ws,
+            &call("read", json!({"path": "bad.dat"})),
+            ToolLimits::default(),
+            None,
+        );
+        let t = r.joined_text();
+        assert_eq!(r.state, ToolState::Error, "{t}");
+        assert!(t.contains("binary"), "{t}");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn str_replace_nul_file_is_binary() {
+        let (ws, dir) = workspace();
+        fs::write(dir.join("bin.dat"), b"hello\0world").unwrap();
+        let r = edit_file(
+            &ws,
+            &call(
+                "edit",
+                json!({"path": "bin.dat", "old_string": "hello", "new_string": "x"}),
+            ),
+        );
+        let t = r.joined_text();
+        assert_eq!(r.state, ToolState::Error, "{t}");
+        assert!(t.contains("binary"), "{t}");
+        assert_eq!(fs::read(dir.join("bin.dat")).unwrap(), b"hello\0world");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn write_onto_directory_is_error() {
+        let (ws, dir) = workspace();
+        fs::create_dir_all(dir.join("asdir")).unwrap();
+        let r = write_file(
+            &ws,
+            &call("write", json!({"path": "asdir", "contents": "HI"})),
+        );
+        let t = r.joined_text();
+        assert_eq!(r.state, ToolState::Error, "{t}");
+        assert!(t.contains("directory"), "{t}");
+        assert!(!t.contains("os error"), "{t}");
+        assert!(dir.join("asdir").is_dir());
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn write_through_existing_file_is_not_os_error() {
+        let (ws, dir) = workspace();
+        fs::write(dir.join("keep.txt"), "x\n").unwrap();
+        let r = write_file(
+            &ws,
+            &call(
+                "write",
+                json!({"path": "keep.txt/oops.txt", "contents": "nope"}),
+            ),
+        );
+        let t = r.joined_text();
+        assert_eq!(r.state, ToolState::Error, "{t}");
+        assert!(t.contains("not a directory"), "{t}");
+        assert!(!t.contains("os error"), "{t}");
+        assert_eq!(fs::read_to_string(dir.join("keep.txt")).unwrap(), "x\n");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn write_through_existing_file_unconfined_is_not_os_error() {
+        let dir = scratch();
+        fs::write(dir.join("keep.txt"), "x\n").unwrap();
+        let ws = Workspace::open(&dir, false).unwrap();
+        let r = write_file(
+            &ws,
+            &call(
+                "write",
+                json!({"path": "keep.txt/oops.txt", "contents": "nope"}),
+            ),
+        );
+        let t = r.joined_text();
+        assert_eq!(r.state, ToolState::Error, "{t}");
+        assert!(t.contains("not a directory"), "{t}");
+        assert!(!t.contains("os error"), "{t}");
+        assert_eq!(fs::read_to_string(dir.join("keep.txt")).unwrap(), "x\n");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn write_oversized_contents_is_error() {
+        let (ws, dir) = workspace();
+        let n = (super::super::path::MAX_TEXT_SLURP_BYTES as usize) + 1;
+        let r = write_file(
+            &ws,
+            &call(
+                "write",
+                json!({"path": "huge.txt", "contents": "x".repeat(n)}),
+            ),
+        );
+        let t = r.joined_text();
+        assert_eq!(r.state, ToolState::Error, "{t}");
+        assert!(t.contains("too large"), "{t}");
+        assert!(!dir.join("huge.txt").exists());
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn write_permission_denied_has_no_os_error() {
+        let (ws, dir) = workspace();
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(&dir, fs::Permissions::from_mode(0o555)).unwrap();
+        let r = write_file(
+            &ws,
+            &call("write", json!({"path": "locked.txt", "contents": "new\n"})),
+        );
+        let t = r.joined_text();
+        let _ = fs::set_permissions(&dir, fs::Permissions::from_mode(0o755));
+        assert_eq!(r.state, ToolState::Error, "{t}");
+        assert!(t.to_ascii_lowercase().contains("permission denied"), "{t}");
+        assert!(!t.contains("os error"), "{t}");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn delete_missing_file_is_error() {
+        let (ws, dir) = workspace();
+        let r = delete_file(&ws, &call("Delete", json!({"path": "nope.txt"})));
+        let t = r.joined_text();
+        assert_eq!(r.state, ToolState::Error, "{t}");
+        assert!(t.contains("does not exist"), "{t}");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn read_directory_marks_dir_symlink() {
+        let (ws, dir) = workspace();
+        fs::create_dir_all(dir.join("sub")).unwrap();
+        std::os::unix::fs::symlink("sub", dir.join("linkdir")).unwrap();
+        let r = read_file(
+            &ws,
+            &call("read", json!({"path": "."})),
+            ToolLimits::default(),
+            None,
+        );
+        let t = r.joined_text();
+        assert_eq!(r.state, ToolState::Success, "{t}");
+        assert!(t.contains("linkdir/"), "{t}");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn read_fifo_is_error_not_hang() {
+        let (ws, dir) = workspace();
+        let fifo = dir.join("pipe");
+        let st = std::process::Command::new("mkfifo")
+            .arg(&fifo)
+            .status()
+            .unwrap();
+        assert!(st.success());
+        let r = read_file(
+            &ws,
+            &call("read", json!({"path": "pipe"})),
+            ToolLimits::default(),
+            None,
+        );
+        let t = r.joined_text();
+        assert_eq!(r.state, ToolState::Error, "{t}");
+        assert!(t.contains("not a regular file"), "{t}");
+        let w = write_file(
+            &ws,
+            &call("write", json!({"path": "pipe", "contents": "no"})),
+        );
+        assert_eq!(w.state, ToolState::Error, "{}", w.joined_text());
+        assert!(w.joined_text().contains("not a regular file"));
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn read_oversized_file_is_error_not_slurp() {
+        let (ws, dir) = workspace();
+        let path = dir.join("big.txt");
+        let chunk = vec![b'x'; 1024 * 1024];
+        {
+            let mut f = fs::File::create(&path).unwrap();
+            for _ in 0..9 {
+                f.write_all(&chunk).unwrap();
+            }
+            f.write_all(b"\n").unwrap();
+        }
+        let started = std::time::Instant::now();
+        let r = read_file(
+            &ws,
+            &call("read", json!({"path": "big.txt"})),
+            ToolLimits::default(),
+            None,
+        );
+        assert!(started.elapsed() < std::time::Duration::from_secs(2));
+        let t = r.joined_text();
+        assert_eq!(r.state, ToolState::Error, "{t}");
+        assert!(t.contains("too large"), "{t}");
+        let e = edit_file(
+            &ws,
+            &call(
+                "edit",
+                json!({"path": "big.txt", "old_string": "x", "new_string": "y"}),
+            ),
+        );
+        assert_eq!(e.state, ToolState::Error, "{}", e.joined_text());
+        assert!(e.joined_text().contains("too large"), "{}", e.joined_text());
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn read_pdf_above_text_slurp_cap_still_uses_doc_extractor() {
+        let (ws, dir) = workspace();
+        let path = dir.join("paper.pdf");
+        let pdf = super::super::doc::fixture_pdf();
+        {
+            let mut f = fs::File::create(&path).unwrap();
+            f.write_all(&pdf).unwrap();
+            f.set_len(super::super::path::MAX_TEXT_SLURP_BYTES + 1)
+                .unwrap();
+        }
+        let r = read_file(
+            &ws,
+            &call("read", json!({"path": "paper.pdf"})),
+            ToolLimits::default(),
+            None,
+        );
+        let t = r.joined_text();
+        assert!(
+            !t.contains("too large to open as text"),
+            "office Read must not use the 8MiB text slurp cap: {t}"
         );
         let _ = fs::remove_dir_all(&dir);
     }

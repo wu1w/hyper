@@ -313,13 +313,16 @@ fn write_disk(dir: &Path, rec: &ChildRecord) {
     };
     if let Ok(bytes) = serde_json::to_vec_pretty(&row) {
         let path = task_path(dir, &rec.id);
+        if crate::tools::is_special_file(&path) {
+            return;
+        }
         let _ = std::fs::write(path, bytes);
     }
 }
 
 fn read_disk(dir: &Path, id: &str) -> Option<ChildRecord> {
-    let bytes = std::fs::read(task_path(dir, id)).ok()?;
-    let row: PersistedChild = serde_json::from_slice(&bytes).ok()?;
+    let raw = crate::tools::read_text_if_regular(&task_path(dir, id))?;
+    let row: PersistedChild = serde_json::from_str(&raw).ok()?;
     Some(ChildRecord {
         id: row.id,
         parent_session: row.parent_session,
@@ -383,4 +386,68 @@ pub fn reap_orphans(dir: &Path) {
 #[cfg(test)]
 pub fn clear() {
     lock_unpoison(registry()).slots.clear();
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[cfg(unix)]
+    #[test]
+    fn read_disk_fifo_is_none_not_hang() {
+        let dir =
+            std::env::temp_dir().join(format!("hyper-task-fifo-{}", uuid::Uuid::new_v4().simple()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = task_path(&dir, "child");
+        let st = std::process::Command::new("mkfifo")
+            .arg(&path)
+            .status()
+            .unwrap();
+        assert!(st.success());
+        let started = Instant::now();
+        assert!(read_disk(&dir, "child").is_none());
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(2),
+            "FIFO task.json must not block: {:?}",
+            started.elapsed()
+        );
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn write_disk_fifo_does_not_hang() {
+        let dir = std::env::temp_dir().join(format!(
+            "hyper-task-write-fifo-{}",
+            uuid::Uuid::new_v4().simple()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let rec = ChildRecord {
+            id: "child".into(),
+            parent_session: "p".into(),
+            description: "d".into(),
+            kind: SubagentType::Explore,
+            capability: CapabilityMode::ReadOnly,
+            isolation: Isolation::None,
+            status: ChildStatus::Running,
+            summary: String::new(),
+            key_paths: vec![],
+            error: None,
+            started: Instant::now(),
+        };
+        let path = task_path(&dir, "child");
+        let st = std::process::Command::new("mkfifo")
+            .arg(&path)
+            .status()
+            .unwrap();
+        assert!(st.success());
+        let started = Instant::now();
+        write_disk(&dir, &rec);
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(2),
+            "FIFO task.json write must not block: {:?}",
+            started.elapsed()
+        );
+        let _ = std::fs::remove_dir_all(dir);
+    }
 }

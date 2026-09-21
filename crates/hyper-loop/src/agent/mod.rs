@@ -537,6 +537,8 @@ pub struct Agent<C> {
     wrap_up_after_tools: bool,
     /// Progress-narration wrap already used this turn.
     stub_nudged: bool,
+    /// [`progress::FORCED_SYNTHESIS_NOTE`] already injected this user turn.
+    synthesis_nudged: bool,
     /// Consecutive length-truncated tool hops. Cap before giving up.
     length_truncations: u32,
     /// Model hops this user turn (primary + roomy retry).

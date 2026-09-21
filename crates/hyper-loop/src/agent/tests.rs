@@ -2,15 +2,15 @@ use std::collections::VecDeque;
 use std::sync::{Arc, Mutex};
 
 use super::dispatch::{
-    bash_coordinator_timeout_secs, canon_ws_path, fold_search_dump, glob_covered_by_search_paths,
-    glob_filename, grep_covered_by_search, is_search_paraphrase, named_new_files,
-    observed_from_messages, parallel_safe_batch, read_is_full, read_repeats_search_span,
-    recursive_any_file_glob, search_cap_reply, search_fold_shrinks, search_ident_already_shown,
-    GLOB_AFTER_SEARCH_MSG, GLOB_FORBIDDEN_MSG, GLOB_NAMED_WRITE_MSG, GLOB_TREE_MSG,
-    GREP_AFTER_SEARCH_MSG, GREP_FORBIDDEN_MSG, GREP_REPEAT_MSG, GREP_TURN_CAP, GREP_TURN_CAP_MSG,
-    READ_ALREADY_MSG, READ_NAMED_NEW_MSG, READ_SEARCH_SPAN_MSG, READ_SIBLING_MSG,
-    SEARCH_NAMED_WRITE_MSG, SEARCH_PARAPHRASE_MSG, SEARCH_TURN_CAP, SEARCH_TURN_CAP_MSG,
-    SHELL_CAT_SEARCH_MSG,
+    bash_coordinator_timeout_secs, canon_ws_path, dispatch_waves, fold_search_dump,
+    glob_covered_by_search_paths, glob_filename, grep_covered_by_search, is_search_paraphrase,
+    named_new_files, observed_from_messages, parallel_safe_batch, read_is_full,
+    read_repeats_search_span, recursive_any_file_glob, search_cap_reply, search_fold_shrinks,
+    search_ident_already_shown, GLOB_AFTER_SEARCH_MSG, GLOB_FORBIDDEN_MSG, GLOB_NAMED_WRITE_MSG,
+    GLOB_TREE_MSG, GREP_AFTER_SEARCH_MSG, GREP_FORBIDDEN_MSG, GREP_REPEAT_MSG, GREP_TURN_CAP,
+    GREP_TURN_CAP_MSG, READ_ALREADY_MSG, READ_NAMED_NEW_MSG, READ_SEARCH_SPAN_MSG,
+    READ_SIBLING_MSG, SEARCH_NAMED_WRITE_MSG, SEARCH_PARAPHRASE_MSG, SEARCH_TURN_CAP,
+    SEARCH_TURN_CAP_MSG, SHELL_CAT_SEARCH_MSG,
 };
 use super::notes::{
     forbids_glob, forbids_grep, forbids_tools, wants_auto_locate, wants_numeric_check,
@@ -18,9 +18,9 @@ use super::notes::{
 };
 use super::progress::{FORCED_SYNTHESIS_NOTE, INSPECT_STREAK, WRITE_NOW_NOTE};
 use super::turn::{
-    EMPTY_CHANNEL_NOTE, EMPTY_STOP_FALLBACK, NO_TOOL_THINK_FLOOR, PARSE_REPAIR_NOTE,
-    PHYSICS_WRAP_NOTE, STUB_CONTINUE_NOTE, SYNTHESIS_OUTPUT_CAP, SYNTHESIS_THINK_CAP,
-    THINK_DIVERGENCE_NOTE, is_physics_stop,
+    is_physics_stop, EMPTY_CHANNEL_NOTE, EMPTY_STOP_FALLBACK, NO_TOOL_THINK_FLOOR,
+    PARSE_REPAIR_NOTE, PHYSICS_WRAP_NOTE, STUB_CONTINUE_NOTE, SYNTHESIS_OUTPUT_CAP,
+    SYNTHESIS_THINK_CAP, THINK_DIVERGENCE_NOTE,
 };
 use super::*;
 use crate::error::Error;
@@ -329,6 +329,36 @@ async fn plan_mode_blocks_write() {
 }
 
 #[tokio::test]
+async fn clarify_mode_blocks_write_without_plan() {
+    let dir = std::env::temp_dir().join(format!("grok-hyper-{}", uuid::Uuid::new_v4().simple()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let target = dir.join("nope.txt");
+    let scripted = Scripted {
+        turns: Mutex::new(VecDeque::from([
+            turn_tool("Write", json!({"path": "nope.txt", "contents": "secret"})),
+            turn_text("Waiting on a choice."),
+        ])),
+        meter: false,
+    };
+    let mut o = opts(&dir);
+    o.clarify_mode = true;
+    let mut agent = Agent::new(scripted, o).unwrap();
+    let out = agent.run("ask first").await.unwrap();
+    assert_eq!(out.text, "Waiting on a choice.");
+    assert!(!out.plan_mode);
+    assert!(out.clarify_mode);
+    assert!(!target.exists(), "/clarify ask mode must gate writes");
+    assert!(agent.messages.iter().any(|message| {
+        message.role == "tool"
+            && message
+                .content
+                .as_deref()
+                .is_some_and(|text| text.contains("ask mode"))
+    }));
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+#[tokio::test]
 async fn switch_mode_changes_the_live_tool_gate() {
     let dir = std::env::temp_dir().join(format!("grok-hyper-{}", uuid::Uuid::new_v4().simple()));
     std::fs::create_dir_all(&dir).unwrap();
@@ -381,6 +411,122 @@ async fn switch_mode_accepts_cursor_target_mode_id() {
     assert!(
         !target.exists(),
         "SwitchMode(target_mode_id=plan) must gate later writes"
+    );
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+#[tokio::test]
+async fn switch_mode_rejects_unknown_target() {
+    let dir = std::env::temp_dir().join(format!("grok-hyper-{}", uuid::Uuid::new_v4().simple()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let scripted = Scripted {
+        turns: Mutex::new(VecDeque::from([
+            turn_tool("SwitchMode", json!({"target_mode_id": "banana"})),
+            turn_text("still agent."),
+        ])),
+        meter: false,
+    };
+    let mut agent = Agent::new(scripted, opts(&dir)).unwrap();
+    let out = agent.run("switch badly").await.unwrap();
+    assert!(!out.plan_mode);
+    assert!(!out.clarify_mode);
+    assert!(!agent.plan_mode);
+    assert!(!agent.clarify_mode);
+    assert!(agent.messages.iter().any(|message| {
+        message.role == "tool"
+            && message.content.as_deref().is_some_and(|text| {
+                text.contains("Error: SwitchMode mode must be agent, plan, or ask.")
+            })
+    }));
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+#[tokio::test]
+async fn switch_mode_ask_blocks_write_same_hop() {
+    let dir = std::env::temp_dir().join(format!("grok-hyper-{}", uuid::Uuid::new_v4().simple()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let target = dir.join("blocked.txt");
+    let scripted = Scripted {
+        turns: Mutex::new(VecDeque::from([
+            turn_tools(vec![
+                ("c1", "SwitchMode", json!({"mode": "ask"})),
+                (
+                    "c2",
+                    "Write",
+                    json!({"path": "blocked.txt", "contents": "SHOULD_NOT_EXIST"}),
+                ),
+            ]),
+            turn_text("Ask ready."),
+        ])),
+        meter: false,
+    };
+    let mut agent = Agent::new(scripted, opts(&dir)).unwrap();
+    let out = agent.run("ask then write").await.unwrap();
+    assert_eq!(out.text, "Ask ready.");
+    assert!(!out.plan_mode);
+    assert!(out.clarify_mode);
+    assert!(
+        !target.exists(),
+        "SwitchMode(ask) must gate Write in the same hop"
+    );
+    assert!(agent.messages.iter().any(|message| {
+        message.role == "tool"
+            && message
+                .content
+                .as_deref()
+                .is_some_and(|text| text.contains("ask mode"))
+    }));
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+#[tokio::test]
+async fn switch_mode_ask_blocks_plan_md() {
+    let dir = std::env::temp_dir().join(format!("grok-hyper-{}", uuid::Uuid::new_v4().simple()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let target = dir.join("plan.md");
+    let scripted = Scripted {
+        turns: Mutex::new(VecDeque::from([
+            turn_tool("SwitchMode", json!({"mode": "ask"})),
+            turn_tool("Write", json!({"path": "plan.md", "contents": "nope"})),
+            turn_text("Still asking."),
+        ])),
+        meter: false,
+    };
+    let mut agent = Agent::new(scripted, opts(&dir)).unwrap();
+    let out = agent.run("ask then plan.md").await.unwrap();
+    assert_eq!(out.text, "Still asking.");
+    assert!(!target.exists(), "ask mode has no plan.md exception");
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+#[tokio::test]
+async fn mixed_hop_prose_survives_empty_followup() {
+    let dir = std::env::temp_dir().join(format!("grok-hyper-{}", uuid::Uuid::new_v4().simple()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let prose = "MIXED_PROSE I wrote MIXED_OK into note.txt as the entire file contents, \
+matching the request: one write, no extra files, no follow-up reads. The note is a \
+single line so later checks can confirm the mixed hop completed as specified.";
+    assert!(crate::stutter::is_substantial_reply(prose));
+    let scripted = Scripted {
+        turns: Mutex::new(VecDeque::from([
+            turn_said(
+                prose,
+                "Write",
+                json!({"path": "note.txt", "contents": "MIXED_OK"}),
+            ),
+            turn_text(""),
+        ])),
+        meter: false,
+    };
+    let mut o = opts(&dir);
+    o.max_steps = 8;
+    o.peripheral = false;
+    let mut agent = Agent::new(scripted, o).unwrap();
+    let out = agent.run("write and speak").await.unwrap();
+    assert_eq!(out.text, prose, "{:?}", out.stop_reason);
+    assert_eq!(
+        std::fs::read_to_string(dir.join("note.txt")).unwrap_or_default(),
+        "MIXED_OK"
     );
     let _ = std::fs::remove_dir_all(dir);
 }
@@ -775,7 +921,36 @@ async fn empty_fallback_is_logged_as_assistant_before_stop() {
         assistant_at < stop_at,
         "fallback must land before stop: {kinds:?}"
     );
-    let _ = std::fs::remove_dir_all(dir);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[tokio::test]
+async fn tool_hop_substantial_text_survives_empty_followup() {
+    let dir = std::env::temp_dir().join(format!(
+        "hyper-last-spoken-{}",
+        uuid::Uuid::new_v4().simple()
+    ));
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(dir.join("ping.txt"), "pong\n").unwrap();
+    let talk = "I reviewed the hop geometry in grok-hyper. The single adjudicator \
+lives in turn.rs. Empty tool-hop text is not a user bubble. Substantial content on \
+a tool hop is remembered as last_spoken so a later empty completion still delivers \
+that paragraph instead of the 没有可见回复 fallback. This fixture is long enough.";
+    assert!(crate::stutter::is_substantial_reply(talk));
+    let mut o = opts(&dir);
+    o.max_steps = 8;
+    o.peripheral = false;
+    let scripted = Scripted {
+        turns: Mutex::new(VecDeque::from([
+            turn_said(talk, "read", json!({"path": "ping.txt"})),
+            turn_text(""),
+        ])),
+        meter: false,
+    };
+    let mut agent = Agent::new(scripted, o).unwrap();
+    let out = agent.run("review the loop").await.unwrap();
+    assert_eq!(out.text, talk, "{:?}", out.stop_reason);
+    let _ = std::fs::remove_dir_all(&dir);
 }
 
 #[tokio::test]
@@ -1843,6 +2018,137 @@ async fn bash_block_until_outlives_default_coordinator_timeout() {
     let _ = std::fs::remove_dir_all(dir);
 }
 
+#[tokio::test]
+async fn short_block_until_offloads_for_await_shell() {
+    let dir = std::env::temp_dir().join(format!(
+        "hyper-block-short-{}",
+        uuid::Uuid::new_v4().simple()
+    ));
+    std::fs::create_dir_all(&dir).unwrap();
+    let scripted = Scripted {
+        turns: Mutex::new(VecDeque::from([
+            turn_tool(
+                "Shell",
+                json!({"command": "sleep 2; echo TOO_LATE", "block_until_ms": 400}),
+            ),
+            turn_text("ok"),
+        ])),
+        meter: false,
+    };
+    let mut o = opts(&dir);
+    o.max_steps = 6;
+    let mut agent = Agent::new(scripted, o).unwrap();
+    let started = std::time::Instant::now();
+    let out = agent.run("background the sleep").await.unwrap();
+    assert_eq!(out.text, "ok");
+    assert!(
+        started.elapsed() < std::time::Duration::from_secs(2),
+        "short block_until_ms must return the hop before sleep finishes: {:?}",
+        started.elapsed()
+    );
+    let tool_txt = agent
+        .messages
+        .iter()
+        .find(|m| m.role == "tool")
+        .map(|m| m.content.as_deref().unwrap_or(""))
+        .unwrap_or("");
+    assert!(
+        tool_txt.contains("running in background"),
+        "expected AwaitShell handoff, got {tool_txt}"
+    );
+    assert!(
+        !tool_txt.trim().eq_ignore_ascii_case("timeout"),
+        "must not hard-timeout a short block_until_ms: {tool_txt}"
+    );
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+#[tokio::test]
+async fn zero_block_until_offloads_immediately() {
+    let dir = std::env::temp_dir().join(format!(
+        "hyper-block-zero-{}",
+        uuid::Uuid::new_v4().simple()
+    ));
+    std::fs::create_dir_all(&dir).unwrap();
+    let scripted = Scripted {
+        turns: Mutex::new(VecDeque::from([
+            turn_tool(
+                "Shell",
+                json!({"command": "sleep 2; echo TOO_LATE", "block_until_ms": 0}),
+            ),
+            turn_text("ok"),
+        ])),
+        meter: false,
+    };
+    let mut o = opts(&dir);
+    o.max_steps = 6;
+    let mut agent = Agent::new(scripted, o).unwrap();
+    let started = std::time::Instant::now();
+    let out = agent.run("background immediately").await.unwrap();
+    assert_eq!(out.text, "ok");
+    assert!(
+        started.elapsed() < std::time::Duration::from_secs(2),
+        "block_until_ms=0 must return the hop before sleep finishes: {:?}",
+        started.elapsed()
+    );
+    let tool_txt = agent
+        .messages
+        .iter()
+        .find(|m| m.role == "tool")
+        .map(|m| m.content.as_deref().unwrap_or(""))
+        .unwrap_or("");
+    assert!(
+        tool_txt.contains("running in background"),
+        "block_until_ms=0 must AwaitShell-handoff, got {tool_txt}"
+    );
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+#[tokio::test]
+async fn yes_with_short_block_until_offloads_not_sigpipe() {
+    let dir = std::env::temp_dir().join(format!(
+        "hyper-block-yes-{}",
+        uuid::Uuid::new_v4().simple()
+    ));
+    std::fs::create_dir_all(&dir).unwrap();
+    let scripted = Scripted {
+        turns: Mutex::new(VecDeque::from([
+            turn_tool(
+                "Shell",
+                json!({"command": "yes UNIQUE_YES_CAP", "block_until_ms": 400}),
+            ),
+            turn_text("ok"),
+        ])),
+        meter: false,
+    };
+    let mut o = opts(&dir);
+    o.max_steps = 6;
+    let mut agent = Agent::new(scripted, o).unwrap();
+    let started = std::time::Instant::now();
+    let out = agent.run("background yes").await.unwrap();
+    assert_eq!(out.text, "ok");
+    assert!(
+        started.elapsed() < std::time::Duration::from_secs(3),
+        "yes must offload, not hang: {:?}",
+        started.elapsed()
+    );
+    let tool_txt = agent
+        .messages
+        .iter()
+        .find(|m| m.role == "tool")
+        .map(|m| m.content.as_deref().unwrap_or(""))
+        .unwrap_or("");
+    assert!(
+        tool_txt.contains("running in background"),
+        "yes + block_until_ms must AwaitShell-handoff, got {tool_txt}"
+    );
+    assert!(
+        !tool_txt.contains("exit code -1"),
+        "must not SIGPIPE yes before offload: {tool_txt}"
+    );
+    let _ = std::fs::remove_dir_all(dir);
+}
+
 #[test]
 fn auto_locate_only_on_coding_asks() {
     assert!(wants_auto_locate("修 paging.py 的分页"));
@@ -2258,6 +2564,11 @@ fn forbids_glob_follows_the_user_turn() {
     assert!(forbids_glob("no glob"));
     assert!(!forbids_glob("Search named_new_files then Read"));
     assert!(!forbids_glob("no global state, just Write the file"));
+    assert!(
+        !forbids_glob("Say GLOBEMPTY_OK if Error that no glob_pattern was provided"),
+        "`no glob_pattern` must not count as forbidding Glob"
+    );
+    assert!(!forbids_grep("no grep_files leftovers"));
 }
 
 #[tokio::test]
@@ -2851,6 +3162,47 @@ async fn leaked_write_json_fence_runs_write() {
         .filter(|m| m.role == "assistant" && m.tool_calls.as_ref().is_some_and(|c| !c.is_empty()))
         .count();
     assert_eq!(tool_hops, 1, "lifted Write must be a native tool hop");
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+#[tokio::test]
+async fn citation_answer_quoting_write_is_delivery() {
+    let dir = std::env::temp_dir().join(format!(
+        "hyper-cite-write-{}",
+        uuid::Uuid::new_v4().simple()
+    ));
+    std::fs::create_dir_all(&dir).unwrap();
+    let answer = format!(
+        "{SYNTH_ANSWER}\n\n\
+```158:224:crates/hyper-loop/src/agent/turn.rs\n\
+    fn hop_is_delivery(turn: &ModelTurn) -> bool {{\n\
+        turn.tool_calls.is_empty()\n\
+    }}\n```\n\n\
+Narration such as `I'll write files` or empty html fences is recovered; \
+this hop is the finished answer covering empty hops, leaked Write-as-prose, \
+inspect streak, and Write-then-Read waves. 我会调用 write 只是引用，不是再写文件。"
+    );
+    let scripted = Scripted {
+        turns: Mutex::new(VecDeque::from([turn_text(&answer)])),
+        meter: false,
+    };
+    let mut o = opts(&dir);
+    o.max_steps = 4;
+    let mut agent = Agent::new(scripted, o).unwrap();
+    let out = agent.run("explain the loop").await.unwrap();
+    assert_eq!(out.text, answer);
+    assert_eq!(out.stop_reason, None, "{:?}", out.stop_reason);
+    let hidden: Vec<_> = agent
+        .messages
+        .iter()
+        .filter(|m| m.role == "user")
+        .filter_map(|m| m.content.as_deref())
+        .filter(|c| crate::template::is_hidden_user_text(c))
+        .collect();
+    assert!(
+        hidden.iter().all(|c| !c.contains(WRITE_NOW_NOTE)),
+        "citation essay must not arm write-now: {hidden:?}"
+    );
     let _ = std::fs::remove_dir_all(dir);
 }
 
@@ -3699,6 +4051,56 @@ async fn parallel_reads() {
     let _ = std::fs::remove_dir_all(dir);
 }
 
+#[tokio::test]
+async fn write_then_read_same_hop_sees_new_bytes() {
+    let dir = std::env::temp_dir().join(format!("hyper-wave-wr-{}", uuid::Uuid::new_v4().simple()));
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(dir.join("a.rs"), "OLD\n").unwrap();
+    let scripted = Scripted {
+        turns: Mutex::new(VecDeque::from([
+            turn_tools(vec![
+                (
+                    "w",
+                    "Write",
+                    json!({"path": "a.rs", "contents": "NEW_BODY\n"}),
+                ),
+                ("r", "Read", json!({"path": "a.rs"})),
+            ]),
+            turn_text("updated"),
+        ])),
+        meter: false,
+    };
+    let mut o = opts(&dir);
+    o.max_steps = 6;
+    o.peripheral = false;
+    let mut agent = Agent::new(scripted, o).unwrap();
+    let out = agent.run("fix a.rs").await.unwrap();
+    assert_eq!(out.text, "updated");
+    let tools: Vec<_> = agent
+        .messages
+        .iter()
+        .filter(|m| m.role == "tool")
+        .map(|m| m.content.clone().unwrap_or_default())
+        .collect();
+    assert_eq!(tools.len(), 2, "{tools:?}");
+    assert!(
+        !tools[0].contains("[diagnostics]"),
+        "Write must not auto-cargo-check: {}",
+        tools[0]
+    );
+    assert!(
+        tools[1].contains("NEW_BODY"),
+        "Read after Write in the same hop must see new bytes: {}",
+        tools[1]
+    );
+    assert!(
+        !tools[1].contains("OLD"),
+        "Read must not race ahead of Write: {}",
+        tools[1]
+    );
+    let _ = std::fs::remove_dir_all(dir);
+}
+
 #[test]
 fn parallel_safe_batch_only_read_and_view() {
     let call = |id: &str, name: &str| ToolCall {
@@ -3743,6 +4145,28 @@ fn parallel_safe_batch_only_read_and_view() {
         call("a", "read"),
         call("b", "memory_search")
     ]));
+}
+
+#[test]
+fn dispatch_waves_split_on_mutation() {
+    let call = |id: &str, name: &str| ToolCall {
+        id: id.into(),
+        name: name.into(),
+        arguments: json!({}),
+    };
+    let waves = dispatch_waves(&[
+        call("r1", "Read"),
+        call("g", "Grep"),
+        call("w", "Write"),
+        call("r2", "Read"),
+        call("sh", "Shell"),
+        call("r3", "Read"),
+    ]);
+    assert_eq!(waves, vec![vec![0, 1], vec![2], vec![3], vec![4], vec![5]]);
+    assert_eq!(
+        dispatch_waves(&[call("r1", "Read"), call("r2", "Read")]),
+        vec![vec![0, 1]]
+    );
 }
 
 #[tokio::test]
@@ -5933,11 +6357,7 @@ async fn slow_first_timeout_still_gets_an_agent_retry() {
     let dir = std::env::temp_dir().join(format!("grok-hyper-{}", uuid::Uuid::new_v4().simple()));
     std::fs::create_dir_all(&dir).unwrap();
     let n = std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0));
-    let mut agent = Agent::new(
-        SlowThenOk { n: n.clone() },
-        opts(&dir),
-    )
-    .unwrap();
+    let mut agent = Agent::new(SlowThenOk { n: n.clone() }, opts(&dir)).unwrap();
     let out = agent.run("hi").await.unwrap();
     assert_eq!(out.text, "recovered");
     assert_eq!(n.load(std::sync::atomic::Ordering::SeqCst), 2);
@@ -6012,9 +6432,10 @@ async fn missing_result_is_closed_on_resume() {
     let mut agent = Agent::new(scripted, o).unwrap();
     let out = agent.run("继续").await.unwrap();
     assert_eq!(out.text, "resumed");
-    assert!(agent.messages.iter().any(|m| {
-        m.role == "tool" && m.text().contains("Side effects are unknown")
-    }));
+    assert!(agent
+        .messages
+        .iter()
+        .any(|m| { m.role == "tool" && m.text().contains("Side effects are unknown") }));
     let mut pending = std::collections::BTreeSet::new();
     for message in &agent.messages {
         if let Some(calls) = &message.tool_calls {
@@ -6030,7 +6451,10 @@ async fn missing_result_is_closed_on_resume() {
             }
         }
     }
-    assert!(pending.is_empty(), "tool_calls must stay paired: {pending:?}");
+    assert!(
+        pending.is_empty(),
+        "tool_calls must stay paired: {pending:?}"
+    );
     let _ = std::fs::remove_dir_all(dir);
 }
 
@@ -7047,6 +7471,37 @@ async fn computer_use_unmounted_is_unknown_tool() {
 }
 
 #[tokio::test]
+async fn get_dynamic_tools_unmounted_is_unknown_tool() {
+    let dir = std::env::temp_dir().join(format!("hyper-mcp-off-{}", uuid::Uuid::new_v4().simple()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let scripted = Scripted {
+        turns: Mutex::new(VecDeque::from([
+            turn_tool("GetDynamicTools", json!({})),
+            turn_text("ok"),
+        ])),
+        meter: false,
+    };
+    let mut agent = Agent::new(scripted, opts(&dir)).unwrap();
+    assert!(!crate::tools_schema::has_tool(
+        agent.tools(),
+        "GetDynamicTools"
+    ));
+    let out = agent.run("list mcp tools").await.unwrap();
+    assert_eq!(out.text, "ok");
+    let body = agent
+        .messages
+        .iter()
+        .find(|m| m.role == "tool")
+        .expect("tool")
+        .text();
+    assert!(
+        body.contains("unknown tool") && body.contains("GetDynamicTools"),
+        "hallucinated GetDynamicTools must not execute: {body}"
+    );
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+#[tokio::test]
 async fn computer_use_mounted_dispatches() {
     let dir = std::env::temp_dir().join(format!("hyper-cu-on-{}", uuid::Uuid::new_v4().simple()));
     std::fs::create_dir_all(&dir).unwrap();
@@ -7072,6 +7527,135 @@ async fn computer_use_mounted_dispatches() {
     assert!(
         body.contains("waited") && !body.contains("unknown tool"),
         "mounted ComputerUse must run: {body}"
+    );
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+#[tokio::test]
+async fn computer_use_click_error_does_not_panic_next_hop() {
+    let dir =
+        std::env::temp_dir().join(format!("hyper-cu-click-{}", uuid::Uuid::new_v4().simple()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let scripted = Scripted {
+        turns: Mutex::new(VecDeque::from([
+            turn_tool(
+                "ComputerUse",
+                json!({"action": "click", "x": 12.0, "y": 40.0}),
+            ),
+            turn_text("click failed; continuing"),
+        ])),
+        meter: false,
+    };
+    let mut o = opts(&dir);
+    o.computer_use = true;
+    let mut agent = Agent::new(scripted, o).unwrap();
+    let out = agent
+        .run("click the desktop")
+        .await
+        .expect("ComputerUse click Error must not panic the next hop");
+    assert_eq!(out.text, "click failed; continuing");
+    let body = agent
+        .messages
+        .iter()
+        .find(|m| m.role == "tool")
+        .expect("tool")
+        .text();
+    assert!(
+        !body.contains("unknown tool"),
+        "mounted ComputerUse must execute: {body}"
+    );
+    assert!(
+        body.starts_with("Error:") || body.contains("clicked"),
+        "click must return Error or Success, not panic: {body}"
+    );
+    let _ = crate::session::messages_to_responses_input(&agent.wire_messages());
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+struct PanicOnSecond {
+    inner: Scripted,
+    n: Mutex<u32>,
+}
+
+impl Completer for PanicOnSecond {
+    async fn complete(
+        &self,
+        messages: &[ChatMessage],
+        tools: Option<&[Value]>,
+    ) -> crate::error::Result<ModelTurn> {
+        let n = {
+            let mut g = self.n.lock().expect("n");
+            *g += 1;
+            *g
+        };
+        if n >= 2 {
+            panic!("synthetic hop panic after tool");
+        }
+        self.inner.complete(messages, tools).await
+    }
+}
+
+#[tokio::test]
+async fn turn_panic_closes_run_lifecycle() {
+    let dir = std::env::temp_dir().join(format!("hyper-panic-{}", uuid::Uuid::new_v4().simple()));
+    let sess = dir.join("sessions");
+    std::fs::create_dir_all(&sess).unwrap();
+    let inner = Scripted {
+        turns: Mutex::new(VecDeque::from([
+            turn_tool(
+                "ComputerUse",
+                json!({"action": "click", "x": 1.0, "y": 1.0}),
+            ),
+            turn_text("should not reach"),
+        ])),
+        meter: false,
+    };
+    let scripted = PanicOnSecond {
+        inner,
+        n: Mutex::new(0),
+    };
+    let mut o = opts(&dir);
+    o.computer_use = true;
+    o.persist_session = true;
+    o.session_id = "panic1".into();
+    o.session_dir = Some(sess.clone());
+    let mut agent = Agent::new(scripted, o).unwrap();
+    let err = agent
+        .run("click then panic")
+        .await
+        .expect_err("panic must become a Result error");
+    let err = err.to_string();
+    assert!(err.contains("turn task panicked"), "{err}");
+    let log = SessionLog::open_in(&sess, "panic1").unwrap();
+    let runs: Vec<_> = log
+        .events()
+        .iter()
+        .filter_map(|event| match event {
+            SessionEvent::Run(run) => Some(run.phase),
+            _ => None,
+        })
+        .collect();
+    assert!(
+        runs.contains(&RunPhase::Accepted) && runs.contains(&RunPhase::Started),
+        "run started: {runs:?}"
+    );
+    assert!(
+        runs.contains(&RunPhase::Error),
+        "panic must close the run: {runs:?}"
+    );
+    assert!(
+        log.events().iter().any(|e| matches!(
+            e,
+            SessionEvent::Step(s) if s.phase == StepPhase::Error
+        )),
+        "step error missing"
+    );
+    assert!(
+        log.events().iter().any(|e| matches!(
+            e,
+            SessionEvent::Context(c) if c.kind == "panic"
+        )),
+        "panic diagnostic context missing"
     );
     let _ = std::fs::remove_dir_all(dir);
 }
@@ -7181,6 +7765,49 @@ async fn read_lints_tsx_without_tsconfig_is_not_clean() {
     );
     assert!(
         body.contains("tsconfig") || body.contains("tsc") || body.starts_with("Error:"),
+        "{body}"
+    );
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+#[tokio::test]
+async fn read_lints_stray_rs_is_not_clean() {
+    let dir = std::env::temp_dir().join(format!(
+        "hyper-lints-stray-{}",
+        uuid::Uuid::new_v4().simple()
+    ));
+    std::fs::create_dir_all(dir.join("src")).unwrap();
+    std::fs::write(
+        dir.join("Cargo.toml"),
+        "[package]\nname = \"lintstrayag\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
+    )
+    .unwrap();
+    std::fs::write(dir.join("src/lib.rs"), "pub fn ok() {}\n").unwrap();
+    std::fs::write(dir.join("bad.rs"), "fn main() { let x = 1 }\n").unwrap();
+    let scripted = Scripted {
+        turns: Mutex::new(VecDeque::from([
+            turn_tool("ReadLints", json!({"paths": ["bad.rs"]})),
+            turn_text("ok"),
+        ])),
+        meter: false,
+    };
+    let mut o = opts(&dir);
+    o.max_steps = 6;
+    let mut agent = Agent::new(scripted, o).unwrap();
+    let out = agent.run("check bad.rs").await.unwrap();
+    assert_eq!(out.text, "ok");
+    let body = agent
+        .messages
+        .iter()
+        .find(|m| m.role == "tool")
+        .expect("ReadLints")
+        .text();
+    assert!(
+        !body.contains("No compiler or linter errors"),
+        "stray rs must not look clean: {body}"
+    );
+    assert!(
+        body.contains("bad.rs") && (body.contains("crate source") || body.contains("Cargo.toml")),
         "{body}"
     );
     let _ = std::fs::remove_dir_all(dir);
@@ -7943,6 +8570,17 @@ async fn inspect_tour_of_new_files_eventually_synthesizes() {
         none.iter().all(|t| !*t),
         "inspect cap must keep tools mounted: {none:?}"
     );
+    let hidden: Vec<_> = agent
+        .messages
+        .iter()
+        .filter(|m| m.role == "user")
+        .filter_map(|m| m.content.as_deref())
+        .filter(|c| crate::template::is_hidden_user_text(c))
+        .collect();
+    assert!(
+        hidden.iter().any(|c| c.contains(FORCED_SYNTHESIS_NOTE)),
+        "inspect streak must reach grok as [channel]: {hidden:?}"
+    );
     let _ = std::fs::remove_dir_all(dir);
 }
 
@@ -8560,17 +9198,18 @@ async fn official_sidecar_restores_blob_and_skip_without_jsonl_blob() {
         )
         .unwrap();
         agent.run("keep this live user").await.unwrap();
-        agent
-            .log
-            .as_ref()
-            .unwrap()
-            .save_official(&item, 1)
-            .unwrap();
+        agent.log.as_ref().unwrap().save_official(&item, 1).unwrap();
         assert!(
-            agent.log.as_ref().unwrap().events().iter().all(|e| match e {
-                crate::session::SessionEvent::Compact(c) => c.official_blob.is_none(),
-                _ => true,
-            }),
+            agent
+                .log
+                .as_ref()
+                .unwrap()
+                .events()
+                .iter()
+                .all(|e| match e {
+                    crate::session::SessionEvent::Compact(c) => c.official_blob.is_none(),
+                    _ => true,
+                }),
             "overnight blob must stay on the sidecar, not JSONL"
         );
         assert!(has_recall(agent.tools()));

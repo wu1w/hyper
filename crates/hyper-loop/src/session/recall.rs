@@ -40,9 +40,8 @@ fn search(log: Option<&SessionLog>, id: &str, query: &str, limits: ToolLimits) -
                 // Include small source events in one hop; keep a focused
                 // snippet plus expansion handle for larger results.
                 let original = log
-                    .events()
-                    .get(h.seq as usize)
-                    .map(|event| format_event(h.seq as u32, event))
+                    .event_at(h.seq as usize)
+                    .map(|event| format_event(h.seq as u32, &event))
                     .filter(|text| text.chars().count() <= 1600);
                 let evidence = original.as_deref().unwrap_or(h.snippet.trim());
                 text.push_str(&format!(
@@ -64,7 +63,7 @@ fn expand_seq(log: Option<&SessionLog>, id: &str, seq: u32, limits: ToolLimits) 
     let Some(log) = log else {
         return ToolResponse::text(id, "Error: no session log.", ToolState::Error);
     };
-    let Some(event) = log.events().get(seq as usize) else {
+    let Some(event) = log.event_at(seq as usize) else {
         return ToolResponse::text(
             id,
             format!("Error: seq {seq} out of range."),
@@ -73,7 +72,7 @@ fn expand_seq(log: Option<&SessionLog>, id: &str, seq: u32, limits: ToolLimits) 
     };
     folded_response(
         id,
-        format_event(seq, event),
+        format_event(seq, &event),
         ToolState::Success,
         limits,
         None,

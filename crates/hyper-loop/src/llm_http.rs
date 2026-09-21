@@ -153,12 +153,27 @@ pub fn apply_env_proxy(b: reqwest::ClientBuilder, base_url: &str) -> reqwest::Cl
         return b;
     };
     match reqwest::Proxy::all(&proxy) {
-        Ok(px) => b.proxy(px.no_proxy(reqwest::NoProxy::from_env())),
+        Ok(px) => b.proxy(px.no_proxy(loopback_noproxy())),
         Err(e) => {
             eprintln!("hyper llm proxy ignored ({proxy}): {e}");
             b
         }
     }
+}
+
+/// WebFetch / view / IM must not send `127.0.0.1` through a corporate proxy.
+fn loopback_noproxy() -> Option<reqwest::NoProxy> {
+    let mut s = "localhost,127.0.0.1,::1,[::1]".to_string();
+    for key in ["NO_PROXY", "no_proxy"] {
+        if let Ok(v) = std::env::var(key) {
+            let v = v.trim();
+            if !v.is_empty() {
+                s.push(',');
+                s.push_str(v);
+            }
+        }
+    }
+    reqwest::NoProxy::from_string(&s)
 }
 
 pub(crate) fn env_http_proxy() -> Option<String> {
@@ -294,7 +309,11 @@ pub fn attach_retry_after(snippet: String, headers: &reqwest::header::HeaderMap)
     else {
         return snippet;
     };
-    let digits: String = raw.trim().chars().take_while(|c| c.is_ascii_digit()).collect();
+    let digits: String = raw
+        .trim()
+        .chars()
+        .take_while(|c| c.is_ascii_digit())
+        .collect();
     if digits.is_empty() {
         snippet
     } else {

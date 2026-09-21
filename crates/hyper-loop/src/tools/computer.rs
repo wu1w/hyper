@@ -18,6 +18,9 @@ use crate::tool_calls::{CancelFlag, ToolCall, ToolResponse, ToolState};
 
 const MAX_EDGE: u32 = 1280;
 const MAX_WAIT_MS: u32 = 8_000;
+/// Wall clock for one ComputerUse hop. xcap `Monitor::all` can block on a
+/// macOS Screen Recording prompt; fail instead of freezing the agent.
+const COMPUTER_HOP_MS: u64 = 12_000;
 const WAIT_SLICE: Duration = Duration::from_millis(50);
 #[allow(dead_code)]
 const MAX_TYPE_CHARS: usize = 4_000;
@@ -139,6 +142,64 @@ pub fn os_hint(err: &str) -> String {
     }
 }
 
+/// macOS Screen Recording vs Accessibility are independent. A working
+/// screenshot must not imply click/type will succeed.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Capabilities {
+    pub screenshot: bool,
+    pub input: bool,
+}
+
+pub const INPUT_DENIED: &str = "the application does not have the permission to simulate input";
+
+pub fn capabilities() -> Capabilities {
+    #[cfg(target_os = "macos")]
+    {
+        Capabilities {
+            screenshot: macos_screenshot_trusted(),
+            input: macos_input_trusted(),
+        }
+    }
+    #[cfg(target_os = "windows")]
+    {
+        Capabilities {
+            screenshot: true,
+            input: true,
+        }
+    }
+    #[cfg(not(any(target_os = "macos", target_os = "windows")))]
+    {
+        Capabilities {
+            screenshot: false,
+            input: false,
+        }
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn macos_input_trusted() -> bool {
+    #[link(name = "ApplicationServices", kind = "framework")]
+    extern "C" {
+        fn AXIsProcessTrusted() -> u8;
+    }
+    unsafe { AXIsProcessTrusted() != 0 }
+}
+
+#[cfg(target_os = "macos")]
+fn macos_screenshot_trusted() -> bool {
+    #[link(name = "CoreGraphics", kind = "framework")]
+    extern "C" {
+        fn CGPreflightScreenCaptureAccess() -> bool;
+    }
+    unsafe { CGPreflightScreenCaptureAccess() }
+}
+
+/// Model-facing schema. When Accessibility is off, describe screenshot-only
+/// so a successful capture does not imply click/type will work.
+pub fn tool_schema() -> serde_json::Value {
+    crate::tools_schema::computer_use_tool_for(capabilities().input)
+}
+
 fn aborted(id: &str) -> ToolResponse {
     ToolResponse::text(id, "Error: tool task aborted", ToolState::Interrupted)
 }
@@ -159,6 +220,16 @@ pub async fn computer_use(call: &ToolCall, cancel: CancelFlag, session_id: &str)
         _ = cancel.cancelled() => {
             join.abort();
             aborted(&call.id)
+        }
+        _ = tokio::time::sleep(Duration::from_millis(COMPUTER_HOP_MS)) => {
+            join.abort();
+            ToolResponse::text(
+                &call.id,
+                os_hint(&format!(
+                    "timed out after {COMPUTER_HOP_MS}ms (Screen Recording / Accessibility prompt, or a stuck capture)"
+                )),
+                ToolState::Error,
+            )
         }
         r = &mut join => match r {
             Ok(_) if cancel.is_cancelled() => aborted(&call.id),
@@ -190,8 +261,26 @@ fn execute_sync_cancel(call: &ToolCall, cancel: &CancelFlag) -> ToolResponse {
     };
     match action {
         Action::Wait => run_wait(&call.id, &call.arguments, cancel),
-        Action::ListDisplays => run_list_displays(&call.id),
-        Action::Screenshot => run_screenshot(&call.id, &call.arguments, cancel),
+        Action::ListDisplays => {
+            if !capabilities().screenshot {
+                return ToolResponse::text(
+                    &call.id,
+                    os_hint("Screen Recording permission is off"),
+                    ToolState::Error,
+                );
+            }
+            run_list_displays(&call.id)
+        }
+        Action::Screenshot => {
+            if !capabilities().screenshot {
+                return ToolResponse::text(
+                    &call.id,
+                    os_hint("Screen Recording permission is off"),
+                    ToolState::Error,
+                );
+            }
+            run_screenshot(&call.id, &call.arguments, cancel)
+        }
         Action::Click
         | Action::DoubleClick
         | Action::RightClick
@@ -485,6 +574,9 @@ mod sys {
     }
 
     fn enigo() -> Result<Enigo, String> {
+        if !super::capabilities().input {
+            return Err(super::INPUT_DENIED.into());
+        }
         Enigo::new(&Settings::default()).map_err(|e| e.to_string())
     }
 
@@ -726,6 +818,23 @@ mod tests {
         assert!(parse_action_name(&json!({"action": "explode"})).is_none());
     }
 
+    #[tokio::test]
+    async fn list_displays_does_not_hang() {
+        let started = std::time::Instant::now();
+        let r = computer_use(
+            &call(json!({"action": "list_displays"})),
+            CancelFlag::new(),
+            "test-session",
+        )
+        .await;
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(14),
+            "list_displays took {:?}",
+            started.elapsed()
+        );
+        assert!(!r.joined_text().trim().is_empty(), "{}", r.joined_text());
+    }
+
     #[test]
     fn observe_actions_skip_permit() {
         assert!(is_observe(&json!({"action": "screenshot"})));
@@ -846,5 +955,17 @@ mod tests {
         assert_eq!(last_shot().unwrap().origin_x, 1);
         set_shot_session("cu-b");
         assert_eq!(last_shot().unwrap().origin_x, 10);
+    }
+
+    #[test]
+    fn click_without_input_capability_is_error_not_panic() {
+        if capabilities().input {
+            return;
+        }
+        let r = execute_sync(&call(json!({"action": "click", "x": 12.0, "y": 34.0})));
+        assert_eq!(r.state, ToolState::Error, "{}", r.joined_text());
+        assert!(r.joined_text().starts_with("Error:"), "{}", r.joined_text());
+        let r2 = execute_sync(&call(json!({"action": "click", "x": 1.0, "y": 1.0})));
+        assert_eq!(r2.state, ToolState::Error, "{}", r2.joined_text());
     }
 }

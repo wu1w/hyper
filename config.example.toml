@@ -33,7 +33,7 @@ narrate = true                 # TUI/web Qwen: one-line progress card. grok-4.6 
 
 [policy]
 default_mode = "agent"
-default_effort = "auto"        # grok-4.6 → xhigh; Qwen still medium. /think still overrides.
+default_effort = "auto"        # grok-4.6 → high; xhigh is /think xhigh. Qwen still medium.
 max_think_tokens_low = 512
 max_think_tokens_medium = 2048
 max_think_tokens_xhigh = 4096

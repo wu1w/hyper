@@ -440,8 +440,6 @@ impl<C: Completer> Agent<C> {
         let mut test_red = false;
         let mut saw_test_output = false;
         let mut guard_notes: Vec<guard::GuardNote> = Vec::new();
-        let mut edited: Vec<String> = Vec::new();
-        let mut last_edit_id: Option<String> = None;
         for (call, response) in calls.iter().zip(responses.iter_mut()) {
             if is_harness_fail(&response) {
                 harness = true;
@@ -474,10 +472,6 @@ impl<C: Completer> Agent<C> {
                     if let Some(path) = fs_tool_path(&call.name, &call.arguments) {
                         if crate::channel::xfer::is_sendable_rel(&path) {
                             self.channel_files.push(path.clone());
-                        }
-                        if verify::is_code_path(&path) {
-                            edited.push(path.clone());
-                            last_edit_id = Some(call.id.clone());
                         }
                         if let Some(idx) = &self.code_index {
                             idx.refresh(&self.workspace, &path);
@@ -521,27 +515,19 @@ impl<C: Completer> Agent<C> {
                 }
             }
         }
-        // One check of the final batch state. Aborting an async wrapper does
-        // not stop its spawn_blocking compiler, so per-edit restarts leaked
-        // concurrent cargo checks and contended on the build lock.
-        let diag =
-            verify::run_diagnostics_async(self.workspace.root(), &edited, &self.cancel).await;
-        if let Some(diag) = diag.as_ref() {
-            if let Some(id) = last_edit_id.as_deref() {
-                if let Some(i) = calls.iter().position(|c| c.id == id) {
-                    responses[i].content.push(TextBlock { text: diag.clone() });
-                }
-            }
-            self.note("[diagnostics]");
-        }
         self.progress.fold_and_observe(
             &self.workspace,
             &calls,
             &mut responses,
             test_red,
             saw_test_output,
-            diag.as_deref(),
+            None,
         );
+        if !self.synthesis_nudged && self.progress.inspect_cap_hit() {
+            self.synthesis_nudged = true;
+            self.note("[channel] inspect streak; answer with evidence");
+            self.push_hidden_user(super::progress::FORCED_SYNTHESIS_NOTE);
+        }
         for (call, response) in calls.iter().zip(responses) {
             let state = response.state.clone();
             let summary = response.joined_text();
@@ -608,7 +594,13 @@ impl<C: Completer> Agent<C> {
             let Ok(abs) = self.workspace.resolve(&path) else {
                 continue;
             };
-            if let Ok(body) = std::fs::read_to_string(abs) {
+            if crate::tools::is_special_file(&abs) {
+                continue;
+            }
+            if crate::tools::is_oversized_text(&abs) {
+                continue;
+            }
+            if let Some(body) = crate::tools::read_text_if_regular(&abs) {
                 out.insert(call.id.clone(), body);
             }
         }
@@ -653,6 +645,13 @@ impl<C: Completer> Agent<C> {
             return Some(ToolResponse::text(
                 &call.id,
                 permit::plan_denied(name),
+                ToolState::Error,
+            ));
+        }
+        if self.clarify_mode && !self.plan_mode && permit::ask_mode_blocks(name, &call.arguments) {
+            return Some(ToolResponse::text(
+                &call.id,
+                permit::ask_denied(name),
                 ToolState::Error,
             ));
         }
@@ -716,6 +715,13 @@ impl<C: Completer> Agent<C> {
         let Some(log) = &self.log else {
             return;
         };
+        if crate::tools::is_special_file(log.path()) {
+            self.persistence_error = Some(format!(
+                "session persistence failed: {} is not a regular file; task paused before further tools",
+                log.path().display()
+            ));
+            return;
+        }
         if let Err(error) = std::fs::OpenOptions::new().append(true).open(log.path()) {
             self.persistence_error = Some(format!(
                 "session persistence failed: {error}; task paused before further tools"
@@ -1133,14 +1139,19 @@ impl<C: Completer> Agent<C> {
         match dispatch_name(&call.name) {
             "ask" => self.run_ask(call).await,
             "recall" => run_recall(self.log.as_ref(), &self.blobs, call, self.limits),
-            "memory_search" => match &self.memory {
-                Some(store) => run_memory_search(store, call, self.limits),
-                None => ToolResponse::text(
-                    &call.id,
-                    "Error: memory store unavailable.",
-                    ToolState::Error,
-                ),
-            },
+            "memory_search" => {
+                if !has_tool(&self.tools, "memory_search") {
+                    return unknown_tool_reply(&call.id, &call.name);
+                }
+                match &self.memory {
+                    Some(store) => run_memory_search(store, call, self.limits),
+                    None => ToolResponse::text(
+                        &call.id,
+                        "Error: memory store unavailable.",
+                        ToolState::Error,
+                    ),
+                }
+            }
             "search" => self.dispatch_search(call),
             "readlints" => self.dispatch_read_lints(call).await,
             "web" => {
@@ -1160,6 +1171,9 @@ impl<C: Completer> Agent<C> {
                 .await
             }
             "mcp" => {
+                if !has_tool(&self.tools, "mcp") {
+                    return unknown_tool_reply(&call.id, &call.name);
+                }
                 let mcp = self.mcp.clone();
                 let blobs = self.blobs.clone();
                 let limits = self.limits;
@@ -1170,6 +1184,9 @@ impl<C: Completer> Agent<C> {
                 .await
             }
             "getdynamictools" => {
+                if !has_tool(&self.tools, "GetDynamicTools") {
+                    return unknown_tool_reply(&call.id, &call.name);
+                }
                 let mcp = self.mcp.clone();
                 let blobs = self.blobs.clone();
                 let limits = self.limits;
@@ -1180,6 +1197,9 @@ impl<C: Completer> Agent<C> {
                 .await
             }
             "calldynamictool" => {
+                if !has_tool(&self.tools, "CallDynamicTool") {
+                    return unknown_tool_reply(&call.id, &call.name);
+                }
                 let mcp = self.mcp.clone();
                 let blobs = self.blobs.clone();
                 let limits = self.limits;
@@ -1190,6 +1210,9 @@ impl<C: Completer> Agent<C> {
                 .await
             }
             "fetchmcpresource" => {
+                if !has_tool(&self.tools, "FetchMcpResource") {
+                    return unknown_tool_reply(&call.id, &call.name);
+                }
                 let mcp = self.mcp.clone();
                 let blobs = self.blobs.clone();
                 let limits = self.limits;
@@ -1265,7 +1288,7 @@ impl<C: Completer> Agent<C> {
                 }
                 run_search(idx, &self.workspace, call, self.limits)
             }
-            None => ToolResponse::text(&call.id, crate::tools::SEARCH_WARMING, ToolState::Success),
+            None => ToolResponse::text(&call.id, crate::tools::SEARCH_FAILED, ToolState::Error),
         }
     }
 
@@ -1336,85 +1359,64 @@ impl<C: Completer> Agent<C> {
         let mut out: Vec<Option<ToolResponse>> = vec![None; calls.len()];
         let mut skipped = HashSet::new();
         let slot = self.speculate.clone();
-        if parallel_safe_batch(calls) {
-            if let Some(slot) = &slot {
-                for (i, call) in calls.iter().enumerate() {
-                    if let Some(r) = slot.take(&call.id).await {
-                        self.emit_tool_lifecycle(
-                            call,
-                            ToolLifecyclePhase::Started,
-                            Some(preview_args(call)),
-                        );
-                        let r = self.finish_prefetch(call, r).await;
-
-                        out[i] = Some(r);
-                    }
-                }
-            }
-            let pending: Vec<(usize, ToolCall)> = calls
-                .iter()
-                .enumerate()
-                .filter(|(i, _)| out[*i].is_none())
-                .map(|(i, c)| (i, c.clone()))
-                .collect();
-            if !pending.is_empty() {
-                let pending_calls: Vec<ToolCall> = pending.iter().map(|(_, c)| c.clone()).collect();
-                let rest = if crate::channel::has_steer(&self.steer) {
-                    pending_calls
-                        .iter()
-                        .map(|call| {
-                            skipped.insert(call.id.clone());
-                            ToolResponse::text(&call.id, STEER_SKIPPED_MSG, ToolState::Interrupted)
-                        })
-                        .collect()
-                } else {
-                    for call in &pending_calls {
-                        self.emit_tool_lifecycle(
-                            call,
-                            ToolLifecyclePhase::Started,
-                            Some(preview_args(call)),
-                        );
-                    }
-                    self.dispatch_parallel(&pending_calls).await
-                };
-                for ((i, _), r) in pending.into_iter().zip(rest) {
-                    out[i] = Some(r);
-                }
-            }
-        } else {
+        if let Some(slot) = &slot {
             for (i, call) in calls.iter().enumerate() {
-                if crate::channel::has_steer(&self.steer) {
-                    skipped.insert(call.id.clone());
-                    out[i] = Some(ToolResponse::text(
-                        &call.id,
-                        STEER_SKIPPED_MSG,
-                        ToolState::Interrupted,
-                    ));
-                    continue;
+                if let Some(r) = slot.take(&call.id).await {
+                    self.emit_tool_lifecycle(
+                        call,
+                        ToolLifecyclePhase::Started,
+                        Some(preview_args(call)),
+                    );
+                    out[i] = Some(self.finish_prefetch(call, r).await);
                 }
-                if let Some(slot) = &slot {
-                    if let Some(r) = slot.take(&call.id).await {
-                        self.emit_tool_lifecycle(
-                            call,
-                            ToolLifecyclePhase::Started,
-                            Some(preview_args(call)),
-                        );
-                        let r = self.finish_prefetch(call, r).await;
+            }
+        }
 
-                        out[i] = Some(r);
-                        continue;
-                    }
-                }
+        let mut i = 0;
+        while i < calls.len() {
+            if out[i].is_some() {
+                i += 1;
                 continue;
             }
-            let safe: Vec<(usize, ToolCall)> = calls
-                .iter()
-                .enumerate()
-                .filter(|(i, c)| out[*i].is_none() && is_parallel_safe(&c.name))
-                .map(|(i, c)| (i, c.clone()))
+            if crate::channel::has_steer(&self.steer) {
+                skipped.insert(calls[i].id.clone());
+                out[i] = Some(ToolResponse::text(
+                    &calls[i].id,
+                    STEER_SKIPPED_MSG,
+                    ToolState::Interrupted,
+                ));
+                i += 1;
+                continue;
+            }
+            if self.persistence_error.is_some() {
+                out[i] = Some(ToolResponse::text(
+                    &calls[i].id,
+                    self.persist_paused_text(),
+                    ToolState::Interrupted,
+                ));
+                i += 1;
+                continue;
+            }
+
+            let wave_end = if is_parallel_safe(&calls[i].name) {
+                let mut j = i + 1;
+                while j < calls.len() && out[j].is_none() && is_parallel_safe(&calls[j].name) {
+                    j += 1;
+                }
+                j
+            } else {
+                i + 1
+            };
+            let pending: Vec<(usize, ToolCall)> = (i..wave_end)
+                .filter(|&k| out[k].is_none())
+                .map(|k| (k, calls[k].clone()))
                 .collect();
-            if safe.len() > 1 {
-                let batch: Vec<ToolCall> = safe.iter().map(|(_, c)| c.clone()).collect();
+            if pending.is_empty() {
+                i = wave_end;
+                continue;
+            }
+            if pending.len() > 1 {
+                let batch: Vec<ToolCall> = pending.iter().map(|(_, c)| c.clone()).collect();
                 for call in &batch {
                     self.emit_tool_lifecycle(
                         call,
@@ -1423,45 +1425,27 @@ impl<C: Completer> Agent<C> {
                     );
                 }
                 let rest = self.dispatch_parallel(&batch).await;
-                for ((i, _), r) in safe.into_iter().zip(rest) {
-                    out[i] = Some(r);
+                for ((k, _), r) in pending.into_iter().zip(rest) {
+                    out[k] = Some(r);
                 }
-            }
-            for (i, call) in calls.iter().enumerate() {
-                if out[i].is_some() {
-                    continue;
-                }
-                if crate::channel::has_steer(&self.steer) {
-                    skipped.insert(call.id.clone());
-                    out[i] = Some(ToolResponse::text(
-                        &call.id,
-                        STEER_SKIPPED_MSG,
-                        ToolState::Interrupted,
-                    ));
-                    continue;
-                }
-                if self.persistence_error.is_some() {
-                    out[i] = Some(ToolResponse::text(
-                        &call.id,
-                        self.persist_paused_text(),
-                        ToolState::Interrupted,
-                    ));
-                    continue;
-                }
+            } else {
+                let (k, call) = pending.into_iter().next().expect("pending");
                 self.emit_tool_lifecycle(
-                    call,
+                    &call,
                     ToolLifecyclePhase::Started,
-                    Some(preview_args(call)),
+                    Some(preview_args(&call)),
                 );
                 let r = if dispatch_name(&call.name) == "switchmode" {
-                    self.run_switch_mode(call)
+                    self.run_switch_mode(&call)
                 } else {
-                    self.dispatch_one(call).await
+                    self.dispatch_one(&call).await
                 };
-                out[i] = Some(r);
+                out[k] = Some(r);
                 self.probe_journal();
             }
+            i = wave_end;
         }
+
         if let Some(slot) = &slot {
             slot.abort();
         }
@@ -1510,7 +1494,7 @@ impl<C: Completer> Agent<C> {
             "ask" => {
                 self.plan_mode = false;
                 self.clarify_mode = true;
-                "Switched to ask mode. Use AskQuestion now and wait for the user's answer before continuing."
+                "Switched to ask mode. Workspace is read-only. Use AskQuestion and wait; SwitchMode agent before any Write or Shell."
             }
             _ => {
                 return ToolResponse::text(
@@ -1804,11 +1788,23 @@ fn copy_generated_file(
     dest_rel: &str,
 ) -> std::result::Result<String, String> {
     let src = ws.resolve(src_rel)?;
-    let dest = ws.resolve(dest_rel)?;
-    if let Some(parent) = dest.parent() {
-        std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
+    let dest = ws.resolve_write(dest_rel)?;
+    if crate::tools::is_special_file(&src) {
+        return Err(format!("Error: {src_rel} is not a regular file."));
     }
-    std::fs::copy(&src, &dest).map_err(|e| e.to_string())?;
+    if crate::tools::is_special_file(&dest) {
+        return Err(format!("Error: {dest_rel} is not a regular file."));
+    }
+    const MAX_COPY: u64 = crate::channel::xfer::FETCH_CAP as u64;
+    if let Ok(meta) = std::fs::metadata(&src) {
+        if meta.is_file() && meta.len() > MAX_COPY {
+            return Err(format!("Error: {src_rel} is too large."));
+        }
+    }
+    if let Some(parent) = dest.parent() {
+        std::fs::create_dir_all(parent).map_err(|e| crate::tools::io_user_msg(&e))?;
+    }
+    std::fs::copy(&src, &dest).map_err(|e| crate::tools::io_user_msg(&e))?;
     Ok(ws.shown(dest_rel))
 }
 
@@ -2142,6 +2138,27 @@ pub(crate) fn openai_stored(calls: &[ToolCall]) -> Vec<OpenAiToolCall> {
         .collect()
 }
 
+/// Cursor: consecutive independent reads run together; a mutation starts
+/// a new wave so later Reads see the write. Indices into `calls`.
+pub(crate) fn dispatch_waves(calls: &[ToolCall]) -> Vec<Vec<usize>> {
+    let mut waves = Vec::new();
+    let mut i = 0;
+    while i < calls.len() {
+        if is_parallel_safe(&calls[i].name) {
+            let start = i;
+            i += 1;
+            while i < calls.len() && is_parallel_safe(&calls[i].name) {
+                i += 1;
+            }
+            waves.push((start..i).collect());
+        } else {
+            waves.push(vec![i]);
+            i += 1;
+        }
+    }
+    waves
+}
+
 pub(crate) fn parallel_safe_batch(calls: &[ToolCall]) -> bool {
     calls.len() > 1 && calls.iter().all(|c| is_parallel_safe(&c.name))
 }
@@ -2336,5 +2353,147 @@ mod collect_read_lints_paths_tests {
         obs.insert("README.md".into());
         let got = collect_read_lints_paths(&call(json!({})), &obs);
         assert_eq!(got, vec!["src/lib.rs".to_string()]);
+    }
+}
+
+#[cfg(all(test, unix))]
+mod write_prior_fifo_tests {
+    use crate::config::Config;
+    use crate::tool_calls::ToolCall;
+    use serde_json::json;
+
+    #[test]
+    fn snapshot_write_priors_skips_fifo_without_blocking() {
+        let dir = std::env::temp_dir().join(format!(
+            "hyper-write-prior-fifo-{}",
+            uuid::Uuid::new_v4().simple()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let fifo = dir.join("pipe");
+        let st = std::process::Command::new("mkfifo")
+            .arg(&fifo)
+            .status()
+            .unwrap();
+        assert!(st.success());
+        let mut o = crate::agent::RunOpts::from_config(&Config::default(), dir.clone());
+        o.session_id = "fifo-prior".into();
+        o.print = false;
+        o.max_steps = 4;
+        o.agents_md = false;
+        o.home = Some(dir.join(".hyper-home"));
+        o.peripheral = true;
+        o.skills_auto_catalog = false;
+        o.mcp_auto_catalog = false;
+        o.narrate = false;
+        struct Dummy;
+        impl crate::agent::Completer for Dummy {
+            async fn complete(
+                &self,
+                _messages: &[crate::template::ChatMessage],
+                _tools: Option<&[serde_json::Value]>,
+            ) -> crate::error::Result<crate::agent::ModelTurn> {
+                Err(crate::error::Error::msg("unused"))
+            }
+        }
+        let agent = crate::agent::Agent::new(Dummy, o).unwrap();
+        let calls = [ToolCall {
+            id: "w1".into(),
+            name: "Write".into(),
+            arguments: json!({"path": "pipe", "contents": "nope"}),
+        }];
+        let started = std::time::Instant::now();
+        let priors = agent.snapshot_write_priors(&calls);
+        assert!(started.elapsed() < std::time::Duration::from_secs(2));
+        assert!(priors.is_empty(), "{priors:?}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn copy_generated_file_refuses_fifo() {
+        let dir =
+            std::env::temp_dir().join(format!("hyper-copy-fifo-{}", uuid::Uuid::new_v4().simple()));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("src.png"), b"xx").unwrap();
+        let fifo = dir.join("pipe.png");
+        let st = std::process::Command::new("mkfifo")
+            .arg(&fifo)
+            .status()
+            .unwrap();
+        assert!(st.success());
+        let ws = crate::tools::Workspace::open(&dir, false).unwrap();
+        let started = std::time::Instant::now();
+        let err = super::copy_generated_file(&ws, "src.png", "pipe.png").unwrap_err();
+        assert!(started.elapsed() < std::time::Duration::from_secs(2));
+        assert!(err.contains("not a regular file"), "{err}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn copy_generated_file_refuses_src_fifo() {
+        let dir = std::env::temp_dir().join(format!(
+            "hyper-copy-src-fifo-{}",
+            uuid::Uuid::new_v4().simple()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let fifo = dir.join("src.png");
+        let st = std::process::Command::new("mkfifo")
+            .arg(&fifo)
+            .status()
+            .unwrap();
+        assert!(st.success());
+        let ws = crate::tools::Workspace::open(&dir, false).unwrap();
+        let started = std::time::Instant::now();
+        let err = super::copy_generated_file(&ws, "src.png", "out.png").unwrap_err();
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(2),
+            "FIFO src copy must not block: {:?}",
+            started.elapsed()
+        );
+        assert!(err.contains("not a regular file"), "{err}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn copy_generated_file_allows_nine_mib_image() {
+        let dir = std::env::temp_dir().join(format!(
+            "hyper-copy-9m-{}",
+            uuid::Uuid::new_v4().simple()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let src = dir.join("src.png");
+        {
+            let f = std::fs::File::create(&src).unwrap();
+            f.set_len(9 * 1024 * 1024).unwrap();
+        }
+        let ws = crate::tools::Workspace::open(&dir, false).unwrap();
+        let shown = super::copy_generated_file(&ws, "src.png", "out.png").unwrap();
+        assert!(shown.contains("out.png"), "{shown}");
+        assert_eq!(
+            std::fs::metadata(dir.join("out.png")).unwrap().len(),
+            9 * 1024 * 1024
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn copy_generated_file_refuses_over_fetch_cap() {
+        let dir = std::env::temp_dir().join(format!(
+            "hyper-copy-17m-{}",
+            uuid::Uuid::new_v4().simple()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let src = dir.join("src.png");
+        {
+            let f = std::fs::File::create(&src).unwrap();
+            f.set_len(crate::channel::xfer::FETCH_CAP as u64 + 1).unwrap();
+        }
+        let ws = crate::tools::Workspace::open(&dir, false).unwrap();
+        let started = std::time::Instant::now();
+        let err = super::copy_generated_file(&ws, "src.png", "out.png").unwrap_err();
+        assert!(started.elapsed() < std::time::Duration::from_secs(2));
+        assert!(err.contains("too large"), "{err}");
+        assert!(!dir.join("out.png").exists());
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

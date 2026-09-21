@@ -68,10 +68,10 @@ impl Worktree {
         }
         let dest_s = dest.to_string_lossy().into_owned();
         let out = git(&repo, &["worktree", "add", "--detach", &dest_s, "HEAD"])?;
-        if !out.status.success() {
+        if !out.0 {
             return Err(format!(
                 "git worktree add failed: {}",
-                String::from_utf8_lossy(&out.stderr).trim()
+                String::from_utf8_lossy(&out.2).trim()
             ));
         }
         Ok((Self { path: dest, repo }, true))
@@ -162,14 +162,17 @@ fn git_common_dir(dir: &Path) -> Result<PathBuf, String> {
         .ok_or_else(|| "worktree path is not utf-8".to_string())?;
     let mut cmd = Command::new("git");
     crate::proc_spawn::hide_window(&mut cmd);
-    let out = cmd
-        .args(["-C", dir_s, "rev-parse", "--git-common-dir"])
-        .output()
-        .map_err(|e| format!("git: {e}"))?;
-    if !out.status.success() {
+    cmd.args(["-C", dir_s, "rev-parse", "--git-common-dir"]);
+    let out = crate::proc_spawn::command_output_capped(
+        &mut cmd,
+        8 * 1024,
+        std::time::Duration::from_secs(8),
+    )
+    .map_err(|e| format!("git: {e}"))?;
+    if !out.0 {
         return Err("not a git worktree".into());
     }
-    let raw = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    let raw = String::from_utf8_lossy(&out.1).trim().to_string();
     if raw.is_empty() {
         return Err("not a git worktree".into());
     }
@@ -191,34 +194,39 @@ fn toplevel(hint: &Path) -> Result<PathBuf, String> {
         .ok_or_else(|| "workspace path is not utf-8".to_string())?;
     let mut cmd = Command::new("git");
     crate::proc_spawn::hide_window(&mut cmd);
-    let out = cmd
-        .args(["-C", hint_s, "rev-parse", "--show-toplevel"])
-        .output()
-        .map_err(|e| format!("git: {e}"))?;
-    if !out.status.success() {
+    cmd.args(["-C", hint_s, "rev-parse", "--show-toplevel"]);
+    let out = crate::proc_spawn::command_output_capped(
+        &mut cmd,
+        8 * 1024,
+        std::time::Duration::from_secs(8),
+    )
+    .map_err(|e| format!("git: {e}"))?;
+    if !out.0 {
         return Err("not a git repository".into());
     }
-    let path = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    let path = String::from_utf8_lossy(&out.1).trim().to_string();
     if path.is_empty() {
         return Err("not a git repository".into());
     }
     Ok(PathBuf::from(path))
 }
 
-fn git(repo: &Path, args: &[&str]) -> Result<std::process::Output, String> {
+fn git(repo: &Path, args: &[&str]) -> Result<(bool, Vec<u8>, Vec<u8>), String> {
     let mut cmd = Command::new("git");
     crate::proc_spawn::hide_window(&mut cmd);
-    cmd.arg("-C")
-        .arg(repo)
-        .args(args)
-        .output()
-        .map_err(|e| format!("git: {e}"))
+    cmd.arg("-C").arg(repo).args(args);
+    crate::proc_spawn::command_output_capped(
+        &mut cmd,
+        64 * 1024,
+        std::time::Duration::from_secs(15),
+    )
+    .map_err(|e| format!("git: {e}"))
 }
 
 fn remove_at(repo: &Path, dest: &Path) -> Result<(), String> {
     let dest_s = dest.to_string_lossy().into_owned();
     let out = git(repo, &["worktree", "remove", "--force", &dest_s])?;
-    if !out.status.success() {
+    if !out.0 {
         let _ = std::fs::remove_dir_all(dest);
         let _ = git(repo, &["worktree", "prune"]);
     }

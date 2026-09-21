@@ -1699,7 +1699,7 @@ dependencies = [
 
 [[package]]
 name = "hyper-bench"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "anyhow",
  "clap",
@@ -1711,7 +1711,7 @@ dependencies = [
 
 [[package]]
 name = "hyper-cli"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "anyhow",
  "clap",
@@ -1724,7 +1724,7 @@ dependencies = [
 
 [[package]]
 name = "hyper-loop"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "aes",
  "aes-gcm",
@@ -1732,6 +1732,7 @@ dependencies = [
  "calamine",
  "encoding_rs",
  "enigo",
+ "flate2",
  "fs2",
  "futures",
  "image",
@@ -1776,7 +1777,7 @@ dependencies = [
 
 [[package]]
 name = "hyper-tui"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "anyhow",
  "crossterm",
@@ -1815,7 +1816,7 @@ dependencies = [
 
 [[package]]
 name = "hyper-web"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "anyhow",
  "axum",

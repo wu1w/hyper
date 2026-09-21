@@ -56,11 +56,16 @@ impl MemoryStore {
             "digest/wiki",
             "skills",
         ] {
-            std::fs::create_dir_all(self.root.join(sub))?;
+            crate::fs_mode::ensure_private_dir(&self.root.join(sub))?;
         }
+        crate::fs_mode::tighten_hyper_home(&self.root);
+        crate::fs_mode::scrub_markdown_tree(&self.root.join("memory"));
+        crate::fs_mode::scrub_markdown_tree(&self.root.join("digest"));
         let mem = self.memory_md();
         if !mem.exists() {
-            std::fs::write(mem, MEMORY_STUB)?;
+            crate::fs_mode::write_private(&mem, MEMORY_STUB)?;
+        } else {
+            crate::fs_mode::tighten_file(&mem);
         }
         if let Ok(idx) = MemoryIndex::open(&self.root) {
             let _ = idx.reindex_tree(&self.root);
@@ -81,10 +86,11 @@ impl MemoryStore {
     ) -> Result<PathBuf> {
         let day = chrono_today();
         let dir = self.root.join("memory").join(&day);
-        std::fs::create_dir_all(&dir)?;
+        crate::fs_mode::ensure_private_dir(&dir)?;
         let path = dir.join(format!("{session_id}-{until_seq}.md"));
+        let body = crate::secrets::redact(body);
         let text = format!("# compact {session_id} until={until_seq}\n\n{body}\n");
-        std::fs::write(&path, &text)?;
+        crate::fs_mode::write_private(&path, &text)?;
         if let Ok(idx) = MemoryIndex::open(&self.root) {
             let rel = format!("memory/{day}/{session_id}-{until_seq}.md");
             let _ = idx.upsert(&rel, "daily", &text);
@@ -103,8 +109,10 @@ impl MemoryStore {
         assistant: &str,
     ) -> Result<PathBuf> {
         let dir = self.root.join("memory/chats");
-        std::fs::create_dir_all(&dir)?;
-        let title = crate::session::catalog::title_from_text(user);
+        crate::fs_mode::ensure_private_dir(&dir)?;
+        let user = crate::secrets::redact(user);
+        let assistant = crate::secrets::redact(assistant);
+        let title = crate::session::catalog::title_from_text(&user);
         let heading = if title.is_empty() {
             session_id
         } else {
@@ -116,7 +124,7 @@ impl MemoryStore {
             assistant.trim(),
         );
         let path = dir.join(format!("{session_id}.md"));
-        std::fs::write(&path, &text)?;
+        crate::fs_mode::write_private(&path, &text)?;
         if let Ok(idx) = MemoryIndex::open(&self.root) {
             let rel = format!("memory/chats/{session_id}.md");
             let _ = idx.upsert(&rel, "chat", &text);
@@ -129,7 +137,7 @@ impl MemoryStore {
     }
 
     pub fn read_memory_md(&self) -> Option<String> {
-        std::fs::read_to_string(self.memory_md()).ok()
+        crate::tools::read_text_if_regular(&self.memory_md())
     }
 }
 
@@ -378,6 +386,26 @@ mod tests {
         assert!(store.search("zirconium-pref", 8).unwrap().is_empty());
         let hits = store.search("linker", 8).unwrap();
         assert!(hits.iter().any(|h| h.kind == "daily"), "{hits:?}");
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn compact_note_redacts_password_and_is_private() {
+        let dir =
+            std::env::temp_dir().join(format!("hyper-mem-sec-{}", uuid::Uuid::new_v4().simple()));
+        let store = MemoryStore::open(&dir).unwrap();
+        let path = store
+            .write_compact_note("s", 9, "Prior User\n- VPS password: hunter2-not-real")
+            .unwrap();
+        let body = std::fs::read_to_string(&path).unwrap();
+        assert!(!body.contains("hunter2-not-real"), "{body}");
+        assert!(body.contains("[redacted]"), "{body}");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+            assert_eq!(mode, 0o600);
+        }
         let _ = std::fs::remove_dir_all(dir);
     }
 
